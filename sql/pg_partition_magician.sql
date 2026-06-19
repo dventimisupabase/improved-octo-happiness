@@ -415,7 +415,7 @@ declare
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb;
-  v_uchk_n bigint; v_uchk_frac numeric;
+  v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
@@ -467,18 +467,24 @@ begin
   select array_agg(a.attname order by a.attnum) into v_idcols
     from pg_attribute a where a.attrelid = p_parent and a.attidentity in ('a','d') and not a.attisdropped;
 
+  -- new PK columns: partition key first, then the rest of the old PK
+  if v_oldpk is not null then
+    v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
+  end if;
+
   -- secondary (non-PK, non-unique) indexes to recreate on the parent
   select array_agg(c.relname::text), array_agg(pg_get_indexdef(i.indexrelid)) into v_idx_names, v_idx_defs
     from pg_index i join pg_class c on c.oid = i.indexrelid
    where i.indrelid = p_parent and i.indislive and not i.indisprimary and not i.indisunique;
+  -- count unique secondary indexes we can't carry over -- but EXCLUDE a pre-built
+  -- index whose columns match the new PK (pgpm.prepare_adopt's index, promoted in step 4).
   select count(*) into v_skipped from pg_index i
-   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary;
+   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary
+     and (v_pkcols is null or (select array_agg(a.attname::text order by k.ord)
+            from unnest(i.indkey) with ordinality as k(attnum, ord)
+            join pg_attribute a on a.attrelid = p_parent and a.attnum = k.attnum) is distinct from v_pkcols);
   if v_skipped > 0 then
     raise notice 'pg_partition_magician: skipped % unique secondary index(es) on %; recreate on the parent manually (must include the partition key)', v_skipped, p_parent;
-  end if;
-
-  if v_oldpk is not null then
-    v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
   end if;
 
   -- 0. incoming FKs (capture before the rename; record after the new parent exists)
@@ -528,12 +534,30 @@ begin
     end loop;
   end if;
 
-  -- 4. promote a composite unique index on the default to its PK (reused, not rebuilt)
+  -- 4. establish the default's PK on (partition key, rest of old PK). If a matching
+  -- unique index was pre-built online (pgpm.prepare_adopt -> CREATE UNIQUE INDEX
+  -- CONCURRENTLY, run by the operator before adopt), promote THAT -- a metadata-only
+  -- step, so adopt holds its ACCESS EXCLUSIVE lock only briefly. Otherwise build the
+  -- index in-transaction: correct, but O(rows) under the lock (fine for small tables,
+  -- a multi-minute write-blocking window on very large ones -- prefer prepare_adopt).
   if v_pkcols is not null then
-    execute format('create unique index %I on %s (%s)', (v_default || '_pk_tmp'), v_defreg::text,
-                   (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+    select c.relname into v_prebuilt
+      from pg_index i join pg_class c on c.oid = i.indexrelid
+     where i.indrelid = v_defreg and i.indisunique and i.indisvalid and not i.indisprimary
+       and i.indpred is null and i.indexprs is null
+       and (select array_agg(a.attname::text order by k.ord)
+              from unnest(i.indkey) with ordinality as k(attnum, ord)
+              join pg_attribute a on a.attrelid = v_defreg and a.attnum = k.attnum) = v_pkcols
+     limit 1;
+    if v_prebuilt is null then
+      v_prebuilt := (v_default || '_pk_tmp')::name;
+      execute format('create unique index %I on %s (%s)', v_prebuilt, v_defreg::text,
+                     (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+    else
+      raise notice 'pg_partition_magician: reusing pre-built unique index % as the PK (adopt stays metadata-only)', v_prebuilt;
+    end if;
     execute format('alter table %s add constraint %I primary key using index %I',
-                   v_defreg::text, (v_default || '_pkey'), (v_default || '_pk_tmp'));
+                   v_defreg::text, (v_default || '_pkey'), v_prebuilt);
   end if;
 
   -- 5. create the partitioned parent under the original name (no PK yet)
@@ -608,6 +632,82 @@ begin
 
   perform pgpm.premake(v_parent);
   return v_parent;
+end;
+$$;
+
+-- build_pk_concurrently: build the default's composite PK index ONLINE before adopt,
+-- so the adopt cutover stays metadata-only. Building it inside adopt() would be O(rows)
+-- under ACCESS EXCLUSIVE -- a multi-minute write-blocking window on a large table.
+-- CREATE INDEX CONCURRENTLY can't run inside a function/procedure, but it CAN run from
+-- a pg_cron background worker (pgpm already requires pg_cron) -- so this schedules the
+-- CIC as a cron job, polls until the index is valid (committing between polls to see
+-- the worker's progress), then unschedules. The operator just calls this, then adopt()
+-- -- which finds the pre-built index by its columns and promotes it. No DDL hand-off.
+--   call pgpm.build_pk_concurrently('public.events','created_at');
+--   select pgpm.adopt('public.events','created_at', interval '1 month');
+create or replace procedure pgpm.build_pk_concurrently(
+  p_parent regclass, p_control name, p_timeout interval default '6 hours', p_poll interval default '5 seconds'
+) language plpgsql as $$
+declare
+  v_nsp name; v_rel name; v_oldpk text[]; v_pkcols text[]; v_idxname name; v_cols text;
+  v_idreg regclass; v_job text; v_deadline timestamptz; v_valid boolean; v_status text; v_msg text;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  select array_agg(a.attname::text order by k.ord) into v_oldpk
+    from pg_constraint con
+    cross join lateral unnest(con.conkey) with ordinality as k(attnum, ord)
+    join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+   where con.conrelid = p_parent and con.contype = 'p';
+  if v_oldpk is null then
+    raise notice 'pg_partition_magician: % has no primary key; adopt() builds none -- nothing to pre-build', p_parent;
+    return;
+  end if;
+  -- same PK derivation as _adopt: partition key first, then the rest of the old PK
+  v_pkcols  := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
+  v_idxname := (v_rel || '_pgpm_pkey_pre')::name;
+  v_cols    := (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x);
+
+  v_idreg := to_regclass(format('%I.%I', v_nsp, v_idxname));
+  if v_idreg is not null and (select indisvalid from pg_index where indexrelid = v_idreg) then
+    raise notice 'pg_partition_magician: %.% already built and valid -- run adopt() next', v_nsp, v_idxname;
+    return;
+  elsif v_idreg is not null then
+    execute format('drop index if exists %I.%I', v_nsp, v_idxname);  -- invalid leftover from a prior attempt
+  end if;
+
+  -- CIC from a pg_cron worker (top-level, so it's allowed). IF NOT EXISTS makes re-fires
+  -- no-ops; we unschedule the moment the index goes valid.
+  v_job := 'pgpm_build_' || v_nsp || '_' || v_rel;
+  perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+  -- pg_cron's sub-minute form is 'N seconds' (not an interval's '00:00:05' text)
+  perform cron.schedule(v_job, format('%s seconds', greatest(1, extract(epoch from p_poll)::int)),
+    format('create unique index concurrently if not exists %I on %I.%I (%s)', v_idxname, v_nsp, v_rel, v_cols));
+  raise notice 'pg_partition_magician: building % concurrently via pg_cron job % ...', v_idxname, v_job;
+
+  v_deadline := clock_timestamp() + p_timeout;
+  loop
+    commit;                       -- observe the cron worker's committed catalog changes
+    perform pg_sleep(extract(epoch from p_poll));
+    v_idreg := to_regclass(format('%I.%I', v_nsp, v_idxname));
+    if v_idreg is not null then
+      select indisvalid into v_valid from pg_index where indexrelid = v_idreg;
+      exit when v_valid;
+    end if;
+    select status, return_message into v_status, v_msg from cron.job_run_details
+      where jobid = (select jobid from cron.job where jobname = v_job)
+      order by start_time desc limit 1;
+    if v_status = 'failed' and coalesce(v_msg, '') not ilike '%already exists%' then
+      perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+      raise exception 'pg_partition_magician: concurrent index build failed: %', v_msg;
+    end if;
+    if clock_timestamp() > v_deadline then
+      perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+      raise exception 'pg_partition_magician: concurrent index build did not finish within %', p_timeout;
+    end if;
+  end loop;
+  perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+  raise notice 'pg_partition_magician: % is valid -- run adopt() now (it reuses this index, metadata-only)', v_idxname;
 end;
 $$;
 
