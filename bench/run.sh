@@ -39,6 +39,7 @@ BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-3600}"  # safety cap on the drain 
 BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder (best-effort; needs elevated privs, PG15-17)
 BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr checkout (pgfr_record + pgfr_analyze)
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip 00/10
+BENCH_DEFER_INDEX="${BENCH_DEFER_INDEX:-0}"      # 1 = drop the secondary index during bulk load, rebuild after (much faster at scale)
 
 mkdir -p "$RESULTS"
 
@@ -49,9 +50,19 @@ cleanup() { local p; for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/
 trap cleanup EXIT INT TERM
 
 # ---- psql helpers (DSN passed positionally, never logged) ------------------
+# Managed Postgres (e.g. Supabase) injects a per-connection statement_timeout
+# (2min) that ALTER DATABASE/ROLE can't override and the pooler drops startup
+# `options`, so disable it (+ lock_timeout) in-session on every connection. The
+# long statements here -- bulk generate, adopt's index build, the drain's
+# VALIDATE CONSTRAINT scan, the final VACUUM -- all exceed a 2min cap. The SETs
+# go in their OWN -c so the actual command runs in its own implicit transaction:
+# folding them into one -c string would wrap everything in a single transaction,
+# and bench.generate_events() is a procedure that COMMITs (illegal in a txn block).
+# SET tags are suppressed by -q, so captured query output stays clean.
+TO_OFF="set statement_timeout=0; set lock_timeout=0"
 conn_args() { if [ -n "$BENCH_DSN" ]; then printf '%s' "$BENCH_DSN"; fi; }
-q()  { if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 -tAqc "$1"; else "$PSQL" -v ON_ERROR_STOP=1 -tAqc "$1"; fi; }
-qf() { if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 -f "$1"; else "$PSQL" -v ON_ERROR_STOP=1 -f "$1"; fi; }
+q()  { if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 -tAq -c "$TO_OFF" -c "$1"; else "$PSQL" -v ON_ERROR_STOP=1 -tAq -c "$TO_OFF" -c "$1"; fi; }
+qf() { if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 -c "$TO_OFF" -f "$1"; else "$PSQL" -v ON_ERROR_STOP=1 -c "$TO_OFF" -f "$1"; fi; }
 say() { printf '\n\033[1;36m== %s ==\033[0m %s\n' "$1" "$(q "select to_char(now(),'HH24:MI:SS')")"; }
 
 have_ext() { [ "$(q "select count(*) from pg_extension where extname='$1'")" = "1" ]; }
@@ -60,7 +71,7 @@ have_wal=0
 have_pgfr=0
 PGVERNUM=0
 # psql -f with single-transaction (pgfr installs want all-or-nothing)
-qf1() { if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 --single-transaction -f "$1"; else "$PSQL" -v ON_ERROR_STOP=1 --single-transaction -f "$1"; fi; }
+qf1() { if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 -c "$TO_OFF" --single-transaction -f "$1"; else "$PSQL" -v ON_ERROR_STOP=1 -c "$TO_OFF" --single-transaction -f "$1"; fi; }
 
 pgss_reset() { [ "$have_pgss" = "1" ] && q "select pg_stat_statements_reset()" >/dev/null || true; }
 # snapshot the workload statements (server-side, WAN-free timing) for a phase
@@ -266,6 +277,10 @@ else
   say "build schema + generate data SERVER-SIDE"
   qf "$BENCH_DIR/sql/00_schema.sql" >/dev/null
   qf "$BENCH_DIR/sql/10_generate.sql" >/dev/null
+  if [ "$BENCH_DEFER_INDEX" = "1" ]; then
+    echo "  deferring secondary index during bulk load (rebuilt after)"
+    q "drop index if exists bench.events_user_created_idx" >/dev/null
+  fi
   if [ "$BENCH_GEN_JOBS" -le 1 ]; then
     echo "  generating $BENCH_ROWS rows across $BENCH_MONTHS months (1 session, in-database, nothing on the wire)..."
     q "call bench.generate_events($BENCH_ROWS, $BENCH_MONTHS, $BENCH_CHUNK)"
@@ -289,8 +304,12 @@ else
     gen_fail=0
     for pid in "${gen_pids[@]}"; do wait "$pid" || gen_fail=1; done
     [ "$gen_fail" = "0" ] || { echo "  ERROR: a generator session failed; see $RESULTS/generate_job_*.log"; exit 1; }
-    q "analyze bench.events" >/dev/null   # one fresh analyze after all sessions finish
   fi
+  if [ "$BENCH_DEFER_INDEX" = "1" ]; then
+    echo "  rebuilding secondary index on the full table (sort build, no statement_timeout)..."
+    q "create index if not exists events_user_created_idx on bench.events (user_id, created_at desc)" >/dev/null
+  fi
+  q "analyze bench.events" >/dev/null   # fresh stats after load (+ any index rebuild)
 fi
 qf "$BENCH_DIR/sql/20_workload.sql" >/dev/null
 echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_size_pretty(pg_total_relation_size('bench.events'))")"
