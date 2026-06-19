@@ -144,7 +144,7 @@ Two hard facts drive the design:
 The tool sidesteps #2 for every range that receives **no concurrent writes** —
 closed past intervals (drain) and future intervals (premake) — by:
 
-```
+```sql
 ADD CONSTRAINT excl CHECK (control < lo OR control >= hi) NOT VALID  -- catalog only, instant
 VALIDATE CONSTRAINT excl                                            -- the scan, under SHARE UPDATE EXCLUSIVE (non-blocking)
 ATTACH / CREATE PARTITION ...                                       -- default scan skipped, metadata-only
@@ -281,6 +281,7 @@ not executed:
 ```sql
 select sql from pgpm.generate_fk_recovery('public.messages');
 ```
+
 ```sql
 -- e.g. for reactions(message_id) -> messages(id):
 ALTER TABLE public.reactions ADD COLUMN message_created_at timestamp with time zone;
