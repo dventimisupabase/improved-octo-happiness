@@ -6,9 +6,9 @@ begin;
 select plan(5);
 
 select is(
-  (select partition_interval from pgpm.config where parent_table = 'public.messages'::regclass),
-  '1 month'::interval,
-  'config: monthly interval registered'
+  (select control_kind from pgpm.config where parent_table = 'public.messages'::regclass),
+  'time',
+  'config: control_kind time registered'
 );
 
 select is(
@@ -20,7 +20,7 @@ select is(
 select cmp_ok(
   (select count(*) from pgpm.part
     where parent_table = 'public.messages'::regclass
-      and lo > date_trunc('month', now()))::int,
+      and lo::timestamptz > date_trunc('month', now()))::int,
   '>=', 4,
   'at least 4 future partitions are premade ahead of the frontier'
 );

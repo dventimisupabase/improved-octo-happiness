@@ -1,14 +1,17 @@
 # pg_partition_magician
 
-A lightweight, **pure-SQL** time-range partition manager for PostgreSQL whose only
+A lightweight, **pure-SQL** RANGE-partition manager for PostgreSQL whose only
 runtime dependency is **pg_cron** — and even that only for scheduling. No compiled
 extension, no superuser beyond what running a SQL script needs. Install it by
 running one file.
 
-It manages the full lifecycle of native `RANGE`-partitioned tables:
+It partitions on any **monotonic** key — time, integer/bigint ids (including
+Snowflake-style ids), or **UUIDv7 / ULID** (time-ordered uuids) — and manages the
+full lifecycle of native `RANGE`-partitioned tables:
 
-- **`adopt()`** — convert an existing (possibly huge, *live*) unpartitioned table
-  into a partitioned one **online**, with no up-front data movement.
+- **`adopt()` / `adopt_by_id()` / `adopt_by_uuidv7()`** — convert an existing
+  (possibly huge, *live*) unpartitioned table into a partitioned one **online**,
+  with no up-front data movement.
 - **premake** — keep N partitions ahead of the write frontier so live writes
   always have a real partition.
 - **drain** — move the `DEFAULT` partition's closed tail into proper partitions in
@@ -59,11 +62,37 @@ select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 That's it. Maintenance premakes ahead, drains the adopted table's closed tail into
 partitions, and applies retention. Watch it with `select * from pgpm.status();`.
 
+### Partitioning dimensions
+
+A control column qualifies if it is (a) RANGE-partitionable, (b) monotonic with
+insertion within a bounded lag, (c) has exact, reproducible grid arithmetic, and
+(d) free of unordered/extreme values that poison the frontier. The engine maps
+every supported type onto one of two grids via a tiny adapter; the only thing that
+changes per kind is `_grid_floor` / `_grid_next` / `_encode` / `_decode` /
+`_frontier_native` / `_part_name`.
+
+| `control_kind` | Adopt with | Column types | Step / retention | Notes |
+|---|---|---|---|---|
+| `time` | `adopt(…, p_interval)` | `timestamptz` / `timestamp` / `date` | interval / interval | calendar-aligned |
+| `id` | `adopt_by_id(…, p_step)` | `int` / `bigint` / **`numeric`** | bigint / bigint count | covers Snowflake-style ids; frontier = `max(id)` |
+| `uuidv7` | `adopt_by_uuidv7(…, p_interval)` | `uuid` | interval / interval | time grid, boundaries encoded as uuids; also **ULID-as-uuid** |
+
+The "frontier" generalizes `now()`: for `id`/`uuidv7` it's the current max of the
+control column. **float/double are explicitly rejected** — they can't guarantee
+gapless boundaries and `NaN`/`Inf` sort highest and poison the frontier. When the
+partition key *is* the column other tables reference (typical for `id`), the PK
+stays single-column and **incoming FKs need no denormalization** — just a re-point.
+
+UUIDv7/ULID generation is the app's job (PG 15 has no `uuidv7()`); the tool only
+stores, compares, and encodes boundary uuids — a pure-SQL `uuid↔ms` codec.
+
 ### API
 
 | Function | Purpose |
 |---|---|
-| `pgpm.adopt(parent, control, interval, …)` | Online swap + register + initial premake |
+| `pgpm.adopt(parent, control, interval, …)` | Online swap + register + premake — **time** kind |
+| `pgpm.adopt_by_id(parent, control, step, …)` | Online swap — **id** kind (bigint/numeric) |
+| `pgpm.adopt_by_uuidv7(parent, control, interval, …)` | Online swap — **uuidv7/ULID** kind |
 | `pgpm.maintenance_all()` | Premake + retention + one drain batch for every managed table (the pg_cron entry) |
 | `pgpm.maintenance(parent)` | Same, for one table (respects the pause flag) |
 | `pgpm.premake(parent)` | Create partitions up to `premake` ahead of now |
@@ -121,17 +150,18 @@ default. Force it with `drain_all(parent, include_open => true)`.
 
 ## Demo (this repo)
 
-The Supabase stack seeds a ~50k-row unpartitioned `public.messages` table across the
-last 6 months, then `adopt()`s it.
+The Supabase stack seeds three unpartitioned tables and adopts one of each kind:
+`public.messages` (`time`, ~50k rows over 6 months), `public.events_id` (`id`, 45k
+bigint rows), and `public.events_uuid` (`uuidv7`, 45k time-ordered uuids).
 
 ```bash
 supabase start
-supabase db reset     # seed -> install pgpm -> adopt messages (maintenance PAUSED)
+supabase db reset     # seed -> install pgpm -> adopt all three (maintenance PAUSED)
 ```
 
-After reset: `messages` is `RANGE(created_at)`-partitioned, `messages_default` holds
-all 50k rows, the next 4 months are premade, and a paused `pgpm-maintenance` cron job
-exists. Drive it:
+After reset each table is `RANGE`-partitioned, its `*_default` holds all rows, future
+partitions are premade, and a paused `pgpm-maintenance` cron job exists.
+`select * from pgpm.status();` shows all three. Drive one:
 
 ```sql
 -- live (pg_cron, every 30s):
@@ -158,17 +188,22 @@ pgTAP, run against a freshly reset DB:
 supabase db reset && supabase test db
 ```
 
-23 tests across structure, write-routing, drain, row conservation, the scan-skip
-attach method, premake, and retention.
+50 tests across structure, write-routing, drain, row conservation, the scan-skip
+attach method, premake, retention, secondary-index propagation, incoming-FK
+handling + recovery, and the `id` and `uuidv7` dimensions (incl. the uuid↔ts codec).
 
 > Reset before testing: tests assume the pristine post-reset state (data in the
 > DEFAULT, maintenance paused). A live drain mutates committed state.
 
 ## v1 scope & caveats
 
-- **Time `RANGE` only**, with a configurable interval (whole-month intervals like
-  `1 month`/`1 year`, or fixed durations like `1 day`/`7 days`/`1 hour`). Mixed
-  month+duration intervals are rejected. No integer/id range yet.
+- **Dimensions**: `time` (interval step; whole-month or fixed-duration — mixed
+  month+duration is rejected), `id` (bigint/numeric step), `uuidv7`/ULID-as-uuid
+  (time grid, uuid boundaries). **float/double rejected.** Other sortable encodings
+  (KSUID, base32 ULID, ObjectId) aren't built in — partition on a companion column.
+- **Monotonicity is the precondition.** uuidv7/ULID are ms-resolution monotonic with
+  a small clock-skew/late-arrival window; the don't-close-until-frontier-past rule
+  plus the `DEFAULT` safety net absorb stragglers. Arbitrary backdated keys break it.
 - **Empty `DEFAULT` kept as a safety net** (`keep_default`). In steady state premake
   stays ahead so the default stays empty; `check_default()` flags any stray row.
 - **Retention uses plain `DROP`** (brief lock). `DETACH … CONCURRENTLY` can't run
