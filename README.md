@@ -71,6 +71,7 @@ partitions, and applies retention. Watch it with `select * from pgpm.status();`.
 | `pgpm.drain_all(parent, batch, include_open)` | Drive the drain to completion (ignores pause) |
 | `pgpm.retention(parent)` | Drop partitions older than the policy |
 | `pgpm.check_default(parent)` | Rows still in the DEFAULT, and how many are in already-closed intervals (the alert) |
+| `pgpm.generate_fk_recovery(parent)` | Emit a path-A recovery script per dropped incoming FK (denormalize + composite FK) |
 | `pgpm.status()` / `pgpm.partitions` | Monitoring |
 
 Config lives in `pgpm.config` (one row per managed table); a partition registry in
@@ -209,6 +210,28 @@ is the operator's data-model decision, so `adopt()` doesn't do it silently:
 select pgpm.adopt('public.messages', 'created_at', '1 month', p_incoming_fks => 'drop');
 select * from pgpm.dropped_fk;   -- what was dropped, for reconstruction
 ```
+
+To take path A, `generate_fk_recovery()` emits a ready-to-review script per dropped
+FK — add the partition-key companion column, backfill it, and rebuild the FK as a
+composite FK (with `NOT VALID` + `VALIDATE` to avoid a long lock). It's generated,
+not executed:
+
+```sql
+select sql from pgpm.generate_fk_recovery('public.messages');
+```
+```sql
+-- e.g. for reactions(message_id) -> messages(id):
+ALTER TABLE public.reactions ADD COLUMN message_created_at timestamp with time zone;
+UPDATE public.reactions r SET message_created_at = p.created_at
+  FROM public.messages p WHERE p.id = r.message_id;
+ALTER TABLE public.reactions ALTER COLUMN message_created_at SET NOT NULL;
+ALTER TABLE public.reactions ADD CONSTRAINT reactions_message_id_fkey
+  FOREIGN KEY (message_created_at, message_id) REFERENCES public.messages (created_at, id) NOT VALID;
+ALTER TABLE public.reactions VALIDATE CONSTRAINT reactions_message_id_fkey;
+```
+
+Review it (the companion column name is a suggestion; batch the backfill for large
+tables) and update the app to populate the new column going forward.
 
 (`pg_partman` reaches the same conclusion — its howto says incoming FKs require an
 outage to drop and recreate against the new partitioned table.)

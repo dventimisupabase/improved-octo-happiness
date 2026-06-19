@@ -69,12 +69,14 @@ create table if not exists pgpm.log (
 -- (e.g. single-column); it will NOT recreate as-is against the now-partitioned
 -- table -- rebuild it as a composite FK on the partition key (see README).
 create table if not exists pgpm.dropped_fk (
-  id                bigint generated always as identity primary key,
-  parent_table      regclass    not null,
-  referencing_table regclass    not null,
-  constraint_name   name        not null,
-  definition        text        not null,
-  dropped_at        timestamptz not null default now()
+  id                  bigint generated always as identity primary key,
+  parent_table        regclass    not null,
+  referencing_table   regclass    not null,
+  constraint_name     name        not null,
+  definition          text        not null,
+  referencing_columns text[]      not null default '{}',  -- local FK columns, in key order
+  referenced_columns  text[]      not null default '{}',  -- parent columns they referenced
+  dropped_at          timestamptz not null default now()
 );
 
 -- ---------------------------------------------------------------------------
@@ -412,6 +414,8 @@ declare
   v_pdef    text;
   j         int;
   v_fk      record;
+  v_dropped jsonb := '[]'::jsonb;
+  v_e       jsonb;
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
@@ -464,13 +468,23 @@ begin
            from pg_constraint where confrelid = p_parent and contype = 'f');
     else
       for v_fk in
-        select conrelid::regclass as reltbl, conname, pg_get_constraintdef(oid) as def
-          from pg_constraint where confrelid = p_parent and contype = 'f'
+        select c.conrelid::regclass as reltbl, c.conname, pg_get_constraintdef(c.oid) as def,
+               (select array_agg(a.attname::text order by k.ord)
+                  from unnest(c.conkey) with ordinality as k(attnum, ord)
+                  join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum) as lcols,
+               (select array_agg(a.attname::text order by k.ord)
+                  from unnest(c.confkey) with ordinality as k(attnum, ord)
+                  join pg_attribute a on a.attrelid = c.confrelid and a.attnum = k.attnum) as rcols
+          from pg_constraint c
+         where c.confrelid = p_parent and c.contype = 'f'
       loop
-        insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition)
-          values (p_parent, v_fk.reltbl, v_fk.conname, v_fk.def);
+        -- Capture now and record after the new parent exists: the rename below
+        -- moves p_parent's OID onto the default, so dropped_fk.parent_table must
+        -- be set to the NEW parent (same name, new OID) instead.
+        v_dropped := v_dropped || jsonb_build_object(
+          'reltbl',  v_fk.reltbl::text, 'conname', v_fk.conname::text, 'def', v_fk.def,
+          'lcols',   to_jsonb(v_fk.lcols), 'rcols', to_jsonb(v_fk.rcols));
         execute format('alter table %s drop constraint %I', v_fk.reltbl::text, v_fk.conname);
-        insert into pgpm.log (parent_table, action, method) values (p_parent, 'drop_incoming_fk', v_fk.conname::text);
       end loop;
     end if;
   end if;
@@ -574,6 +588,17 @@ begin
     default_table = excluded.default_table, paused = excluded.paused;
 
   insert into pgpm.log (parent_table, action, method) values (v_parent, 'adopt', null);
+
+  -- record the incoming FKs we dropped (parent_table points at the new parent)
+  for v_e in select value from jsonb_array_elements(v_dropped) loop
+    insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition,
+                                 referencing_columns, referenced_columns)
+    values (v_parent, (v_e->>'reltbl')::regclass, v_e->>'conname', v_e->>'def',
+            array(select jsonb_array_elements_text(v_e->'lcols')),
+            array(select jsonb_array_elements_text(v_e->'rcols')));
+    insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
+  end loop;
+
   perform pgpm.premake(v_parent);
   return v_parent;
 end;
@@ -627,6 +652,72 @@ begin
   return query execute format(
     'select count(*)::bigint, count(*) filter (where %I < %L)::bigint, min(%I) from %s',
     cfg.control_column, v_cur_lo, cfg.control_column, v_def);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- generate_fk_recovery(): emit a path-A recovery script per dropped incoming FK
+-- -- denormalize the partition key into the referencing table and rebuild the FK
+-- as a COMPOSITE FK on the partition key. Generated, NOT executed: review, adjust
+-- (column name, batch the backfill), and run. The app must then populate the new
+-- companion column going forward.
+-- ---------------------------------------------------------------------------
+create or replace function pgpm.generate_fk_recovery(p_parent regclass)
+returns table (referencing_table regclass, sql text)
+language plpgsql
+as $$
+declare
+  cfg       pgpm.config;
+  v_control name;
+  v_ctype   text;
+  r         pgpm.dropped_fk%rowtype;
+  v_newcol  text;
+  v_join    text;
+  v_fkcols  text;
+  v_refcols text;
+  i         int;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  v_control := cfg.control_column;
+  select format_type(a.atttypid, a.atttypmod) into v_ctype
+    from pg_attribute a where a.attrelid = p_parent and a.attname = v_control and not a.attisdropped;
+
+  for r in select * from pgpm.dropped_fk where parent_table = p_parent order by id loop
+    -- suggested companion column: <x>_id -> <x>_<control>, else <col>_<control>
+    if r.referencing_columns[1] like '%\_id' then
+      v_newcol := left(r.referencing_columns[1], length(r.referencing_columns[1]) - 3) || '_' || v_control;
+    else
+      v_newcol := r.referencing_columns[1] || '_' || v_control;
+    end if;
+
+    -- backfill join: pair each old referencing column with its referenced column
+    v_join := '';
+    for i in 1 .. coalesce(array_length(r.referencing_columns, 1), 0) loop
+      v_join := v_join || case when i > 1 then ' and ' else '' end
+             || format('p.%I = r.%I', r.referenced_columns[i], r.referencing_columns[i]);
+    end loop;
+
+    -- composite FK column lists, with the partition key prepended
+    v_fkcols  := quote_ident(v_newcol) || ', ' ||
+                 (select string_agg(quote_ident(c), ', ') from unnest(r.referencing_columns) c);
+    v_refcols := quote_ident(v_control) || ', ' ||
+                 (select string_agg(quote_ident(c), ', ') from unnest(r.referenced_columns) c);
+
+    referencing_table := r.referencing_table;
+    sql := format(
+$tmpl$-- Recover FK %1$I on %2$s as a composite FK to %3$s (partition key: %6$I).
+ALTER TABLE %2$s ADD COLUMN %4$I %5$s;
+UPDATE %2$s r SET %4$I = p.%6$I FROM %3$s p WHERE %7$s;
+ALTER TABLE %2$s ALTER COLUMN %4$I SET NOT NULL;
+ALTER TABLE %2$s ADD CONSTRAINT %1$I
+  FOREIGN KEY (%8$s) REFERENCES %3$s (%9$s) NOT VALID;
+ALTER TABLE %2$s VALIDATE CONSTRAINT %1$I;
+-- Then populate %2$s.%4$I from the application on insert/update.$tmpl$,
+      r.constraint_name, r.referencing_table::text, p_parent::text,
+      v_newcol, v_ctype, v_control, v_join, v_fkcols, v_refcols);
+    return next;
+  end loop;
 end;
 $$;
 
