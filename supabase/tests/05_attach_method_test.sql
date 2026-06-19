@@ -1,42 +1,28 @@
--- Verifies the default-scan-skip optimization: closed windows attach via the
--- exclusion-CHECK path, the open/current window uses a plain attach, and the
--- temporary exclusion constraints are cleaned up afterward.
+-- Verifies the default-scan-skip optimization: closed intervals attach via the
+-- exclusion-CHECK path, the open/current interval uses a write-safe plain attach,
+-- and no temporary exclusion constraints linger on the default.
 create extension if not exists pgtap;
 
 begin;
-select plan(4);
+select plan(3);
 
--- precondition: at least one closed window exists to exercise the skip path
+select pgpm.drain_all('public.messages', p_include_open => true);
+
+select is(
+  (select count(*) from pgpm.log where action = 'drain_attach' and method = 'plain')::int,
+  1,
+  'exactly one plain attach -- the open/current month'
+);
+
 select cmp_ok(
-  (select count(*) from partition_migration.windows where window_end <= current_date)::int,
+  (select count(*) from pgpm.log where action = 'drain_attach' and method = 'check_skip')::int,
   '>', 0,
-  'there is at least one closed window to attach via check_skip'
+  'closed months attached via the scan-skipping check_skip path'
 );
 
--- drive the full drain
-select partition_migration.drain_all(5000);
-
-select is(
-  (select count(*) from partition_migration.windows
-    where window_end <= current_date
-      and attach_method is distinct from 'check_skip')::int,
-  0,
-  'every CLOSED window attached via the scan-skipping check_skip path'
-);
-
-select is(
-  (select count(*) from partition_migration.windows
-    where window_end > current_date
-      and attach_method is distinct from 'plain')::int,
-  0,
-  'the OPEN (current/future) window attached via a plain (write-safe) attach'
-);
-
--- the temporary exclusion constraints must not linger on the default
 select is(
   (select count(*) from pg_constraint
-    where conrelid = 'public.messages_default'::regclass
-      and conname ~ '_excl$')::int,
+    where conrelid = 'public.messages_default'::regclass and conname ~ '_excl$')::int,
   0,
   'temporary exclusion CHECK constraints were dropped after attach'
 );

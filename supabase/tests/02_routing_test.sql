@@ -1,10 +1,10 @@
--- Verifies that new writes route to proper partitions, not the DEFAULT.
+-- Verifies new writes route to a pre-made partition, not the DEFAULT.
 create extension if not exists pgtap;
 
 begin;
 select plan(2);
 
--- A future-dated insert falls in a pre-created (empty) monthly partition.
+-- A future-dated insert falls in a partition premade by adopt()/maintenance.
 insert into public.messages (tenant_id, created_at, body)
 values (
   '00000000-0000-0000-0000-0000000000a1',
@@ -20,9 +20,9 @@ select isnt(
 
 select is(
   (select tableoid from public.messages where body = 'routing-probe-future'),
-  to_regclass('public.messages_' ||
+  to_regclass('public.messages_p' ||
     to_char((date_trunc('month', now()) + interval '1 month')::date, 'YYYY_MM'))::oid,
-  'future-dated insert routes to its correct monthly partition'
+  'future-dated insert routes to its premade monthly partition'
 );
 
 select * from finish();

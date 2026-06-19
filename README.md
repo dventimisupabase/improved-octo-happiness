@@ -1,162 +1,178 @@
-# Online `messages` Partition Migration — POC
+# pg_partition_magician
 
-A runnable proof-of-concept for converting a large, unpartitioned PostgreSQL
-`messages` table into a time-`RANGE`-partitioned table **with no up-front data
-movement**, by attaching the existing table as the `DEFAULT` partition and then
-**draining** historical rows into proper monthly partitions in paced microbatches
-driven by **pg_cron**.
+A lightweight, **pure-SQL** time-range partition manager for PostgreSQL whose only
+runtime dependency is **pg_cron** — and even that only for scheduling. No compiled
+extension, no superuser beyond what running a SQL script needs. Install it by
+running one file.
 
-It implements the strategy described in
-[`postgresql_online_partition_migration_summary.md`](./postgresql_online_partition_migration_summary.md)
-and is built on the Supabase local dev stack with pgTAP tests.
+It manages the full lifecycle of native `RANGE`-partitioned tables:
 
-## The idea in one paragraph
+- **`adopt()`** — convert an existing (possibly huge, *live*) unpartitioned table
+  into a partitioned one **online**, with no up-front data movement.
+- **premake** — keep N partitions ahead of the write frontier so live writes
+  always have a real partition.
+- **drain** — move the `DEFAULT` partition's closed tail into proper partitions in
+  paced microbatches.
+- **retention** — drop partitions older than a policy.
+- **maintenance** — the single procedure `pg_cron` calls (premake + retention + drain).
 
-You cannot convert a table to partitioned in place. So you rename the live table
-out of the way, create a partitioned parent under the original name, and attach
-the old table as the `DEFAULT` partition — **no rows move**, the app sees no
-change. New future-dated writes route to proper partitions immediately. A
-background job then drains the `DEFAULT` partition month-by-month into proper
-partitions, a few thousand rows per batch, slow enough that autovacuum keeps dead
-tuples under control. Progress is fully observable, and the drain can be paused or
-throttled at any time. The migration becomes a well-behaved maintenance workload
-rather than a high-risk data-movement event.
+Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
 
-## Prerequisites
+> Born from the design doc in
+> [`postgresql_online_partition_migration_summary.md`](./postgresql_online_partition_migration_summary.md)
+> and the locking analysis that followed.
 
-- [Supabase CLI](https://supabase.com/docs/guides/cli) (tested with 2.105)
-- Docker (running)
+## Why it exists
 
-The local stack is pinned to **PostgreSQL 15** (`supabase/config.toml`,
-`major_version = 15`) — a deliberate choice to match the older-but-still-supported
-versions common in the wild (PG 14 leaves long-term support in late 2025). The
-technique and locking behavior are identical on 15 and 17.
+`pg_partman` is excellent, but it's a compiled C extension: it needs `CREATE
+EXTENSION`, the binary installed, and privileges that some managed/locked-down
+Postgres environments don't grant. `pg_partition_magician` is just tables, views,
+and PL/pgSQL — you can install it anywhere you can run SQL and schedule a job.
 
-## Quickstart
+## Install
 
 ```bash
-supabase start          # first run pulls images
-supabase db reset       # applies migrations + seeds ~50k rows, then converts
+psql "$DATABASE_URL" -f sql/pg_partition_magician.sql
 ```
 
-After `db reset` you have:
+Pure SQL, idempotent. (In this repo the same file is also applied as a Supabase
+migration — `supabase/migrations/*_install_pg_partition_magician.sql` is a copy of
+`sql/pg_partition_magician.sql`, the single source of truth.)
 
-- `public.messages` — a `RANGE(created_at)` partitioned table (PK `(created_at, id)`)
-- `public.messages_default` — the `DEFAULT` partition, holding **all** seeded rows
-- `messages_<next two months>` — empty, pre-created future partitions
-- 6 month-windows queued in `partition_migration.windows` (state `pending`)
-- a paused pg_cron job `drain-messages` (every 10s)
-
-## Run the drain (pg_cron)
-
-The drain is **paused by default** so `db reset` doesn't kick off background work
-and so tests stay deterministic. Start it by flipping the control flag:
+## Use it
 
 ```sql
--- start the live drain (pg_cron fires every 10s, newest month first)
-update partition_migration.control set is_paused = false;
+-- Convert an existing table online and register it (zero data movement here):
+select pgpm.adopt(
+  p_parent      => 'public.events',
+  p_control     => 'created_at',     -- the timestamp to range-partition on
+  p_interval    => '1 day',          -- daily/weekly/monthly/yearly...
+  p_premake     => 7,                -- keep 7 partitions ahead
+  p_retention   => '90 days',        -- drop partitions older than this (null = keep)
+  p_paused      => false             -- let scheduled maintenance run
+);
 
--- throttle: smaller batches = gentler on vacuum/WAL/replication
-update partition_migration.control set batch_size = 2000;
-
--- pause at any time
-update partition_migration.control set is_paused = true;
+-- Schedule the one entry point (pg_cron):
+select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 ```
 
-Watch it progress:
+That's it. Maintenance premakes ahead, drains the adopted table's closed tail into
+partitions, and applies retention. Watch it with `select * from pgpm.status();`.
+
+### API
+
+| Function | Purpose |
+|---|---|
+| `pgpm.adopt(parent, control, interval, …)` | Online swap + register + initial premake |
+| `pgpm.maintenance_all()` | Premake + retention + one drain batch for every managed table (the pg_cron entry) |
+| `pgpm.maintenance(parent)` | Same, for one table (respects the pause flag) |
+| `pgpm.premake(parent)` | Create partitions up to `premake` ahead of now |
+| `pgpm.drain_step(parent, batch, include_open)` | Move one microbatch out of the DEFAULT; attach when an interval empties |
+| `pgpm.drain_all(parent, batch, include_open)` | Drive the drain to completion (ignores pause) |
+| `pgpm.retention(parent)` | Drop partitions older than the policy |
+| `pgpm.check_default(parent)` | Rows still in the DEFAULT, and how many are in already-closed intervals (the alert) |
+| `pgpm.status()` / `pgpm.partitions` | Monitoring |
+
+Config lives in `pgpm.config` (one row per managed table); a partition registry in
+`pgpm.part`; an action audit trail in `pgpm.log`.
+
+## How the online migration stays online
+
+Two hard facts drive the design:
+
+1. **You can't convert a table to partitioned in place.** So `adopt()` renames the
+   live table out of the way, creates a partitioned parent under the original name,
+   and **attaches the old table as the `DEFAULT` partition** — no rows move, the app
+   sees no change. (PK is rebuilt to include the partition key; identity is moved to
+   the parent and its sequence advanced.)
+2. **Adding a partition while the `DEFAULT` holds data forces a full scan of the
+   `DEFAULT` under `ACCESS EXCLUSIVE`** (PG 15 docs) — the biggest scaling risk.
+
+The tool sidesteps #2 for every range that receives **no concurrent writes** —
+closed past intervals (drain) and future intervals (premake) — by:
+
+```
+ADD CONSTRAINT excl CHECK (control < lo OR control >= hi) NOT VALID  -- catalog only, instant
+VALIDATE CONSTRAINT excl                                            -- the scan, under SHARE UPDATE EXCLUSIVE (non-blocking)
+ATTACH / CREATE PARTITION ...                                       -- default scan skipped, metadata-only
+DROP CONSTRAINT excl
+```
+
+The one rule that keeps this safe: **never exclude the interval currently receiving
+writes.** A `NOT VALID` CHECK is enforced on new rows, so excluding the live range
+would *reject* writes routing to the default. So the active interval simply lives in
+the `DEFAULT` until it closes, then drains as a closed tail — and premake keeps
+future intervals ready so live writes always have a real partition. *The only window
+we ever drain is the now-closed tail.*
+
+Measured on PG 15 (4M-row default): plain attach **101 ms** under `ACCESS EXCLUSIVE`
+vs scan-skip attach **0.43 ms**; the ~97 ms scan moves to `VALIDATE` under the
+non-blocking lock. Same for `CREATE … PARTITION OF` premake (108 ms → 2 ms).
+
+For the open/current interval there's no non-blocking option (a `NOT VALID` CHECK
+would reject live writes), so it attaches via a **plain** `ATTACH` — which *blocks*
+briefly rather than *rejecting*. Cheapest when it's drained last, against a small
+default. Force it with `drain_all(parent, include_open => true)`.
+
+## Demo (this repo)
+
+The Supabase stack seeds a ~50k-row unpartitioned `public.messages` table across the
+last 6 months, then `adopt()`s it.
+
+```bash
+supabase start
+supabase db reset     # seed -> install pgpm -> adopt messages (maintenance PAUSED)
+```
+
+After reset: `messages` is `RANGE(created_at)`-partitioned, `messages_default` holds
+all 50k rows, the next 4 months are premade, and a paused `pgpm-maintenance` cron job
+exists. Drive it:
 
 ```sql
--- per-window: how much is left in DEFAULT, what's been moved, current state
-select * from partition_migration.progress;
+-- live (pg_cron, every 30s):
+update pgpm.config set paused = false;
+select * from pgpm.status();
+select * from pgpm.check_default('public.messages');
 
--- storage/vacuum health of the DEFAULT partition during the drain
-select * from partition_migration.health;
+-- or synchronous, finishing the current month too:
+select pgpm.drain_all('public.messages', p_include_open => true);
 ```
 
-You'll see `rows_remaining_in_default` fall, windows move `pending → draining →
-attached`, and `n_dead_tup` rise and fall as autovacuum reclaims space — the whole
-point of the design.
+Pinned to **PostgreSQL 15** (`supabase/config.toml`) — the realistic older-but-still-
+supported workhorse (PG 14 leaves long-term support in late 2025); behavior is
+identical on 15–17.
 
-Connect with `psql "$(supabase status -o env | grep DB_URL | cut -d= -f2- | tr -d '"')"`
-or just `psql postgresql://postgres:postgres@127.0.0.1:54322/postgres`.
-
-### Run it synchronously instead
-
-For a one-shot full drain (used by the tests; ignores the pause flag):
-
-```sql
-select partition_migration.drain_all();   -- returns number of batches run
-```
+Scale the seed: `alter database postgres set poc.seed_count = 1000000;` then
+`supabase db reset`.
 
 ## Tests
 
-pgTAP tests assert structure, write-routing, the full drain, and row-count
-conservation. Run them against a freshly reset DB:
+pgTAP, run against a freshly reset DB:
 
 ```bash
 supabase db reset && supabase test db
 ```
 
-> Run `supabase db reset` first. The tests assume the pristine post-reset state
-> (all rows in `DEFAULT`, drain paused). If you've run a live drain, the committed
-> state has changed — reset before testing.
+23 tests across structure, write-routing, drain, row conservation, the scan-skip
+attach method, premake, and retention.
 
-## Scaling the seed
+> Reset before testing: tests assume the pristine post-reset state (data in the
+> DEFAULT, maintenance paused). A live drain mutates committed state.
 
-Default is ~50k rows. To stress the bloat/vacuum/observability behavior, scale up
-without editing any file:
+## v1 scope & caveats
 
-```sql
-alter database postgres set poc.seed_count = 1000000;
-```
-```bash
-supabase db reset
-```
-
-## How it maps to migrations
-
-| File | Role |
-|------|------|
-| `…01_create_messages_unpartitioned.sql` | Legacy unpartitioned table + deterministic data generator |
-| `…02_seed_legacy_data.sql` | Seed the table **before** conversion (parameterized by `poc.seed_count`) |
-| `…03_convert_to_partitioned.sql` | Rename → build composite unique index → create partitioned parent → attach `DEFAULT` → pre-create future partitions |
-| `…04_migration_control_and_drain.sql` | `partition_migration` schema: control + windows tables, `drain_step` (cron), `drain_all` (sync), `bootstrap_windows`; closed-window attach skips the default scan via `NOT VALID` CHECK + `VALIDATE` |
-| `…05_autovacuum_tuning.sql` | Aggressive per-table autovacuum on `messages_default` |
-| `…06_observability_views.sql` | `progress` and `health` views |
-| `…07_schedule_pg_cron.sql` | Create `pg_cron` extension and schedule the (paused) drain |
-
-## POC vs. production caveats
-
-This POC is deliberately honest about the parts the summary glosses over:
-
-- **PK must include the partition key.** The enforced PK becomes `(created_at,
-  id)`; uniqueness of `id` alone is no longer DB-enforced. Check your FKs and app
-  assumptions.
-- **You cannot attach a partition for a range that still has rows in `DEFAULT`.**
-  That's why historical data is moved into a *standalone* staging table (with a
-  matching `CHECK`) and only then `ATTACH`ed — not "moved into an already-attached
-  partition."
-- **Attaching a partition forces a scan of the whole `DEFAULT`.** Per the PG 15
-  docs, adding a partition while the `DEFAULT` holds data makes PG scan the entire
-  `DEFAULT` *under `ACCESS EXCLUSIVE`* to prove it has no rows in the new range —
-  the single biggest scaling risk of this strategy. The drain mitigates it for
-  **closed (past) windows**: it adds an exclusion `CHECK` to the `DEFAULT`
-  (`NOT VALID`, then `VALIDATE CONSTRAINT` under the non-blocking `SHARE UPDATE
-  EXCLUSIVE` lock), so the subsequent `ATTACH` skips the default scan and is
-  metadata-only. The **open/current window** can't use this (a `NOT VALID` CHECK
-  would reject live writes routing to the `DEFAULT`), so it falls back to a plain
-  `ATTACH` — cheapest when drained last, against a nearly-empty default. The
-  `attach_method` column / `progress` view records which path each window took.
-- **Index builds.** This POC uses non-concurrent `CREATE [UNIQUE] INDEX` (fine at
-  50k). In production build them with `CREATE [UNIQUE] INDEX CONCURRENTLY` outside
-  a transaction.
-- **Concurrent writes into the month currently being drained** are a documented
-  minor race, out of scope for the deterministic test path.
-- **pg_cron**: preloaded locally in the Supabase Postgres image; on hosted
-  Supabase enable it via the dashboard first. If unavailable, the migration
-  degrades gracefully — use `select partition_migration.drain_all();`.
-- **pg_partman** is the production-grade tool for partition automation; this POC
-  is hand-rolled to expose the mechanics.
+- **Time `RANGE` only**, with a configurable interval (whole-month intervals like
+  `1 month`/`1 year`, or fixed durations like `1 day`/`7 days`/`1 hour`). Mixed
+  month+duration intervals are rejected. No integer/id range yet.
+- **Empty `DEFAULT` kept as a safety net** (`keep_default`). In steady state premake
+  stays ahead so the default stays empty; `check_default()` flags any stray row.
+- **Retention uses plain `DROP`** (brief lock). `DETACH … CONCURRENTLY` can't run
+  inside a function; for huge cold partitions, detach concurrently by hand.
+- **Secondary indexes**: add them to the *parent* (they propagate to new partitions);
+  `adopt()` does not auto-copy non-PK indexes off the old table in v1.
+- **Incoming foreign keys** to the adopted table still require an outage to re-point
+  (true of any such migration).
+- Boundaries align to the database timezone (UTC on Supabase).
 
 ## Teardown
 

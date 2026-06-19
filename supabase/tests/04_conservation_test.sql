@@ -4,12 +4,10 @@ create extension if not exists pgtap;
 begin;
 select plan(2);
 
--- Snapshot per-tenant counts before draining (all rows currently in DEFAULT).
 create temporary table _before on commit drop as
 select tenant_id, count(*) as n from public.messages group by tenant_id;
 
--- Drive the full drain.
-select partition_migration.drain_all(5000);
+select pgpm.drain_all('public.messages', p_include_open => true);
 
 select is(
   (select count(*) from public.messages)::bigint,
