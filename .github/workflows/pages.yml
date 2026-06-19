@@ -60,6 +60,10 @@ jobs:
           ls -la _site
 
       - uses: actions/configure-pages@v5
+        with:
+          # Turn on Pages (Actions source) automatically on first run, so no
+          # manual Settings toggle is needed. Uses the workflow's pages:write token.
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
