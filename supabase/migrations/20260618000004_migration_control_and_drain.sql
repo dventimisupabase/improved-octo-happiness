@@ -35,7 +35,8 @@ create table partition_migration.windows (
   rows_moved    bigint not null default 0,
   started_at    timestamptz,
   last_batch_at timestamptz,
-  attached_at   timestamptz
+  attached_at   timestamptz,
+  attach_method text          -- 'check_skip' or 'plain' (set when attached)
 );
 
 -- ---------------------------------------------------------------------------
@@ -159,22 +160,57 @@ begin
    where window_start = w.window_start;
 
   -- When DEFAULT has no more rows in this window, attach the staging table.
-  -- The CHECK proves staging rows are in range (no staging scan); DEFAULT is
-  -- still briefly scanned under ACCESS EXCLUSIVE -- the real locking cost.
   execute format(
     'select count(*) from public.messages_default where created_at >= %L and created_at < %L',
     w.window_start, w.window_end
   ) into v_remain;
 
   if v_remain = 0 then
-    execute format(
-      'alter table public.messages attach partition public.%I for values from (%L) to (%L)',
-      w.staging_table, w.window_start, w.window_end
-    );
-    update partition_migration.windows
-       set state = 'attached', attached_at = now()
-     where window_start = w.window_start;
-    return 'attached:' || w.staging_table;
+    declare
+      v_excl   text := w.staging_table || '_excl';
+      v_method text;
+    begin
+      -- The staging table's own CHECK lets ATTACH skip scanning IT. But ATTACH
+      -- would still scan the entire DEFAULT under ACCESS EXCLUSIVE to prove it
+      -- holds nothing in [lo,hi) (PG15+ docs). We avoid that blocking scan only
+      -- for CLOSED windows.
+      if w.window_end <= current_date then
+        -- CLOSED window: its range is in the past, so no new write will ever
+        -- land in [lo,hi). Add an exclusion CHECK to the DEFAULT so ATTACH can
+        -- skip the default scan. The O(default) scan happens in VALIDATE under
+        -- SHARE UPDATE EXCLUSIVE (concurrent reads & writes continue) instead of
+        -- under ACCESS EXCLUSIVE.
+        execute format(
+          'alter table public.messages_default add constraint %I check (created_at < %L or created_at >= %L) not valid',
+          v_excl, w.window_start, w.window_end
+        );
+        execute format('alter table public.messages_default validate constraint %I', v_excl);
+        execute format(
+          'alter table public.messages attach partition public.%I for values from (%L) to (%L)',
+          w.staging_table, w.window_start, w.window_end
+        );
+        -- now redundant with the new partition bound; drop it (metadata only)
+        execute format('alter table public.messages_default drop constraint %I', v_excl);
+        v_method := 'check_skip';
+      else
+        -- OPEN window (current/future): live writes can still arrive in [lo,hi)
+        -- and route to the DEFAULT until this partition exists. An exclusion
+        -- CHECK would REJECT those writes (NOT VALID still enforces new rows), so
+        -- we must NOT use it here. Plain ATTACH scans the default under ACCESS
+        -- EXCLUSIVE but is correct under concurrent writes. (Cheapest when this
+        -- window is drained last, against a nearly-empty default.)
+        execute format(
+          'alter table public.messages attach partition public.%I for values from (%L) to (%L)',
+          w.staging_table, w.window_start, w.window_end
+        );
+        v_method := 'plain';
+      end if;
+
+      update partition_migration.windows
+         set state = 'attached', attached_at = now(), attach_method = v_method
+       where window_start = w.window_start;
+      return 'attached:' || w.staging_table || ':' || v_method;
+    end;
   end if;
 
   return 'moved:' || v_moved;

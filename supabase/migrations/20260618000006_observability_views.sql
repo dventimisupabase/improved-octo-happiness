@@ -13,6 +13,7 @@ select
   w.window_end,
   w.staging_table,
   w.state,
+  w.attach_method,
   w.rows_moved,
   (
     select count(*)

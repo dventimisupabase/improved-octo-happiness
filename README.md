@@ -27,6 +27,11 @@ rather than a high-risk data-movement event.
 - [Supabase CLI](https://supabase.com/docs/guides/cli) (tested with 2.105)
 - Docker (running)
 
+The local stack is pinned to **PostgreSQL 15** (`supabase/config.toml`,
+`major_version = 15`) — a deliberate choice to match the older-but-still-supported
+versions common in the wild (PG 14 leaves long-term support in late 2025). The
+technique and locking behavior are identical on 15 and 17.
+
 ## Quickstart
 
 ```bash
@@ -115,7 +120,7 @@ supabase db reset
 | `…01_create_messages_unpartitioned.sql` | Legacy unpartitioned table + deterministic data generator |
 | `…02_seed_legacy_data.sql` | Seed the table **before** conversion (parameterized by `poc.seed_count`) |
 | `…03_convert_to_partitioned.sql` | Rename → build composite unique index → create partitioned parent → attach `DEFAULT` → pre-create future partitions |
-| `…04_migration_control_and_drain.sql` | `partition_migration` schema: control + windows tables, `drain_step` (cron), `drain_all` (sync), `bootstrap_windows` |
+| `…04_migration_control_and_drain.sql` | `partition_migration` schema: control + windows tables, `drain_step` (cron), `drain_all` (sync), `bootstrap_windows`; closed-window attach skips the default scan via `NOT VALID` CHECK + `VALIDATE` |
 | `…05_autovacuum_tuning.sql` | Aggressive per-table autovacuum on `messages_default` |
 | `…06_observability_views.sql` | `progress` and `health` views |
 | `…07_schedule_pg_cron.sql` | Create `pg_cron` extension and schedule the (paused) drain |
@@ -131,9 +136,17 @@ This POC is deliberately honest about the parts the summary glosses over:
   That's why historical data is moved into a *standalone* staging table (with a
   matching `CHECK`) and only then `ATTACH`ed — not "moved into an already-attached
   partition."
-- **`ATTACH` briefly scans + `ACCESS EXCLUSIVE`-locks `DEFAULT`** to prove no rows
-  belong in the new range. The `CHECK` on the staging table avoids scanning *it*,
-  but the `DEFAULT` scan is the real locking cost at scale.
+- **Attaching a partition forces a scan of the whole `DEFAULT`.** Per the PG 15
+  docs, adding a partition while the `DEFAULT` holds data makes PG scan the entire
+  `DEFAULT` *under `ACCESS EXCLUSIVE`* to prove it has no rows in the new range —
+  the single biggest scaling risk of this strategy. The drain mitigates it for
+  **closed (past) windows**: it adds an exclusion `CHECK` to the `DEFAULT`
+  (`NOT VALID`, then `VALIDATE CONSTRAINT` under the non-blocking `SHARE UPDATE
+  EXCLUSIVE` lock), so the subsequent `ATTACH` skips the default scan and is
+  metadata-only. The **open/current window** can't use this (a `NOT VALID` CHECK
+  would reject live writes routing to the `DEFAULT`), so it falls back to a plain
+  `ATTACH` — cheapest when drained last, against a nearly-empty default. The
+  `attach_method` column / `progress` view records which path each window took.
 - **Index builds.** This POC uses non-concurrent `CREATE [UNIQUE] INDEX` (fine at
   50k). In production build them with `CREATE [UNIQUE] INDEX CONCURRENTLY` outside
   a transaction.
