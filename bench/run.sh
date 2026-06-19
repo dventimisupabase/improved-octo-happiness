@@ -40,6 +40,7 @@ BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder (be
 BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr checkout (pgfr_record + pgfr_analyze)
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip 00/10
 BENCH_DEFER_INDEX="${BENCH_DEFER_INDEX:-0}"      # 1 = drop the secondary index during bulk load, rebuild after (much faster at scale)
+BENCH_PREPARE_ADOPT="${BENCH_PREPARE_ADOPT:-0}"  # 1 = build the PK index CONCURRENTLY (online, under load) before adopt, so adopt is metadata-only (essential at scale)
 
 mkdir -p "$RESULTS"
 
@@ -149,7 +150,7 @@ wal_report() {
   python3 - "$RESULTS" <<'PY'
 import sys, os, csv
 res = sys.argv[1]
-order = ['_ref', 'baseline', 'adopt', 'drain', 'post']
+order = ['_ref', 'baseline', 'prepare', 'adopt', 'drain', 'post']
 rows = {}
 for ph in order:
     p = os.path.join(res, f'{ph}.wal.csv')
@@ -167,7 +168,7 @@ def pretty(n):
     return f'{n:.1f} PB'
 cols = [('wal_bytes_total', 'WAL bytes'), ('wal_records', 'WAL records'),
         ('wal_fpi', 'WAL FPI'), ('checkpoints', 'checkpoints'), ('ckpt_buffers', 'ckpt buffers')]
-have = [ph for ph in ['baseline', 'adopt', 'drain', 'post'] if ph in rows]
+have = [ph for ph in ['baseline', 'prepare', 'adopt', 'drain', 'post'] if ph in rows]
 if not have:
     print('_(WAL/checkpoint gauges unavailable this run.)_')
     sys.exit(0)
@@ -319,6 +320,33 @@ run_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # for pgfr post
 wal_snapshot _ref                                                # WAL/checkpoint reference point
 run_phase baseline "$BENCH_PHASE_SECS"
 
+# ---- 3b. prepare: build the PK index CONCURRENTLY under load (keeps adopt online) --
+# pgpm.build_pk_concurrently() schedules the CIC as a pg_cron job and blocks (polling)
+# until the index is valid -- entirely inside pgpm, no DDL handed back. We run it under
+# live load to measure the online build's impact on the workload.
+if [ "$BENCH_PREPARE_ADOPT" = "1" ]; then
+  say "prepare adopt: build PK index CONCURRENTLY under load (pgpm.build_pk_concurrently, online)"
+  pgss_reset
+  rm -f "$RESULTS/pgb_prepare".*
+  ( if [ -n "$BENCH_DSN" ]; then \
+      "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_DRAIN_MAX_SECS" -P 5 \
+        -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_prepare"; \
+    else \
+      "$PGBENCH" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_DRAIN_MAX_SECS" -P 5 \
+        -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_prepare"; \
+    fi > "$RESULTS/prepare.pgbench.txt" 2>&1 ) &
+  load_pid=$!; BG_PIDS+=("$load_pid")
+  echo "  calling pgpm.build_pk_concurrently('bench.events','created_at') -- cron-driven online build..."
+  prep_start=$(q "select extract(epoch from clock_timestamp())")
+  q "call pgpm.build_pk_concurrently('bench.events','created_at')" >/dev/null
+  prep_end=$(q "select extract(epoch from clock_timestamp())")
+  kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
+  awk -v a="$prep_start" -v b="$prep_end" 'BEGIN{printf "  PK index built online in %.1fs (writes never blocked)\n", b-a}'
+  pgss_snapshot prepare; health_snapshot prepare; wal_snapshot prepare; pgfr_snapshot prepare
+  printf '%s\n' "$(pctiles prepare)" > "$RESULTS/prepare.pctiles.txt"
+  echo "  latency during online build: $(cat "$RESULTS/prepare.pctiles.txt")"
+fi
+
 # ---- 4. adopt under load ---------------------------------------------------
 say "adopt under load"
 pgss_reset
@@ -418,7 +446,7 @@ say "report"
   echo
   echo "| phase | pgbench tps | pgbench avg latency | server-side latency (pgbench --log) |"
   echo "|-------|-------------|---------------------|--------------------------------------|"
-  for ph in baseline adopt drain post; do
+  for ph in baseline prepare adopt drain post; do
     tps=$(grep -h 'tps =' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || echo "n/a")
     lat=$(grep -h 'latency average' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || echo "n/a")
     pct=$(cat "$RESULTS/$ph.pctiles.txt" 2>/dev/null || echo "n/a")
@@ -430,7 +458,7 @@ say "report"
   if [ -f "$RESULTS/baseline.health.csv" ]; then
     head -1 "$RESULTS/baseline.health.csv" | sed 's/,/ | /g; s/^/| /; s/$/ |/'
     head -1 "$RESULTS/baseline.health.csv" | sed 's/[^,]*/---/g; s/,/ | /g; s/^/| /; s/$/ |/'
-    for ph in baseline adopt drain post; do
+    for ph in baseline prepare adopt drain post; do
       [ -f "$RESULTS/$ph.health.csv" ] && tail -1 "$RESULTS/$ph.health.csv" | sed 's/,/ | /g; s/^/| /; s/$/ |/'
     done
   fi

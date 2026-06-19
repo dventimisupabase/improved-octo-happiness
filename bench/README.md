@@ -82,6 +82,8 @@ keeps `pgbench`'s own tps/latency numbers meaningful alongside the server-side o
 | `BENCH_MONTHS` | `12` | months of history to spread across |
 | `BENCH_CHUNK` | `2000000` | generator commit chunk |
 | `BENCH_GEN_JOBS` | `1` | parallel generator sessions — set to ≈vCPU to fan generation across cores (one `INSERT…SELECT` is single-core-bound) |
+| `BENCH_DEFER_INDEX` | `0` | drop the secondary index during bulk load, rebuild after — avoids scattered per-row index maintenance across hundreds of millions of inserts |
+| `BENCH_PREPARE_ADOPT` | `0` | build the PK index `CONCURRENTLY` online (a new `prepare` phase, under load) before `adopt`, so the cutover is metadata-only. **Essential at scale** — otherwise `adopt` builds the index in-transaction under `ACCESS EXCLUSIVE` (a multi-minute write-blocking window on a 100GB+ table) |
 | `BENCH_INTERVAL` | `1 month` | partition width |
 | `BENCH_PREMAKE` | `3` | future partitions to premake at adopt |
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | pgbench concurrency |
