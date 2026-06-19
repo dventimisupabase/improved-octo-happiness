@@ -3,6 +3,9 @@ x-pg-base: &pg-base
     POSTGRES_DB: postgres
     POSTGRES_USER: postgres
     POSTGRES_PASSWORD: postgres
+  # default /dev/shm is 64MB; too small for parallel scans/VACUUM on a large
+  # bench table (managed instances have ample shm, this only matters in Docker)
+  shm_size: "1gb"
   # mount the repo read-only so the harness can psql -f the source, the
   # migrations (fixtures), built bundles, and pg_prove the tests.
   volumes:
