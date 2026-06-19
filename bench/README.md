@@ -65,7 +65,7 @@ BENCH_DSN='postgres://postgres:postgres@localhost:5515/postgres' \
 BENCH_DSN='postgres://...:...@db.<ref>.supabase.co:5432/postgres' \
   BENCH_ROWS=300000000 BENCH_MONTHS=12 BENCH_PHASE_SECS=180 \
   BENCH_GEN_JOBS=8 BENCH_CLIENTS=16 BENCH_JOBS=8 BENCH_DRAIN_BATCH=50000 \
-  BENCH_PGFR=1 BENCH_PGFR_SQL=/path/to/pg_flight_recorder.sql \
+  BENCH_PGFR=1 BENCH_PGFR_DIR=bench/vendor/pg_flight_recorder \
   bench/run.sh
 ```
 
@@ -90,19 +90,40 @@ keeps `pgbench`'s own tps/latency numbers meaningful alongside the server-side o
 | `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step` |
 | `BENCH_DRAIN_SLEEP` | `0` | pause between drain steps (s); `0` = full speed |
 | `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the drain window |
-| `BENCH_PGFR` / `BENCH_PGFR_SQL` | `0` / — | wire in pg_flight_recorder + its install SQL |
+| `BENCH_PGFR` / `BENCH_PGFR_DIR` | `0` / `bench/vendor/pg_flight_recorder` | install + enable pg_flight_recorder (record + analyze) for WAL/checkpoint/wait telemetry; clone the repo into `BENCH_PGFR_DIR` first |
 | `BENCH_SKIP_GENERATE` | `0` | reuse already-loaded data |
 
 ## Output (`bench/results/`)
 
-- `report.md` — the before/during/after comparison table.
+- `report.md` — the before/during/after comparison: tps, latency percentiles,
+  health, and **WAL/checkpoint deltas** per phase.
 - `<phase>.pgbench.txt` — raw pgbench summary (tps, latency average).
 - `<phase>.pctiles.txt` — p50/p95/p99/max from the per-transaction log.
 - `<phase>.pgss.csv` — top server-side statements (WAN-free timing).
 - `<phase>.health.csv` — table size, dead tuples, partition count, active backends.
+- `<phase>.wal.csv` — WAL LSN + WAL records/FPI + checkpoint counters at the phase
+  boundary; the report diffs consecutive phases into per-phase write-pressure deltas.
 - `drain.progress.csv` — default-partition drain curve under load.
+- **pg_flight_recorder** (when `BENCH_PGFR=1`): `<phase>.pgfr_deltas.csv` (snapshot
+  deltas — WAL/checkpoint/IO), `<phase>.pgfr_waits.csv` (wait events), and
+  `pgfr_report.md` (the full-run `pgfr_analyze` narrative: anomalies, wait summary,
+  WAL/checkpoint snapshots over time).
 
 > `bench/results/` is git-ignored except for committed example reports.
+
+### WAL / checkpoint gauges
+
+Two layers, complementary:
+
+- **Bespoke (always on, no superuser):** an exact per-phase WAL-bytes figure from a
+  `pg_current_wal_lsn()` boundary diff, plus WAL records/FPI and checkpoint counts
+  (`pg_stat_checkpointer` on PG17+, else `pg_stat_bgwriter`). The drain is the WAL-heavy
+  phase (microbatch delete+insert) — this quantifies it.
+- **pg_flight_recorder (`BENCH_PGFR=1`):** pgfr already samples WAL/checkpoint/IO and wait
+  events continuously into `pgfr_record.snapshots_v` / `deltas`, so the harness reads its
+  series per phase and emits the `pgfr_analyze` narrative. pgfr needs `pg_cron` +
+  `pg_stat_statements` preloaded (both true on Supabase); if it can't install, the run
+  continues on the bespoke gauges alone.
 
 ## Interpreting the results
 

@@ -36,8 +36,8 @@ BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step
 BENCH_DRAIN_SLEEP="${BENCH_DRAIN_SLEEP:-0}"      # pause between drain steps (s); 0 = full speed
 BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-3600}"  # safety cap on the drain window
 
-BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder
-BENCH_PGFR_SQL="${BENCH_PGFR_SQL:-}"        # path to pg_flight_recorder install SQL (if BENCH_PGFR=1)
+BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder (best-effort; needs elevated privs, PG15-17)
+BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr checkout (pgfr_record + pgfr_analyze)
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip 00/10
 
 mkdir -p "$RESULTS"
@@ -56,6 +56,11 @@ say() { printf '\n\033[1;36m== %s ==\033[0m %s\n' "$1" "$(q "select to_char(now(
 
 have_ext() { [ "$(q "select count(*) from pg_extension where extname='$1'")" = "1" ]; }
 have_pgss=0
+have_wal=0
+have_pgfr=0
+PGVERNUM=0
+# psql -f with single-transaction (pgfr installs want all-or-nothing)
+qf1() { if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 --single-transaction -f "$1"; else "$PSQL" -v ON_ERROR_STOP=1 --single-transaction -f "$1"; fi; }
 
 pgss_reset() { [ "$have_pgss" = "1" ] && q "select pg_stat_statements_reset()" >/dev/null || true; }
 # snapshot the workload statements (server-side, WAN-free timing) for a phase
@@ -94,6 +99,84 @@ health_snapshot() {
      ) to stdout with (format csv, header true)" > "$RESULTS/$label.health.csv"
 }
 
+# WAL + checkpoint counters at a phase boundary (cumulative; the report diffs
+# consecutive phases). Cheap counter reads, no superuser. pg_stat_wal is PG14+;
+# checkpoint stats moved from pg_stat_bgwriter to pg_stat_checkpointer in PG17.
+wal_snapshot() {
+  [ "$have_wal" = "1" ] || return 0
+  local label="$1" ckpt_count ckpt_buf
+  if [ "$PGVERNUM" -ge 170000 ]; then
+    ckpt_count="(select num_timed+num_requested from pg_stat_checkpointer)"
+    ckpt_buf="(select buffers_written from pg_stat_checkpointer)"
+  else
+    ckpt_count="(select checkpoints_timed+checkpoints_req from pg_stat_bgwriter)"
+    ckpt_buf="(select buffers_checkpoint from pg_stat_bgwriter)"
+  fi
+  q "copy (select '$label' as phase,
+       (select pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')::bigint) as wal_bytes_total,
+       (select wal_records from pg_stat_wal) as wal_records,
+       (select wal_fpi from pg_stat_wal)     as wal_fpi,
+       $ckpt_count as checkpoints,
+       $ckpt_buf   as ckpt_buffers
+     ) to stdout with (format csv, header true)" > "$RESULTS/$label.wal.csv" 2>/dev/null || true
+}
+
+# pg_flight_recorder per-phase capture: its continuous samples (WAL/checkpoint/IO
+# deltas + wait events) tagged with the phase. select * because the view columns
+# are pgfr's to define; guarded so a schema mismatch never aborts the run.
+pgfr_snapshot() {
+  [ "$have_pgfr" = "1" ] || return 0
+  local label="$1"
+  q "copy (select '$label'::text as phase, d.* from pgfr_record.deltas d) to stdout with (format csv, header true)" \
+     > "$RESULTS/$label.pgfr_deltas.csv" 2>/dev/null || true
+  q "copy (select '$label'::text as phase, w.* from pgfr_record.recent_waits w) to stdout with (format csv, header true)" \
+     > "$RESULTS/$label.pgfr_waits.csv" 2>/dev/null || true
+}
+
+# markdown table of per-phase WAL/checkpoint deltas (each phase minus the prior boundary)
+wal_report() {
+  python3 - "$RESULTS" <<'PY'
+import sys, os, csv
+res = sys.argv[1]
+order = ['_ref', 'baseline', 'adopt', 'drain', 'post']
+rows = {}
+for ph in order:
+    p = os.path.join(res, f'{ph}.wal.csv')
+    if os.path.exists(p):
+        with open(p) as f:
+            r = list(csv.DictReader(f))
+            if r:
+                rows[ph] = r[0]
+def pretty(n):
+    n = float(n)
+    for u in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(n) < 1024:
+            return f'{n:.1f} {u}'
+        n /= 1024
+    return f'{n:.1f} PB'
+cols = [('wal_bytes_total', 'WAL bytes'), ('wal_records', 'WAL records'),
+        ('wal_fpi', 'WAL FPI'), ('checkpoints', 'checkpoints'), ('ckpt_buffers', 'ckpt buffers')]
+have = [ph for ph in ['baseline', 'adopt', 'drain', 'post'] if ph in rows]
+if not have:
+    print('_(WAL/checkpoint gauges unavailable this run.)_')
+    sys.exit(0)
+print('| phase | ' + ' | '.join(c[1] for c in cols) + ' |')
+print('|' + '---|' * (len(cols) + 1))
+prev = '_ref' if '_ref' in rows else None
+for ph in have:
+    cells = []
+    for key, _ in cols:
+        cur = rows[ph].get(key)
+        if cur in (None, ''):
+            cells.append('n/a'); continue
+        base = rows[prev].get(key) if (prev and prev in rows) else None
+        d = float(cur) - float(base) if base not in (None, '') else float(cur)
+        cells.append(pretty(d) if key == 'wal_bytes_total' else f'{int(d)}')
+    print(f'| {ph} | ' + ' | '.join(cells) + ' |')
+    prev = ph
+PY
+}
+
 # percentiles (µs -> ms) from pgbench --log files for a label
 pctiles() {
   local label="$1" files
@@ -123,6 +206,8 @@ run_phase() {
     | tee "$RESULTS/$label.pgbench.txt"
   pgss_snapshot "$label"
   health_snapshot "$label"
+  wal_snapshot "$label"
+  pgfr_snapshot "$label"
   printf '%s\n' "$(pctiles "$label")" > "$RESULTS/$label.pctiles.txt"
   echo "  latency: $(cat "$RESULTS/$label.pctiles.txt")"
 }
@@ -130,6 +215,14 @@ run_phase() {
 # ---- 0. preflight ----------------------------------------------------------
 say "preflight"
 q "select version()" | sed 's/^/  /'
+PGVERNUM=$(q "show server_version_num" 2>/dev/null || echo 0)
+# WAL/checkpoint gauges work without superuser as long as pg_monitor-ish reads are allowed
+if q "select pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')" >/dev/null 2>&1 \
+   && q "select wal_records from pg_stat_wal" >/dev/null 2>&1; then
+  have_wal=1; echo "  WAL/checkpoint gauges: on (server_version_num=$PGVERNUM)"
+else
+  echo "  WAL/checkpoint gauges: unavailable (pg_current_wal_lsn/pg_stat_wal not readable)"
+fi
 if ! have_ext pg_cron; then
   echo "  NOTE: pg_cron not installed; pgpm install needs it. Attempting create extension..."
   q "create extension if not exists pg_cron" || { echo "  ERROR: pg_cron required"; exit 1; }
@@ -148,11 +241,21 @@ say "install pg_partition_magician"
 qf "$REPO_ROOT/sql/pg_partition_magician.sql" >/dev/null
 echo "  pgpm installed: $(q "select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='pgpm'") functions"
 if [ "$BENCH_PGFR" = "1" ]; then
-  if [ -n "$BENCH_PGFR_SQL" ] && [ -f "$BENCH_PGFR_SQL" ]; then
-    say "install pg_flight_recorder"
-    qf "$BENCH_PGFR_SQL" >/dev/null && echo "  pg_flight_recorder installed"
+  if [ -f "$BENCH_PGFR_DIR/pgfr_record/install.sql" ]; then
+    say "install pg_flight_recorder (record + analyze) and enable collection"
+    # non-fatal: a pgfr hiccup (e.g. pg_stat_statements not preloaded) must not kill the run
+    if qf1 "$BENCH_PGFR_DIR/pgfr_record/install.sql" >/dev/null 2>&1 \
+       && q "select pgfr_record.enable()" >/dev/null 2>&1; then
+      qf1 "$BENCH_PGFR_DIR/pgfr_analyze/install.sql" >/dev/null 2>&1 \
+        || echo "  note: pgfr_analyze install skipped (reports unavailable; record alone covers capture)"
+      q "select pgfr_record.apply_profile('troubleshooting')" >/dev/null 2>&1 || true
+      have_pgfr=1
+      echo "  pg_flight_recorder: enabled ($(q "select count(*) from cron.job where jobname like 'pgfr%'" 2>/dev/null || echo '?') cron jobs)"
+    else
+      echo "  pg_flight_recorder: install/enable failed (needs pg_stat_statements preloaded) — continuing without pgfr"
+    fi
   else
-    echo "  WARNING: BENCH_PGFR=1 but BENCH_PGFR_SQL not set/found; skipping pgfr"
+    echo "  WARNING: BENCH_PGFR=1 but $BENCH_PGFR_DIR/pgfr_record/install.sql not found; skipping pgfr"
   fi
 fi
 
@@ -193,6 +296,8 @@ qf "$BENCH_DIR/sql/20_workload.sql" >/dev/null
 echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_size_pretty(pg_total_relation_size('bench.events'))")"
 
 # ---- 3. baseline (unpartitioned, under load) -------------------------------
+run_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # for pgfr post-run report window
+wal_snapshot _ref                                                # WAL/checkpoint reference point
 run_phase baseline "$BENCH_PHASE_SECS"
 
 # ---- 4. adopt under load ---------------------------------------------------
@@ -219,6 +324,8 @@ awk -v a="$adopt_start" -v b="$adopt_end" 'BEGIN{printf "  adopt() returned in %
 wait "$load_pid" || true
 pgss_snapshot adopt
 health_snapshot adopt
+wal_snapshot adopt
+pgfr_snapshot adopt
 printf '%s\n' "$(pctiles adopt)" > "$RESULTS/adopt.pctiles.txt"
 echo "  default holds: $(q "select default_rows from pgpm.check_default('bench.events')") rows to drain"
 
@@ -267,6 +374,8 @@ kill "$load_pid" 2>/dev/null || true
 wait "$load_pid" 2>/dev/null || true
 pgss_snapshot drain
 health_snapshot drain
+wal_snapshot drain
+pgfr_snapshot drain
 printf '%s\n' "$(pctiles drain)" > "$RESULTS/drain.pctiles.txt"
 
 # ---- 6. post (partitioned, under load) -------------------------------------
@@ -307,12 +416,33 @@ say "report"
     done
   fi
   echo
+  echo "## WAL / checkpoint by phase (deltas)"
+  echo
+  wal_report
+  echo
+  if [ "$have_pgfr" = "1" ]; then
+    echo "## pg_flight_recorder"
+    echo
+    echo "Per-phase wait events / activity / snapshot deltas: \`*.pgfr_deltas.csv\`, \`*.pgfr_waits.csv\`."
+    echo "Full-run narrative: \`pgfr_report.md\`."
+  fi
+  echo
   echo "## drain progress"
   echo
   echo "See \`drain.progress.csv\` (default_rows draining to ~current-month residue under load)."
   echo
   echo "Per-statement server-side timing per phase: \`*.pgss.csv\`."
 } > "$RESULTS/report.md"
+
+# pg_flight_recorder full-run narrative (analyze) + stop collection
+if [ "$have_pgfr" = "1" ]; then
+  run_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")
+  q "select pgfr_analyze.report('1 hour')" > "$RESULTS/pgfr_report.md" 2>/dev/null \
+    || q "select pgfr_analyze.incident_timeline('$run_start','$run_end')" > "$RESULTS/pgfr_report.md" 2>/dev/null \
+    || echo "(pgfr_analyze report unavailable)" > "$RESULTS/pgfr_report.md"
+  q "select pgfr_record.disable()" >/dev/null 2>&1 || true
+fi
+
 cat "$RESULTS/report.md"
 echo
 echo "Full artifacts in $RESULTS/"
