@@ -31,6 +31,12 @@ isn't co-located), each `pgbench` transaction calls `bench.workload_step(ops)`,
 which runs many index-supported ops in one round-trip. Server-side latency is read
 WAN-free from `pg_stat_statements` and from the `pgbench --log` percentiles.
 
+A single `INSERT…SELECT` is single-core-bound, so generating hundreds of millions
+of rows on one session is slow regardless of instance size. Set `BENCH_GEN_JOBS` to
+about the vCPU count to split the target across that many concurrent generator
+sessions (they all append to `bench.events`; the identity sequence keeps ids unique
+and the month-spread is unchanged).
+
 ## The phases
 
 1. **baseline** — steady workload against the *unpartitioned* table.
@@ -55,10 +61,10 @@ BENCH_DSN='postgres://postgres:postgres@localhost:5515/postgres' \
   BENCH_CLIENTS=8 BENCH_DRAIN_BATCH=20000 \
   bench/run.sh
 
-# at scale, against a provisioned large instance, with pg_flight_recorder
+# at scale, against a provisioned large instance (e.g. 2XL: 8 vCPU), with pg_flight_recorder
 BENCH_DSN='postgres://...:...@db.<ref>.supabase.co:5432/postgres' \
   BENCH_ROWS=300000000 BENCH_MONTHS=12 BENCH_PHASE_SECS=180 \
-  BENCH_CLIENTS=32 BENCH_JOBS=8 BENCH_DRAIN_BATCH=50000 \
+  BENCH_GEN_JOBS=8 BENCH_CLIENTS=16 BENCH_JOBS=8 BENCH_DRAIN_BATCH=50000 \
   BENCH_PGFR=1 BENCH_PGFR_SQL=/path/to/pg_flight_recorder.sql \
   bench/run.sh
 ```
@@ -75,6 +81,7 @@ keeps `pgbench`'s own tps/latency numbers meaningful alongside the server-side o
 | `BENCH_ROWS` | `300000000` | target rows in `bench.events` |
 | `BENCH_MONTHS` | `12` | months of history to spread across |
 | `BENCH_CHUNK` | `2000000` | generator commit chunk |
+| `BENCH_GEN_JOBS` | `1` | parallel generator sessions — set to ≈vCPU to fan generation across cores (one `INSERT…SELECT` is single-core-bound) |
 | `BENCH_INTERVAL` | `1 month` | partition width |
 | `BENCH_PREMAKE` | `3` | future partitions to premake at adopt |
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | pgbench concurrency |

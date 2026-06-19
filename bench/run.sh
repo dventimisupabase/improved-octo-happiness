@@ -22,6 +22,7 @@ RESULTS="${RESULTS:-$BENCH_DIR/results}"
 BENCH_ROWS="${BENCH_ROWS:-300000000}"       # target rows in bench.events (~120GB at ~400B/row)
 BENCH_MONTHS="${BENCH_MONTHS:-12}"          # spread history across this many months
 BENCH_CHUNK="${BENCH_CHUNK:-2000000}"       # generator commit chunk
+BENCH_GEN_JOBS="${BENCH_GEN_JOBS:-1}"       # parallel generator sessions (one INSERT..SELECT is single-core; fan out to use all cores)
 BENCH_INTERVAL="${BENCH_INTERVAL:-1 month}" # partition width
 BENCH_PREMAKE="${BENCH_PREMAKE:-3}"
 
@@ -162,8 +163,31 @@ else
   say "build schema + generate data SERVER-SIDE"
   qf "$BENCH_DIR/sql/00_schema.sql" >/dev/null
   qf "$BENCH_DIR/sql/10_generate.sql" >/dev/null
-  echo "  generating $BENCH_ROWS rows across $BENCH_MONTHS months (in-database, nothing on the wire)..."
-  q "call bench.generate_events($BENCH_ROWS, $BENCH_MONTHS, $BENCH_CHUNK)"
+  if [ "$BENCH_GEN_JOBS" -le 1 ]; then
+    echo "  generating $BENCH_ROWS rows across $BENCH_MONTHS months (1 session, in-database, nothing on the wire)..."
+    q "call bench.generate_events($BENCH_ROWS, $BENCH_MONTHS, $BENCH_CHUNK)"
+  else
+    # one INSERT..SELECT is single-core-bound; split the target across N sessions
+    # that all append to bench.events concurrently (the identity sequence keeps ids
+    # unique). They each spread rows over the same month span, so the distribution
+    # is unchanged.
+    echo "  generating $BENCH_ROWS rows across $BENCH_MONTHS months via $BENCH_GEN_JOBS parallel sessions..."
+    gen_base=$(( BENCH_ROWS / BENCH_GEN_JOBS ))
+    gen_rem=$(( BENCH_ROWS - gen_base * BENCH_GEN_JOBS ))
+    gen_pids=()
+    for j in $(seq 1 "$BENCH_GEN_JOBS"); do
+      rows_j=$gen_base
+      [ "$j" -eq 1 ] && rows_j=$(( gen_base + gen_rem ))   # job 1 absorbs the remainder
+      ( q "call bench.generate_events($rows_j, $BENCH_MONTHS, $BENCH_CHUNK)" \
+          > "$RESULTS/generate_job_$j.log" 2>&1 ) &
+      pid=$!; gen_pids+=("$pid"); BG_PIDS+=("$pid")
+      echo "    job $j: $rows_j rows (pid $pid)"
+    done
+    gen_fail=0
+    for pid in "${gen_pids[@]}"; do wait "$pid" || gen_fail=1; done
+    [ "$gen_fail" = "0" ] || { echo "  ERROR: a generator session failed; see $RESULTS/generate_job_*.log"; exit 1; }
+    q "analyze bench.events" >/dev/null   # one fresh analyze after all sessions finish
+  fi
 fi
 qf "$BENCH_DIR/sql/20_workload.sql" >/dev/null
 echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_size_pretty(pg_total_relation_size('bench.events'))")"
@@ -174,6 +198,7 @@ run_phase baseline "$BENCH_PHASE_SECS"
 # ---- 4. adopt under load ---------------------------------------------------
 say "adopt under load"
 pgss_reset
+rm -f "$RESULTS/pgb_adopt".*   # drop any prior-run logs so pctiles is fresh
 adopt_bg_secs=$(( BENCH_ADOPT_WARM + 30 ))
 ( if [ -n "$BENCH_DSN" ]; then \
     "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$adopt_bg_secs" -P 5 \
@@ -200,6 +225,7 @@ echo "  default holds: $(q "select default_rows from pgpm.check_default('bench.e
 # ---- 5. drain under load ---------------------------------------------------
 say "drain under load"
 pgss_reset
+rm -f "$RESULTS/pgb_drain".*   # drop any prior-run logs so pctiles is fresh
 ( if [ -n "$BENCH_DSN" ]; then \
     "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_DRAIN_MAX_SECS" -P 5 \
       -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" \
