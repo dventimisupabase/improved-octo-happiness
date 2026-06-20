@@ -179,6 +179,8 @@
     .cta { text-align: center; }
     .cta h2 { font-size: clamp(1.9rem, 3.6vw, 2.6rem); margin-bottom: 14px; }
     .cta p { color: var(--fg-dim); margin-bottom: 28px; }
+    .cta .cta-note { font-size: 14px; color: var(--fg-muted); max-width: 640px; margin: 16px auto 0; }
+    .cta .cta-note a { color: var(--green); }
     .codecopy { max-width: 640px; margin: 0 auto; display: flex; align-items: center; gap: 10px; background: var(--bg-surface); border: 1px solid var(--border-strong); border-radius: 10px; padding: 6px 6px 6px 18px; text-align: left; }
     .codecopy code { flex: 1; font-family: var(--font-mono); font-size: 13px; color: var(--fg-dim); overflow-x: auto; white-space: nowrap; }
     .codecopy button { flex: none; }
@@ -364,15 +366,16 @@
     <div class="wrap">
       <div class="reveal">
         <span class="eyebrow">Install</span>
-        <h2 class="display">One paste, and it's yours.</h2>
-        <p>On a managed Postgres with Trusted Language Extensions (like Supabase):</p>
+        <h2 class="display">One file. Run it with psql.</h2>
+        <p>Pure SQL — no compiled extension, no superuser. Point <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">psql</code> at the single source file and you're done:</p>
         <div class="codecopy">
-          <code id="dbdev-cmd">select dbdev.install('dventimisupabase@pg_partition_magician');</code>
-          <button class="btn btn-ghost" id="copy-dbdev" type="button">
+          <code id="install-cmd">psql "$DATABASE_URL" -f sql/pg_partition_magician.sql</code>
+          <button class="btn btn-ghost" id="copy-install" type="button">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5"/></svg>
             <span class="lbl">Copy</span>
           </button>
         </div>
+        <p class="cta-note">No CLI? On Supabase or any SQL editor, the <a href="install.html">install page</a> has a paste-and-run bundle. A Trusted Language Extension package is there too, for completeness.</p>
         <div class="cta-actions">
           <a class="btn btn-primary" href="install.html">All install options</a>
           <a class="btn btn-ghost" href="https://github.com/dventimisupabase/improved-octo-happiness" target="_blank" rel="noopener">Read the docs</a>
@@ -421,12 +424,12 @@
       requestAnimationFrame(() => setTimeout(() => fan.classList.add('revealed'), 220));
     }
 
-    // Copy the dbdev one-liner.
-    const btn = document.getElementById('copy-dbdev');
+    // Copy the install command.
+    const btn = document.getElementById('copy-install');
     btn.addEventListener('click', async () => {
       const lbl = btn.querySelector('.lbl');
       try {
-        await navigator.clipboard.writeText(document.getElementById('dbdev-cmd').textContent);
+        await navigator.clipboard.writeText(document.getElementById('install-cmd').textContent);
         lbl.textContent = 'Copied';
         setTimeout(() => { lbl.textContent = 'Copy'; }, 1800);
       } catch { lbl.textContent = 'Copy failed'; }
