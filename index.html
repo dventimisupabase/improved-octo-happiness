@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pg_partition_magician: partition a live Postgres table without moving a row</title>
-  <meta name="description" content="A pure-SQL Postgres partition manager. Adopt an existing table into a native RANGE-partitioned table online (time, bigint id, or UUIDv7), driven by pg_cron." />
+  <title>pg_partition_magician: partition a live Postgres table online</title>
+  <meta name="description" content="A pure-SQL Postgres partition manager. Adopt an existing live table into a native RANGE-partitioned table online (on a time, bigint id, or UUIDv7 key), with no maintenance window, driven by pg_cron." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -241,7 +241,7 @@
     <div class="wrap hero-inner">
       <div>
         <span class="eyebrow">Pure SQL · pg_cron only</span>
-        <h1 class="display">Partition a live table<br>without moving <em>a row</em>.</h1>
+        <h1 class="display">Now a table. Now partitions.<br>It only looks like <em>magic</em>.</h1>
         <p class="lede">pg_partition_magician adopts an existing Postgres table into a native RANGE-partitioned table, online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="install.html">Install</a>

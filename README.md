@@ -2,7 +2,7 @@
 
 **[→ Explainer &amp; install page](https://dventimisupabase.github.io/improved-octo-happiness/)**
 
-[![pg_partition_magician: partition a live Postgres table without moving a row](docs/screenshot.png)](https://dventimisupabase.github.io/improved-octo-happiness/)
+[![pg_partition_magician: partition a live Postgres table online](docs/screenshot.png)](https://dventimisupabase.github.io/improved-octo-happiness/)
 
 A lightweight, **pure-SQL** RANGE-partition manager for PostgreSQL whose only
 runtime dependency is **pg_cron**, and even that only for scheduling. No compiled
