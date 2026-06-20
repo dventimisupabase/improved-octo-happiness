@@ -28,11 +28,6 @@
   loses the lock race is deferred (logged as `*_skip`, retried next tick) without aborting the
   drain. The closed-tail drain attaches via the scan-skip path, so it keeps converting the
   table online even while premake repeatedly defers under load.
-- `drain_step` no longer sorts each microbatch. It selected the batch with `ORDER BY` on the
-  control column, which forces an external-merge sort of the entire closed range to pick each
-  batch -- spilling to temp files and re-sorting on every step. The order is irrelevant (every
-  row in the range moves to the same child, and the range is fully drained before it is
-  attached), so the batch is now an unordered scan+limit: no sort, no temp spill, less I/O.
 
 ## [0.1.0] - 2026-06-19
 
