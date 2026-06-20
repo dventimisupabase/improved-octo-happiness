@@ -56,8 +56,9 @@ scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_
 `psql -f sql/uninstall.sql` (removes the `pgpm` schema + its cron jobs; your partitioned
 tables and data are left intact).
 
-On a managed Postgres that has `pg_tle`, you can instead install it as a Trusted
-Language Extension from [database.dev](https://database.dev):
+For completeness, on a managed Postgres that has `pg_tle` it can also be installed as a
+Trusted Language Extension from [database.dev](https://database.dev) — but the `psql -f`
+path above is simpler and is the recommended way:
 
 ```sql
 select dbdev.install('dventimisupabase@pg_partition_magician');
