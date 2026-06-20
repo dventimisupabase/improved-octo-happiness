@@ -26,7 +26,10 @@ declare
   newid   bigint;
   i       int;
 begin
-  select count(*) into v_users from bench.users;
+  -- highest user id (users are a fixed, contiguous 1..N seed). Use max(id), which the planner
+  -- answers from the PK index in O(1) -- NOT count(*), which seq-scans all 50k user rows on
+  -- every single call (~1 scan/txn => a billion-tuple SEQUENTIAL_SCAN_STORM under load).
+  select max(id) into v_users from bench.users;
   for i in 1 .. p_ops loop
     r   := random();
     uid := 1 + floor(random() * v_users)::int;
