@@ -318,10 +318,14 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
 
+  -- No ORDER BY on the batch: every row in [lo,hi) moves to the same child and the range is
+  -- fully drained before it is attached, so order is irrelevant -- but an ORDER BY forces an
+  -- external-merge sort of the whole range to pick each batch, spilling to temp files (and
+  -- re-sorting on every step). Taking an unordered batch is a plain scan+limit: no sort, no temp.
   execute format($f$
     with b as (
       delete from %1$s where ctid in (select ctid from %1$s
-                       where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)
+                       where %2$I >= %3$L and %2$I < %4$L limit %5$s)
       returning %6$s
     )
     insert into %7$I.%8$I (%6$s) select %6$s from b
