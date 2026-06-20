@@ -47,13 +47,17 @@ ambient workload, and *observes*. Three phases:
 1. **baseline**: ambient workload against the *unpartitioned* table.
 2. **convert**: fire `pgpm.adopt()` once (`p_paused => false`) and schedule
    `pgpm.maintenance` on pg_cron — then **pgpm** premakes and drains the default on its
-   own while the harness samples metrics and watches `pgpm.log` until the drain settles.
+   own while the harness drives the workload and watches `pgpm.log` until the drain settles.
    The harness never calls `drain_step`; because the conversion runs server-side, a
-   dropped observer connection can't stop it.
+   dropped harness connection can't stop it.
 3. **post**: ambient workload against the now-partitioned table.
 
-The report compares tps, p50/p95/p99 latency, and health/WAL gauges across the three
-phases, so any degradation *while pgpm converts the table under load* is visible.
+The report compares client tps + p50/p95/p99 latency across the three phases and summarizes
+pgpm's own conversion (drain/premake from `pgpm.log`). The system-metric time-series — WAL,
+checkpoints, `pg_stat_io`, wait/lock events — is **pg_flight_recorder's** job: it records them
+continuously and server-side, and the report slices its series to the conversion window. So
+degradation *while pgpm converts the table under load* is visible without the harness
+hand-rolling gauges.
 
 ## Running it
 
@@ -78,6 +82,9 @@ BENCH_DSN='postgres://...:...@db.<ref>.supabase.co:5432/postgres' \
 Run the driver **as close to the database as possible** (same region / a VM in the
 same network). The server-side workload design tolerates latency, but co-location
 keeps `pgbench`'s own tps/latency numbers meaningful alongside the server-side ones.
+
+Pick a scale from **[`SIZE_LADDER.md`](SIZE_LADDER.md)** and climb it rung by rung — a
+larger run is only worth doing once the one below it has passed cleanly.
 
 ## Knobs
 
@@ -139,35 +146,31 @@ to cut that on repeat runs, with an honest caveat on each:
 
 ## Output (`bench/results/`)
 
-- `report.md`: the before/during/after comparison: tps, latency percentiles,
-  health, and **WAL/checkpoint deltas** per phase.
+- `report.md`: the before/during/after comparison — client tps + latency percentiles per
+  phase, a summary of pgpm's own conversion (drain/premake counts, rows moved, closed-tail
+  remaining, from `pgpm.log`), and a pointer to the pgfr system-metric series sliced to the
+  conversion window.
 - `<phase>.pgbench.txt`: raw pgbench summary (tps, latency average).
-- `<phase>.pctiles.txt`: p50/p95/p99/max from the per-transaction log.
-- `<phase>.pgss.csv`: top server-side statements (WAN-free timing).
-- `<phase>.health.csv`: table size, dead tuples, partition count, active backends.
-- `<phase>.wal.csv`: WAL LSN + WAL records/FPI + checkpoint counters at the phase
-  boundary; the report diffs consecutive phases into per-phase write-pressure deltas.
-- `drain.progress.csv`: default-partition drain curve under load.
-- **pg_flight_recorder** (when `BENCH_PGFR=1`): `<phase>.pgfr_deltas.csv` (snapshot
-  deltas, WAL/checkpoint/IO), `<phase>.pgfr_waits.csv` (wait events), and
-  `pgfr_report.md` (the full-run `pgfr_analyze` narrative: anomalies, wait summary,
-  WAL/checkpoint snapshots over time).
+- `<phase>.pctiles.txt`: client p50/p95/p99/max from the per-transaction log.
+- `<phase>.pgss.csv`: top server-side workload statements per phase (a scoped
+  `pg_stat_statements` reset/dump — WAN-free timing for the workload itself).
+- `drain.progress.csv`: the default-partition drain curve under load (observed_s,
+  default_rows, partitions, drain_ops) — pgpm's own conversion progress.
+- **pg_flight_recorder** (when `BENCH_PGFR=1`): `pgfr_report.md`, the `pgfr_analyze`
+  narrative for the conversion window (anomalies, wait-event summary, WAL/checkpoint/IO
+  snapshots over time).
 
 > `bench/results/` is git-ignored except for committed example reports.
 
-### WAL / checkpoint gauges
+### System metrics are pg_flight_recorder's job
 
-Two layers, complementary:
-
-- **Bespoke (always on, no superuser):** an exact per-phase WAL-bytes figure from a
-  `pg_current_wal_lsn()` boundary diff, plus WAL records/FPI and checkpoint counts
-  (`pg_stat_checkpointer` on PG17+, else `pg_stat_bgwriter`). The drain is the WAL-heavy
-  phase (microbatch delete+insert); this quantifies it.
-- **pg_flight_recorder (`BENCH_PGFR=1`):** pgfr already samples WAL/checkpoint/IO and wait
-  events continuously into `pgfr_record.snapshots_v` / `deltas`, so the harness reads its
-  series per phase and emits the `pgfr_analyze` narrative. pgfr needs `pg_cron` +
-  `pg_stat_statements` preloaded (both true on Supabase); if it can't install, the run
-  continues on the bespoke gauges alone.
+The harness does **not** hand-roll WAL/checkpoint/health gauges. pgfr already records the full
+server-side time-series continuously — WAL bytes + write/sync time, checkpoints, `pg_stat_io`
+(client/checkpointer/autovacuum/bgwriter reads+writes+fsyncs), wait/lock events, table sizes —
+so the harness records the phase-boundary timestamps and the report slices pgfr's series to the
+conversion window (`pgfr_analyze.incident_timeline`). pgfr needs `pg_cron` + `pg_stat_statements`
+preloaded (both true on Supabase). With `BENCH_PGFR=0` you get client-side latency + the pgpm
+conversion summary, but no system-metric time-series — set `BENCH_PGFR=1` for the full picture.
 
 ## Interpreting the results
 
