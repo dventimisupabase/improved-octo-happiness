@@ -27,7 +27,12 @@
   and isolates premake, retention, and the drain in separate subtransactions: a step that
   loses the lock race is deferred (logged as `*_skip`, retried next tick) without aborting the
   drain. The closed-tail drain attaches via the scan-skip path, so it keeps converting the
-  table online even while premake repeatedly defers under load.
+  table online even while premake repeatedly defers under load. Two further safeguards keep
+  premake from disrupting the workload under sustained writes: (a) premake/retention use a very
+  short `lock_timeout` so a lost lock race fails in milliseconds -- barely blocking the workload,
+  and bailing before premake's `VALIDATE` scan of the default; (b) after a deferral, premake
+  backs off (a window recorded in `pgpm.config.premake_retry_after`) instead of retrying every
+  tick. The drain keeps a longer `lock_timeout` so its infrequent, must-win attach isn't starved.
 - `drain_step`'s "any rows left in this range?" check now uses `EXISTS` instead of `count(*)`.
   The old `count(*)` re-scanned the entire remaining range after every microbatch -- O(rows^2 /
   batch) work, and while the default is not all-visible mid-drain the planner seq-scans the

@@ -40,8 +40,14 @@ create table if not exists pgpm.config (
   drain_batch      int         not null default 5000,
   default_table    name        not null,
   paused           boolean     not null default true,
-  created_at       timestamptz not null default now()
+  created_at       timestamptz not null default now(),
+  -- when maintenance may next attempt premake for this parent. Under sustained write contention
+  -- premake keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
+  -- instead of retrying (and risking a wasted default scan) every tick. null = attempt now.
+  premake_retry_after timestamptz
 );
+-- upgrade path for installs that predate premake_retry_after
+alter table pgpm.config add column if not exists premake_retry_after timestamptz;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -788,12 +794,25 @@ begin
   -- retries when the workload next has a gap.
   perform set_config('lock_timeout', '200ms', true);
 
-  begin
-    v_made := pgpm.premake(p_parent);
-  exception when others then
-    v_note := v_note || ' premake_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'premake_skip', left(sqlerrm, 200));
-  end;
+  -- premake back-off: once a deferral happens, don't retry every tick -- under sustained write
+  -- contention premake can't win the lock for minutes, and each attempt risks a wasted default
+  -- scan. Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches
+  -- them), so deferring premake is harmless. A successful premake clears the back-off.
+  if coalesce(cfg.premake_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
+    begin
+      v_made := pgpm.premake(p_parent);
+      if cfg.premake_retry_after is not null then
+        update pgpm.config set premake_retry_after = null where parent_table = p_parent;
+      end if;
+    exception when others then
+      v_note := v_note || ' premake_deferred';
+      update pgpm.config set premake_retry_after = clock_timestamp() + interval '30 seconds'
+        where parent_table = p_parent;
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'premake_skip', left(sqlerrm, 200));
+    end;
+  else
+    v_note := v_note || ' premake_backoff';
+  end if;
 
   begin
     v_dropped := pgpm.retention(p_parent);
