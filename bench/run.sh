@@ -456,13 +456,16 @@ say "report"
   echo "| phase | pgbench tps | pgbench avg latency | client p50 / p95 / p99 (pgbench --log) |"
   echo "|-------|-------------|---------------------|----------------------------------------|"
   for ph in baseline convert post; do
-    tps=$(grep -h 'tps =' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
-    lat=$(grep -h 'latency average' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
-    # convert's pgbench is killed and prints no summary -> derive tps/avg from its log; in window
-    # mode restrict it to the same steady-state slice the pctiles use (conv_win_lo..conv_win_hi).
-    if [ -z "$tps" ]; then
-      if [ "$ph" = convert ]; then s=$(pgbench_log_summary convert "$conv_win_lo" "$conv_win_hi"); else s=$(pgbench_log_summary "$ph"); fi
-      tps=${s%%|*}; lat=${s##*|}
+    if [ "$ph" = convert ] && [ "$BENCH_OBSERVE_MODE" = window ]; then
+      # window mode: the convert pgbench's own summary (if it printed one when killed) spans the
+      # WHOLE convert incl. warmup/cutover and isn't windowed -- always derive convert tps/avg
+      # from the windowed log slice instead, consistent with the windowed pctiles.
+      s=$(pgbench_log_summary convert "$conv_win_lo" "$conv_win_hi"); tps=${s%%|*}; lat=${s##*|}
+    else
+      tps=$(grep -h 'tps =' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
+      lat=$(grep -h 'latency average' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
+      # convert (settle mode) is killed and prints no summary -> derive tps/avg from its log
+      if [ -z "$tps" ]; then s=$(pgbench_log_summary "$ph"); tps=${s%%|*}; lat=${s##*|}; fi
     fi
     pct=$(cat "$RESULTS/$ph.pctiles.txt" 2>/dev/null || echo "n/a")
     printf '| %s | %s | %s | %s |\n' "$ph" "${tps:-n/a}" "${lat:-n/a}" "$pct"
@@ -473,7 +476,11 @@ say "report"
   if [ "$BENCH_OBSERVE_MODE" = window ]; then
     echo "- mode: **gentle / steady-state window** -- measured ~${BENCH_CONVERT_WINDOW_SECS}s of draining"
     echo "  after a ${BENCH_CONVERT_WARMUP_SECS}s warm-up; the drain was deliberately NOT run to completion."
-    echo "  Read it by comparing the **convert** row above to **baseline**: if they track, the drain is unnoticeable."
+    echo "  **Verdict = the latency comparison** (convert p50/p95/p99 vs baseline): if they track, the drain"
+    echo "  is unnoticeable. Throughput (tps) over the window is NOT the verdict -- for a fixed client count"
+    echo "  tps is ~clients/latency, so it only drops if latency rises OR if the workload driver loses its"
+    echo "  connection mid-window (a client/network stall reads as a tps drop with UNCHANGED latency). See"
+    echo "  \`convert.pgbench.txt\` progress lines for per-interval steady-state tps."
   else
     echo "- mode: **stress / run-to-completion** -- drove the drain until the closed tail fully drained."
   fi
