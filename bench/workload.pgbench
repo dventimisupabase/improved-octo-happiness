@@ -1,0 +1,3 @@
+-- pgbench transaction: one server-side workload step (many ops per round-trip).
+-- ops-per-call is injected with `pgbench -D ops=N`.
+SELECT bench.workload_step(:ops);

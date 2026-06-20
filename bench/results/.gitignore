@@ -1,0 +1,4 @@
+# load-test artifacts are large/ephemeral; keep the dir, ignore the contents
+# (commit a curated report.md explicitly with `git add -f` when you want to share one)
+*
+!.gitignore

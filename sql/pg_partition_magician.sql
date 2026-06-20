@@ -40,8 +40,14 @@ create table if not exists pgpm.config (
   drain_batch      int         not null default 5000,
   default_table    name        not null,
   paused           boolean     not null default true,
-  created_at       timestamptz not null default now()
+  created_at       timestamptz not null default now(),
+  -- when maintenance may next attempt premake for this parent. Under sustained write contention
+  -- premake keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
+  -- instead of retrying (and risking a wasted default scan) every tick. null = attempt now.
+  premake_retry_after timestamptz
 );
+-- upgrade path for installs that predate premake_retry_after
+alter table pgpm.config add column if not exists premake_retry_after timestamptz;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -283,7 +289,7 @@ returns text language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_def text; v_cols text; v_batch int;
   v_min text; v_min_native text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text;
-  v_name name; v_open boolean; v_frontier text; v_moved bigint; v_remain bigint;
+  v_name name; v_open boolean; v_frontier text; v_moved bigint; v_more boolean;
   v_excl name; v_method text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -318,6 +324,12 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
 
+  -- ORDER BY the control column: the default's PK leads with the control column (adopt builds
+  -- it that way), so this makes the batch select an INDEX SCAN that reads exactly p_batch rows
+  -- in order. Without it the planner SEQ-SCANs the (large) default to find a batch -- every
+  -- drain_step re-scanning the whole default, a SEQUENTIAL_SCAN_STORM at scale. The index scan
+  -- also needs no sort. (The per-batch temp spill is the data-modifying CTE below materializing
+  -- the moved rows -- it is independent of this ORDER BY.)
   execute format($f$
     with b as (
       delete from %1$s where ctid in (select ctid from %1$s
@@ -329,9 +341,13 @@ begin
   get diagnostics v_moved = row_count;
   insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'drain_move', v_lo, v_hi, v_moved);
 
-  execute format('select count(*) from %s where %I >= %L and %I < %L',
-                 v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_remain;
-  if v_remain > 0 then return 'moved:' || v_moved; end if;
+  -- Does ANY row remain in [lo,hi)? Use EXISTS (index scan, stops at the first row), NOT
+  -- count(*), which re-scans the whole range every microbatch -- O(rows^2/batch), and while
+  -- the default isn't all-visible mid-drain it seq-scans the range each step (a
+  -- SEQUENTIAL_SCAN_STORM at scale). We only need to know whether to keep draining or attach.
+  execute format('select exists(select 1 from %s where %I >= %L and %I < %L)',
+                 v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
+  if v_more then return 'moved:' || v_moved; end if;
 
   if v_open or not cfg.keep_default then
     execute format('alter table %I.%I attach partition %I.%I for values from (%L) to (%L)',
@@ -415,7 +431,8 @@ declare
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb;
-  v_uchk_n bigint; v_uchk_frac numeric;
+  v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name;
+  v_idmax bigint[]; v_m bigint; v_i int;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
@@ -467,18 +484,39 @@ begin
   select array_agg(a.attname order by a.attnum) into v_idcols
     from pg_attribute a where a.attrelid = p_parent and a.attidentity in ('a','d') and not a.attisdropped;
 
+  -- Capture max(identity) NOW, while the table's ORIGINAL indexes still exist. We drop the old PK
+  -- below (step 2) and swap to the composite (control, id) PK (step 4); after that the only index
+  -- covering the identity column no longer leads with it, so a later max(id) would seq-scan the
+  -- whole (large) DEFAULT under adopt's ACCESS EXCLUSIVE lock -- turning the metadata-only cutover
+  -- into an O(rows) blocking operation (minutes on a 100GB+ table). Here, with the original id PK
+  -- index intact, it is an index lookup. The captured value advances the (freshly recreated) parent
+  -- identity sequence in step 8b. (Falls back to whatever plan the original indexes allow if the
+  -- identity column wasn't index-leading -- no worse than before, and index-fast in the common case.)
+  if v_idcols is not null then
+    foreach v_col in array v_idcols loop
+      execute format('select coalesce(max(%I), 0)::bigint from %s', v_col, p_parent::text) into v_m;
+      v_idmax := array_append(v_idmax, v_m);
+    end loop;
+  end if;
+
+  -- new PK columns: partition key first, then the rest of the old PK
+  if v_oldpk is not null then
+    v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
+  end if;
+
   -- secondary (non-PK, non-unique) indexes to recreate on the parent
   select array_agg(c.relname::text), array_agg(pg_get_indexdef(i.indexrelid)) into v_idx_names, v_idx_defs
     from pg_index i join pg_class c on c.oid = i.indexrelid
    where i.indrelid = p_parent and i.indislive and not i.indisprimary and not i.indisunique;
+  -- count unique secondary indexes we can't carry over -- but EXCLUDE a pre-built
+  -- index whose columns match the new PK (pgpm.build_pk_concurrently's index, promoted in step 4).
   select count(*) into v_skipped from pg_index i
-   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary;
+   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary
+     and (v_pkcols is null or (select array_agg(a.attname::text order by k.ord)
+            from unnest(i.indkey) with ordinality as k(attnum, ord)
+            join pg_attribute a on a.attrelid = p_parent and a.attnum = k.attnum) is distinct from v_pkcols);
   if v_skipped > 0 then
     raise notice 'pg_partition_magician: skipped % unique secondary index(es) on %; recreate on the parent manually (must include the partition key)', v_skipped, p_parent;
-  end if;
-
-  if v_oldpk is not null then
-    v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
   end if;
 
   -- 0. incoming FKs (capture before the rename; record after the new parent exists)
@@ -528,12 +566,30 @@ begin
     end loop;
   end if;
 
-  -- 4. promote a composite unique index on the default to its PK (reused, not rebuilt)
+  -- 4. establish the default's PK on (partition key, rest of old PK). If a matching
+  -- unique index was pre-built online (pgpm.build_pk_concurrently -> CREATE UNIQUE INDEX
+  -- CONCURRENTLY, run by the operator before adopt), promote THAT -- a metadata-only
+  -- step, so adopt holds its ACCESS EXCLUSIVE lock only briefly. Otherwise build the
+  -- index in-transaction: correct, but O(rows) under the lock (fine for small tables,
+  -- a multi-minute write-blocking window on very large ones -- prefer build_pk_concurrently).
   if v_pkcols is not null then
-    execute format('create unique index %I on %s (%s)', (v_default || '_pk_tmp'), v_defreg::text,
-                   (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+    select c.relname into v_prebuilt
+      from pg_index i join pg_class c on c.oid = i.indexrelid
+     where i.indrelid = v_defreg and i.indisunique and i.indisvalid and not i.indisprimary
+       and i.indpred is null and i.indexprs is null
+       and (select array_agg(a.attname::text order by k.ord)
+              from unnest(i.indkey) with ordinality as k(attnum, ord)
+              join pg_attribute a on a.attrelid = v_defreg and a.attnum = k.attnum) = v_pkcols
+     limit 1;
+    if v_prebuilt is null then
+      v_prebuilt := (v_default || '_pk_tmp')::name;
+      execute format('create unique index %I on %s (%s)', v_prebuilt, v_defreg::text,
+                     (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+    else
+      raise notice 'pg_partition_magician: reusing pre-built unique index % as the PK (adopt stays metadata-only)', v_prebuilt;
+    end if;
     execute format('alter table %s add constraint %I primary key using index %I',
-                   v_defreg::text, (v_default || '_pkey'), (v_default || '_pk_tmp'));
+                   v_defreg::text, (v_default || '_pkey'), v_prebuilt);
   end if;
 
   -- 5. create the partitioned parent under the original name (no PK yet)
@@ -557,11 +613,14 @@ begin
                    (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
   end if;
 
-  -- 8b. advance identity sequences past the largest existing value
+  -- 8b. advance each identity sequence past the largest existing value -- using the max captured
+  -- up front (index lookup), NOT a fresh max() here (which would seq-scan the default now that the
+  -- id-leading index is gone). The parent's identity sequence was freshly created in step 6, so
+  -- this advance is REQUIRED: without it the next insert would collide at id = 1.
   if v_idcols is not null then
-    foreach v_col in array v_idcols loop
-      execute format('select setval(pg_get_serial_sequence(%L, %L), coalesce((select max(%I) from %s), 0) + 1, false)',
-                     v_parent::text, v_col, v_col, v_defreg::text);
+    for v_i in 1 .. array_length(v_idcols, 1) loop
+      execute format('select setval(pg_get_serial_sequence(%L, %L), %s, false)',
+                     v_parent::text, v_idcols[v_i], v_idmax[v_i] + 1);
     end loop;
   end if;
 
@@ -606,8 +665,92 @@ begin
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
-  perform pgpm.premake(v_parent);
+  -- NOTE: premake is intentionally NOT run inside adopt. It attaches future partitions,
+  -- and attaching a partition to a parent whose DEFAULT already holds data makes Postgres
+  -- scan the default -- which, inside this ACCESS EXCLUSIVE transaction, blocks ALL access
+  -- for the whole scan (O(default), minutes on a large table). adopt() therefore does the
+  -- metadata-only cutover ONLY (a fresh parent with just the DEFAULT attached scans nothing),
+  -- so it stays online even at scale. Run pgpm.premake(parent) (or pgpm.maintenance, or the
+  -- scheduled maintenance job) AFTER adopt to build the future partitions online -- its
+  -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until premake
+  -- runs, new writes route to the DEFAULT (correct, just not yet split into future cells).
   return v_parent;
+end;
+$$;
+
+-- build_pk_concurrently: build the default's composite PK index ONLINE before adopt,
+-- so the adopt cutover stays metadata-only. Building it inside adopt() would be O(rows)
+-- under ACCESS EXCLUSIVE -- a multi-minute write-blocking window on a large table.
+-- CREATE INDEX CONCURRENTLY can't run inside a function/procedure, but it CAN run from
+-- a pg_cron background worker (pgpm already requires pg_cron) -- so this schedules the
+-- CIC as a cron job, polls until the index is valid (committing between polls to see
+-- the worker's progress), then unschedules. The operator just calls this, then adopt()
+-- -- which finds the pre-built index by its columns and promotes it. No DDL hand-off.
+--   call pgpm.build_pk_concurrently('public.events','created_at');
+--   select pgpm.adopt('public.events','created_at', interval '1 month');
+create or replace procedure pgpm.build_pk_concurrently(
+  p_parent regclass, p_control name, p_timeout interval default '6 hours', p_poll interval default '5 seconds'
+) language plpgsql as $$
+declare
+  v_nsp name; v_rel name; v_oldpk text[]; v_pkcols text[]; v_idxname name; v_cols text;
+  v_idreg regclass; v_job text; v_deadline timestamptz; v_valid boolean; v_status text; v_msg text;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  select array_agg(a.attname::text order by k.ord) into v_oldpk
+    from pg_constraint con
+    cross join lateral unnest(con.conkey) with ordinality as k(attnum, ord)
+    join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+   where con.conrelid = p_parent and con.contype = 'p';
+  if v_oldpk is null then
+    raise notice 'pg_partition_magician: % has no primary key; adopt() builds none -- nothing to pre-build', p_parent;
+    return;
+  end if;
+  -- same PK derivation as _adopt: partition key first, then the rest of the old PK
+  v_pkcols  := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
+  v_idxname := (v_rel || '_pgpm_pkey_pre')::name;
+  v_cols    := (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x);
+
+  v_idreg := to_regclass(format('%I.%I', v_nsp, v_idxname));
+  if v_idreg is not null and (select indisvalid from pg_index where indexrelid = v_idreg) then
+    raise notice 'pg_partition_magician: %.% already built and valid -- run adopt() next', v_nsp, v_idxname;
+    return;
+  elsif v_idreg is not null then
+    execute format('drop index if exists %I.%I', v_nsp, v_idxname);  -- invalid leftover from a prior attempt
+  end if;
+
+  -- CIC from a pg_cron worker (top-level, so it's allowed). IF NOT EXISTS makes re-fires
+  -- no-ops; we unschedule the moment the index goes valid.
+  v_job := 'pgpm_build_' || v_nsp || '_' || v_rel;
+  perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+  -- pg_cron's sub-minute form is 'N seconds' (not an interval's '00:00:05' text)
+  perform cron.schedule(v_job, format('%s seconds', greatest(1, extract(epoch from p_poll)::int)),
+    format('create unique index concurrently if not exists %I on %I.%I (%s)', v_idxname, v_nsp, v_rel, v_cols));
+  raise notice 'pg_partition_magician: building % concurrently via pg_cron job % ...', v_idxname, v_job;
+
+  v_deadline := clock_timestamp() + p_timeout;
+  loop
+    commit;                       -- observe the cron worker's committed catalog changes
+    perform pg_sleep(extract(epoch from p_poll));
+    v_idreg := to_regclass(format('%I.%I', v_nsp, v_idxname));
+    if v_idreg is not null then
+      select indisvalid into v_valid from pg_index where indexrelid = v_idreg;
+      exit when v_valid;
+    end if;
+    select status, return_message into v_status, v_msg from cron.job_run_details
+      where jobid = (select jobid from cron.job where jobname = v_job)
+      order by start_time desc limit 1;
+    if v_status = 'failed' and coalesce(v_msg, '') not ilike '%already exists%' then
+      perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+      raise exception 'pg_partition_magician: concurrent index build failed: %', v_msg;
+    end if;
+    if clock_timestamp() > v_deadline then
+      perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+      raise exception 'pg_partition_magician: concurrent index build did not finish within %', p_timeout;
+    end if;
+  end loop;
+  perform cron.unschedule(jobid) from cron.job where jobname = v_job;
+  raise notice 'pg_partition_magician: % is valid -- run adopt() now (it reuses this index, metadata-only)', v_idxname;
 end;
 $$;
 
@@ -646,15 +789,70 @@ $$;
 
 create or replace function pgpm.maintenance(p_parent regclass)
 returns text language plpgsql as $$
-declare cfg pgpm.config; v_made int; v_dropped int; v_drain text;
+declare
+  cfg pgpm.config;
+  v_made int := 0; v_dropped int := 0; v_drain text := 'skipped';
+  v_note text := '';
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   if cfg.paused then return 'paused'; end if;
-  v_made    := pgpm.premake(p_parent);
-  v_dropped := pgpm.retention(p_parent);
-  v_drain   := pgpm.drain_step(p_parent);
-  return format('premade=%s dropped=%s drain=%s', v_made, v_dropped, v_drain);
+
+  -- Maintenance is a background janitor; it must NEVER block -- let alone deadlock -- the live
+  -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
+  -- is DEFERRED (retried next tick) WITHOUT aborting the drain.
+  --
+  -- premake/retention get a VERY SHORT lock_timeout. Premaking a future partition's first step
+  -- (ADD CONSTRAINT on the default, for the scan-skip path) takes ACCESS EXCLUSIVE on the default
+  -- -- which the live workload's inserts hold almost continuously. A long timeout there is doubly
+  -- bad: it blocks the workload for the whole wait (the pending ACCESS EXCLUSIVE queues every new
+  -- locker behind it), AND if it does win the lock it goes on to VALIDATE-scan the entire default
+  -- before the CREATE -- a scan that is wasted whenever the CREATE then can't get its lock. Failing
+  -- fast makes a deferral nearly free: no long block, and it bails before that scan. premake is
+  -- optional (the future cells aren't written yet; the DEFAULT catches anything), so it simply
+  -- retries when the workload next has a gap.
+  perform set_config('lock_timeout', '200ms', true);
+
+  -- premake back-off: once a deferral happens, don't retry every tick -- under sustained write
+  -- contention premake can't win the lock for minutes, and each attempt risks a wasted default
+  -- scan. Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches
+  -- them), so deferring premake is harmless. A successful premake clears the back-off.
+  if coalesce(cfg.premake_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
+    begin
+      v_made := pgpm.premake(p_parent);
+      if cfg.premake_retry_after is not null then
+        update pgpm.config set premake_retry_after = null where parent_table = p_parent;
+      end if;
+    exception when others then
+      v_note := v_note || ' premake_deferred';
+      update pgpm.config set premake_retry_after = clock_timestamp() + interval '30 seconds'
+        where parent_table = p_parent;
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'premake_skip', left(sqlerrm, 200));
+    end;
+  else
+    v_note := v_note || ' premake_backoff';
+  end if;
+
+  begin
+    v_dropped := pgpm.retention(p_parent);
+  exception when others then
+    v_note := v_note || ' retention_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'retention_skip', left(sqlerrm, 200));
+  end;
+
+  -- The drain IS the conversion: give its (infrequent) partition attach room to win its lock,
+  -- so progress isn't starved. Its scans run under SHARE UPDATE EXCLUSIVE (non-blocking to the
+  -- workload); only the brief final ATTACH needs a stronger lock.
+  perform set_config('lock_timeout', '3s', true);
+  begin
+    v_drain := pgpm.drain_step(p_parent);
+  exception when others then
+    v_drain := 'deferred';
+    v_note := v_note || ' drain_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'drain_skip', left(sqlerrm, 200));
+  end;
+
+  return format('premade=%s dropped=%s drain=%s%s', v_made, v_dropped, v_drain, v_note);
 end;
 $$;
 
