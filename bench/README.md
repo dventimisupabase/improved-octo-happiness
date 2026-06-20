@@ -37,17 +37,23 @@ about the vCPU count to split the target across that many concurrent generator
 sessions (they all append to `bench.events`; the identity sequence keeps ids unique
 and the month-spread is unchanged).
 
-## The phases
+## The phases (a passive observer)
 
-1. **baseline**: steady workload against the *unpartitioned* table.
-2. **adopt**: fire `pgpm.adopt()` while the workload runs; time the (metadata-only) cutover.
-3. **drain**: loop `pgpm.drain_step()` to move the historical months into real
-   partitions, *under continuous load*; sample default-size / dead-tuples / partition
-   count over time.
-4. **post**: steady workload against the now-partitioned table.
+pgpm is **self-driving**: you call `adopt()` once and pgpm's own pg_cron maintenance
+premakes and drains the default autonomously, inside the database. So this harness does
+**not** perform the partitioning — it sets pgpm up the way an operator would, drives an
+ambient workload, and *observes*. Three phases:
 
-The report compares tps, average + p50/p95/p99 latency, and health gauges across
-all four phases so any degradation during adopt/drain is visible.
+1. **baseline**: ambient workload against the *unpartitioned* table.
+2. **convert**: fire `pgpm.adopt()` once (`p_paused => false`) and schedule
+   `pgpm.maintenance` on pg_cron — then **pgpm** premakes and drains the default on its
+   own while the harness samples metrics and watches `pgpm.log` until the drain settles.
+   The harness never calls `drain_step`; because the conversion runs server-side, a
+   dropped observer connection can't stop it.
+3. **post**: ambient workload against the now-partitioned table.
+
+The report compares tps, p50/p95/p99 latency, and health/WAL gauges across the three
+phases, so any degradation *while pgpm converts the table under load* is visible.
 
 ## Running it
 
@@ -83,17 +89,18 @@ keeps `pgbench`'s own tps/latency numbers meaningful alongside the server-side o
 | `BENCH_CHUNK` | `2000000` | generator commit chunk |
 | `BENCH_GEN_JOBS` | `1` | parallel generator sessions: set to ≈vCPU to fan generation across cores (one `INSERT…SELECT` is single-core-bound) |
 | `BENCH_DEFER_INDEX` | `0` | drop the secondary index during bulk load, rebuild after; avoids scattered per-row index maintenance across hundreds of millions of inserts |
-| `BENCH_PREPARE_ADOPT` | `0` | build the PK index `CONCURRENTLY` online (a new `prepare` phase, under load) before `adopt`, so the cutover is metadata-only. **Essential at scale**: otherwise `adopt` builds the index in-transaction under `ACCESS EXCLUSIVE` (a multi-minute write-blocking window on a 100GB+ table) |
+| `BENCH_PREPARE_ADOPT` | `0` | run `pgpm.build_pk_concurrently()` (online PK index, cron-driven inside pgpm) before `adopt`, so the cutover is metadata-only. **Essential at scale**: otherwise `adopt` builds the index in-transaction under `ACCESS EXCLUSIVE` (a multi-minute write-blocking window on a 100GB+ table) |
 | `BENCH_INTERVAL` | `1 month` | partition width |
-| `BENCH_PREMAKE` | `3` | future partitions to premake at adopt |
-| `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | pgbench concurrency |
-| `BENCH_OPS` | `50` | server-side ops per `workload_step` call |
-| `BENCH_PHASE_SECS` | `120` | baseline/post load duration |
-| `BENCH_OPS` | `50` | server-side ops per `workload_step` call, **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table will blow `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
+| `BENCH_PREMAKE` | `3` | future partitions pgpm premakes (configured on adopt; pgpm's maintenance does it) |
+| `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | ambient-workload pgbench concurrency |
+| `BENCH_OPS` | `50` | server-side ops per `workload_step` call — **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table blows `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
+| `BENCH_PHASE_SECS` | `120` | baseline/post observation duration |
 | `BENCH_MAX_FAIL_PCT` | `5` | abort right after baseline if more than this % of transactions failed (catches a mis-calibrated `BENCH_OPS` in minutes instead of hours) |
-| `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step` |
-| `BENCH_DRAIN_SLEEP` | `0` | pause between drain steps (s); `0` = full speed |
-| `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the drain window |
+| `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step` — set on `adopt`; **pgpm** uses it when *it* drains |
+| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintenance` — how often pgpm drives premake + drain |
+| `BENCH_OBSERVE_INTERVAL` | `15` | how often (s) the harness samples while pgpm drains |
+| `BENCH_DRAIN_IDLE_SECS` | `120` | drain is "settled" after this long with no pgpm drain activity in `pgpm.log` |
+| `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the observation window |
 | `BENCH_PGFR` / `BENCH_PGFR_DIR` | `0` / `bench/vendor/pg_flight_recorder` | install + enable pg_flight_recorder (record + analyze) for WAL/checkpoint/wait telemetry; clone the repo into `BENCH_PGFR_DIR` first |
 | `BENCH_SKIP_GENERATE` | `0` | reuse already-loaded data |
 
@@ -164,16 +171,19 @@ Two layers, complementary:
 
 ## Interpreting the results
 
-- **adopt** should show tps ~unchanged from baseline: it's metadata-only. Expect a
-  single large `max` latency: the brief `ACCESS EXCLUSIVE` lock on the rename/attach.
-  p95/p99 stay close to baseline (only the handful of txns caught in that window pay).
-- **drain** runs fully online; p50/p95 stay low. The `max` tail comes from rare txns
-  queued behind a partition `ATTACH` lock under contention. Raise `BENCH_DRAIN_SLEEP`
-  (e.g. `0.25`) to pace the drain and shrink that tail at the cost of a longer drain.
-- **post** is measured after a `VACUUM (ANALYZE)` so it reflects steady state, not the
-  drain's transient dead tuples. The table is larger than at baseline (the load kept
-  inserting throughout), so compare latency shape, not just absolute tps.
-- A clean run preserves every row: final `count(*)` = generated + inserted-under-load.
+- **convert** is the window that matters: pgpm is premaking + draining the default while
+  the ambient workload runs. p50/p95 should stay close to baseline — the conversion is
+  online. Expect occasional `max` blips: the brief `ACCESS EXCLUSIVE` on the adopt cutover,
+  and pgpm's partition `ATTACH`es. If `max` is large or sustained, that's a real finding
+  worth chasing (e.g. the adopt's prep wasn't done, so the PK index built in-transaction).
+- **drain progress** is in `drain.progress.csv`: the default shrinks as pgpm drains the
+  closed months, then *grows* once they're gone (the open/current month stays in the
+  default and the ambient workload keeps filling it) — that's the drain reaching "settled."
+- **post** reflects the post-conversion steady state; pgpm tuned autovacuum aggressively on
+  the default at adopt, so dead tuples from the drain reclaim over time. The table is larger
+  than at baseline (the workload kept inserting), so compare latency *shape*, not just tps.
+- The conversion runs **server-side via pg_cron** — the harness only observes, so a dropped
+  observer connection is harmless (it retries; pgpm keeps draining).
 
 > Re-running against the **same** database needs a reset first
 > (`drop schema bench cascade; drop schema pgpm cascade;`), the harness never drops

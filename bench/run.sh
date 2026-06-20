@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # At-scale load test for pg_partition_magician.
 #
-# Builds a multi-table DB with one giant time-series table (bench.events),
-# generates the bulk DATA SERVER-SIDE (nothing crosses the wire), then drives a
-# steady index-supported OLTP workload while pg_partition_magician converts the
-# giant table to partitioned ONLINE. Captures latency/throughput/health before,
-# during, and after the conversion so the impact is measurable.
+# pgpm is self-driving: you call adopt() once and pgpm's own pg_cron maintenance
+# premakes + drains the default autonomously, inside the database. So this harness is a
+# PASSIVE OBSERVER -- it (1) generates the bulk data SERVER-SIDE, (2) drives an ambient
+# OLTP workload that has nothing to do with pgpm, (3) triggers the conversion once
+# (adopt + schedule pgpm.maintenance) and then OBSERVES pgpm convert the table online,
+# sampling latency/throughput/health before/during/after, and (4) writes a report.
+# It never drives drain_step/premake itself; the conversion runs server-side.
 #
 # Everything is parameterised by env vars (see bench/README.md). The connection
 # string is read from PGHOST/PGUSER/... or a single BENCH_DSN; it is NEVER echoed.
@@ -33,9 +35,11 @@ BENCH_PHASE_SECS="${BENCH_PHASE_SECS:-120}" # per-phase load duration (baseline/
 BENCH_ADOPT_WARM="${BENCH_ADOPT_WARM:-15}"  # load lead-in before firing adopt
 BENCH_MAX_FAIL_PCT="${BENCH_MAX_FAIL_PCT:-5}"  # abort if baseline workload exceeds this failure % (mis-calibrated BENCH_OPS)
 
-BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step
-BENCH_DRAIN_SLEEP="${BENCH_DRAIN_SLEEP:-0}"      # pause between drain steps (s); 0 = full speed
-BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-3600}"  # safety cap on the drain window
+BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step (configured on adopt; pgpm uses it)
+BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-3600}"  # safety cap on the observation window
+BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-5 seconds}"  # pg_cron schedule for pgpm.maintenance (pgpm self-drives the drain)
+BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-15}"     # how often (s) the harness samples while pgpm drains
+BENCH_DRAIN_IDLE_SECS="${BENCH_DRAIN_IDLE_SECS:-120}"      # drain is "settled" after this long with no pgpm drain activity
 
 BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder (best-effort; needs elevated privs, PG15-17)
 BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr checkout (pgfr_record + pgfr_analyze)
@@ -151,7 +155,7 @@ wal_report() {
   python3 - "$RESULTS" <<'PY'
 import sys, os, csv
 res = sys.argv[1]
-order = ['_ref', 'baseline', 'prepare', 'adopt', 'drain', 'post']
+order = ['_ref', 'baseline', 'convert', 'post']
 rows = {}
 for ph in order:
     p = os.path.join(res, f'{ph}.wal.csv')
@@ -169,7 +173,7 @@ def pretty(n):
     return f'{n:.1f} PB'
 cols = [('wal_bytes_total', 'WAL bytes'), ('wal_records', 'WAL records'),
         ('wal_fpi', 'WAL FPI'), ('checkpoints', 'checkpoints'), ('ckpt_buffers', 'ckpt buffers')]
-have = [ph for ph in ['baseline', 'prepare', 'adopt', 'drain', 'post'] if ph in rows]
+have = [ph for ph in ['baseline', 'convert', 'post'] if ph in rows]
 if not have:
     print('_(WAL/checkpoint gauges unavailable this run.)_')
     sys.exit(0)
@@ -344,118 +348,78 @@ wal_snapshot _ref                                                # WAL/checkpoin
 run_phase baseline "$BENCH_PHASE_SECS"
 assert_workload_healthy baseline   # bail now if the workload is timing out, before adopt/drain/post
 
-# ---- 3b. prepare: build the PK index CONCURRENTLY under load (keeps adopt online) --
-# pgpm.build_pk_concurrently() schedules the CIC as a pg_cron job and blocks (polling)
-# until the index is valid -- entirely inside pgpm, no DDL handed back. We run it under
-# live load to measure the online build's impact on the workload.
+# ---- 4. conversion: trigger pgpm ONCE, then OBSERVE it self-drive -----------
+# The benchmark does NOT perform the partitioning. It sets pgpm up the way an operator
+# does -- fire adopt() once (unpaused) and schedule pgpm.maintenance on pg_cron -- and then
+# pgpm's OWN cron jobs premake + drain the default autonomously, inside the database. The
+# harness only runs the ambient workload and OBSERVES (samples + watches pgpm.log) until the
+# drain settles. Nothing here calls drain_step or premake; a dropped observer connection
+# can't stop the conversion, because the conversion isn't running on this connection.
+say "conversion: trigger pgpm.adopt, then observe pgpm self-drive (pg_cron) under load"
+pgss_reset
+rm -f "$RESULTS/pgb_convert".*
+# one continuous ambient workload spanning the whole conversion (prep + adopt + drain)
+conv_bg_secs=$(( BENCH_DRAIN_MAX_SECS + 1200 ))
+( if [ -n "$BENCH_DSN" ]; then \
+    "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$conv_bg_secs" -P 5 \
+      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_convert"; \
+  else \
+    "$PGBENCH" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$conv_bg_secs" -P 5 \
+      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_convert"; \
+  fi > "$RESULTS/convert.pgbench.txt" 2>&1 ) &
+load_pid=$!; BG_PIDS+=("$load_pid")
+
+# 4a. operator prep (online): build the PK index concurrently so adopt stays metadata-only
 if [ "$BENCH_PREPARE_ADOPT" = "1" ]; then
-  say "prepare adopt: build PK index CONCURRENTLY under load (pgpm.build_pk_concurrently, online)"
-  pgss_reset
-  rm -f "$RESULTS/pgb_prepare".*
-  ( if [ -n "$BENCH_DSN" ]; then \
-      "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_DRAIN_MAX_SECS" -P 5 \
-        -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_prepare"; \
-    else \
-      "$PGBENCH" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_DRAIN_MAX_SECS" -P 5 \
-        -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_prepare"; \
-    fi > "$RESULTS/prepare.pgbench.txt" 2>&1 ) &
-  load_pid=$!; BG_PIDS+=("$load_pid")
-  echo "  calling pgpm.build_pk_concurrently('bench.events','created_at') -- cron-driven online build..."
-  prep_start=$(q "select extract(epoch from clock_timestamp())")
+  echo "  pgpm.build_pk_concurrently (online PK index, cron-driven inside pgpm)..."
+  t0=$(q "select extract(epoch from clock_timestamp())")
   q "call pgpm.build_pk_concurrently('bench.events','created_at')" >/dev/null
-  prep_end=$(q "select extract(epoch from clock_timestamp())")
-  kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
-  awk -v a="$prep_start" -v b="$prep_end" 'BEGIN{printf "  PK index built online in %.1fs (writes never blocked)\n", b-a}'
-  pgss_snapshot prepare; health_snapshot prepare; wal_snapshot prepare; pgfr_snapshot prepare
-  printf '%s\n' "$(pctiles prepare)" > "$RESULTS/prepare.pctiles.txt"
-  echo "  latency during online build: $(cat "$RESULTS/prepare.pctiles.txt")"
+  awk -v a="$t0" -v b="$(q "select extract(epoch from clock_timestamp())")" 'BEGIN{printf "  PK index built online in %.1fs\n", b-a}'
 fi
 
-# ---- 4. adopt under load ---------------------------------------------------
-say "adopt under load"
-pgss_reset
-rm -f "$RESULTS/pgb_adopt".*   # drop any prior-run logs so pctiles is fresh
-adopt_bg_secs=$(( BENCH_ADOPT_WARM + 30 ))
-( if [ -n "$BENCH_DSN" ]; then \
-    "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$adopt_bg_secs" -P 5 \
-      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" \
-      --log "--log-prefix=$RESULTS/pgb_adopt"; \
-  else \
-    "$PGBENCH" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$adopt_bg_secs" -P 5 \
-      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" \
-      --log "--log-prefix=$RESULTS/pgb_adopt"; \
-  fi > "$RESULTS/adopt.pgbench.txt" 2>&1 ) &
-load_pid=$!; BG_PIDS+=("$load_pid")
-sleep "$BENCH_ADOPT_WARM"
-echo "  firing pgpm.adopt('bench.events','created_at','$BENCH_INTERVAL') under live load..."
-adopt_start=$(q "select extract(epoch from clock_timestamp())")
-q "select pgpm.adopt('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_PREMAKE)" >/dev/null
-adopt_end=$(q "select extract(epoch from clock_timestamp())")
-awk -v a="$adopt_start" -v b="$adopt_end" 'BEGIN{printf "  adopt() returned in %.3fs (metadata-only; table is now partitioned)\n", b-a}'
-wait "$load_pid" || true
-pgss_snapshot adopt
-health_snapshot adopt
-wal_snapshot adopt
-pgfr_snapshot adopt
-printf '%s\n' "$(pctiles adopt)" > "$RESULTS/adopt.pctiles.txt"
-echo "  default holds: $(q "select coalesce(n_live_tup,0)::bigint from pg_stat_user_tables where relid='bench.events_default'::regclass") rows to drain"
+# 4b. the single operator trigger: adopt() unpaused. pgpm takes it from here.
+echo "  firing pgpm.adopt('bench.events','created_at','$BENCH_INTERVAL', paused=>false)..."
+adopt_t0=$(q "select extract(epoch from clock_timestamp())")
+q "select pgpm.adopt('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_PREMAKE, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
+adopt_t1=$(q "select extract(epoch from clock_timestamp())")
+awk -v a="$adopt_t0" -v b="$adopt_t1" 'BEGIN{printf "  adopt() returned in %.1fs (metadata cutover)\n", b-a}'
 
-# ---- 5. drain under load ---------------------------------------------------
-say "drain under load"
-pgss_reset
-rm -f "$RESULTS/pgb_drain".*   # drop any prior-run logs so pctiles is fresh
-( if [ -n "$BENCH_DSN" ]; then \
-    "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_DRAIN_MAX_SECS" -P 5 \
-      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" \
-      --log "--log-prefix=$RESULTS/pgb_drain"; \
-  else \
-    "$PGBENCH" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_DRAIN_MAX_SECS" -P 5 \
-      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" \
-      --log "--log-prefix=$RESULTS/pgb_drain"; \
-  fi > "$RESULTS/drain.pgbench.txt" 2>&1 ) &
-load_pid=$!; BG_PIDS+=("$load_pid")
-drain_start=$(q "select extract(epoch from clock_timestamp())")
+# 4c. schedule pgpm.maintenance on pg_cron -- THIS is how pgpm self-drives premake + drain
+#     (standard pgpm operation; the operator schedules it once; pg_cron skips overlapping runs)
+q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
+q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintenance_all()')" >/dev/null
+echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now draining itself"
+
+# 4d. OBSERVE (passive): sample + watch pgpm.log until pgpm's drain settles. A failed poll
+#     is non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless.
 : > "$RESULTS/drain.progress.csv"
-# default_rows_est is pg_stat_user_tables.n_live_tup (instant estimate) -- an exact
-# count(*) over the default is a full scan (100s+ at scale) and would dominate the loop.
-echo "elapsed_s,default_rows_est,partitions,status" >> "$RESULTS/drain.progress.csv"
-steps=0
+echo "observed_s,default_rows_est,partitions,last_drain_age_s" >> "$RESULTS/drain.progress.csv"
+obs_start=$(q "select extract(epoch from clock_timestamp())")
 while :; do
-  status=$(q "select pgpm.drain_step('bench.events', $BENCH_DRAIN_BATCH)")
-  steps=$((steps + 1))
-  if [ $((steps % 10)) -eq 0 ] || [ "${status%%:*}" = "attached" ]; then
-    now_s=$(q "select extract(epoch from clock_timestamp())")
-    elapsed=$(awk -v a="$drain_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
-    drows=$(q "select coalesce(n_live_tup,0)::bigint from pg_stat_user_tables where relid='bench.events_default'::regclass")
-    nparts=$(q "select count(*) from pg_inherits where inhparent='bench.events'::regclass")
-    printf '%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$status" >> "$RESULTS/drain.progress.csv"
-    printf '\r  drain: %ss elapsed, default=%s rows, %s partitions, last=%s   ' \
-      "$elapsed" "$drows" "$nparts" "$status"
+  sleep "$BENCH_OBSERVE_INTERVAL"
+  now_s=$(q "select extract(epoch from clock_timestamp())" 2>/dev/null) || { echo "  (observe poll failed -- retrying)"; continue; }
+  elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
+  drows=$(q "select coalesce(n_live_tup,0)::bigint from pg_stat_user_tables where relid='bench.events_default'::regclass" 2>/dev/null) || drows='?'
+  nparts=$(q "select count(*) from pg_inherits where inhparent='bench.events'::regclass" 2>/dev/null) || nparts='?'
+  age=$(q "select coalesce(round(extract(epoch from (clock_timestamp()-max(at))))::int, 999999) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')" 2>/dev/null) || age='?'
+  printf '%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$age" >> "$RESULTS/drain.progress.csv"
+  printf '\r  observing: %ss, default~%s rows, %s partitions, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$age"
+  if [ "$age" != '?' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
+    echo; echo "  pgpm drain settled -- no drain activity for ${age}s (default drained to the open interval)"; break
   fi
-  [ "$status" = "idle" ] && break
-  now_s=$(q "select extract(epoch from clock_timestamp())")
-  if awk -v a="$drain_start" -v b="$now_s" -v m="$BENCH_DRAIN_MAX_SECS" 'BEGIN{exit !(b-a > m)}'; then
-    echo; echo "  drain hit BENCH_DRAIN_MAX_SECS cap; stopping"; break
+  if awk -v e="$elapsed" -v m="$BENCH_DRAIN_MAX_SECS" 'BEGIN{exit !(e+0 > m+0)}'; then
+    echo; echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s; stopping"; break
   fi
-  [ "$BENCH_DRAIN_SLEEP" != "0" ] && sleep "$BENCH_DRAIN_SLEEP" || true
 done
-drain_end=$(q "select extract(epoch from clock_timestamp())")
-echo
-awk -v a="$drain_start" -v b="$drain_end" -v s="$steps" \
-  'BEGIN{printf "  drain complete: %d steps in %.1fs (closed history fully partitioned)\n", s, b-a}'
-kill "$load_pid" 2>/dev/null || true
-wait "$load_pid" 2>/dev/null || true
-pgss_snapshot drain
-health_snapshot drain
-wal_snapshot drain
-pgfr_snapshot drain
-printf '%s\n' "$(pctiles drain)" > "$RESULTS/drain.pctiles.txt"
+kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
+q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
+pgss_snapshot convert; health_snapshot convert; wal_snapshot convert; pgfr_snapshot convert
+printf '%s\n' "$(pctiles convert)" > "$RESULTS/convert.pctiles.txt"
+echo "  ambient-workload latency through the conversion: $(cat "$RESULTS/convert.pctiles.txt")"
 
-# ---- 6. post (partitioned, under load) -------------------------------------
-# Reclaim the dead tuples the drain left in the default before measuring: "after
-# conversion" steady state has a vacuumed default, not the drain's transient bloat.
-say "vacuum + analyze before post (settle the conversion)"
-q "vacuum (analyze) bench.events" >/dev/null
+# ---- 5. post (partitioned, under load) -------------------------------------
+# Pure observer: no operator VACUUM here. pgpm tuned autovacuum aggressively on the
+# default at adopt, so post observes the real post-conversion steady state as it settles.
 run_phase post "$BENCH_PHASE_SECS"
 
 # ---- 7. report -------------------------------------------------------------
@@ -466,13 +430,13 @@ say "report"
   echo "- rows: $(q "select count(*) from bench.events")"
   echo "- events size: $(q "select $EVENTS_SIZE_SUB")"
   echo "- partitions: $(q "select count(*) from pg_inherits where inhparent='bench.events'::regclass")"
-  echo "- clients: $BENCH_CLIENTS, ops/call: $BENCH_OPS, drain batch: $BENCH_DRAIN_BATCH"
+  echo "- clients: $BENCH_CLIENTS, ops/call: $BENCH_OPS, drain batch: $BENCH_DRAIN_BATCH (pgpm-driven via pg_cron every '$BENCH_MAINT_INTERVAL')"
   echo
   echo "## throughput / latency by phase"
   echo
   echo "| phase | pgbench tps | pgbench avg latency | server-side latency (pgbench --log) |"
   echo "|-------|-------------|---------------------|--------------------------------------|"
-  for ph in baseline prepare adopt drain post; do
+  for ph in baseline convert post; do
     tps=$(grep -h 'tps =' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || echo "n/a")
     lat=$(grep -h 'latency average' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || echo "n/a")
     pct=$(cat "$RESULTS/$ph.pctiles.txt" 2>/dev/null || echo "n/a")
@@ -484,7 +448,7 @@ say "report"
   if [ -f "$RESULTS/baseline.health.csv" ]; then
     head -1 "$RESULTS/baseline.health.csv" | sed 's/,/ | /g; s/^/| /; s/$/ |/'
     head -1 "$RESULTS/baseline.health.csv" | sed 's/[^,]*/---/g; s/,/ | /g; s/^/| /; s/$/ |/'
-    for ph in baseline prepare adopt drain post; do
+    for ph in baseline convert post; do
       [ -f "$RESULTS/$ph.health.csv" ] && tail -1 "$RESULTS/$ph.health.csv" | sed 's/,/ | /g; s/^/| /; s/$/ |/'
     done
   fi
