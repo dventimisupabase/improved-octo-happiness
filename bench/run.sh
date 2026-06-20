@@ -31,6 +31,7 @@ BENCH_JOBS="${BENCH_JOBS:-4}"               # pgbench worker threads
 BENCH_OPS="${BENCH_OPS:-50}"                # server-side ops per workload_step call
 BENCH_PHASE_SECS="${BENCH_PHASE_SECS:-120}" # per-phase load duration (baseline/post)
 BENCH_ADOPT_WARM="${BENCH_ADOPT_WARM:-15}"  # load lead-in before firing adopt
+BENCH_MAX_FAIL_PCT="${BENCH_MAX_FAIL_PCT:-5}"  # abort if baseline workload exceeds this failure % (mis-calibrated BENCH_OPS)
 
 BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step
 BENCH_DRAIN_SLEEP="${BENCH_DRAIN_SLEEP:-0}"      # pause between drain steps (s); 0 = full speed
@@ -224,6 +225,28 @@ run_phase() {
   echo "  latency: $(cat "$RESULTS/$label.pctiles.txt")"
 }
 
+# Fail fast: a workload that's timing out (BENCH_OPS too high for the data's
+# disk-bound per-op cost at scale) shows up as high failure % / collapsed tps in
+# the FIRST phase. Abort now instead of limping for hours through a useless run.
+assert_workload_healthy() {
+  local label="$1" f tps
+  f=$(grep -oE 'number of failed transactions: [0-9]+ \([0-9.]+%\)' "$RESULTS/$label.pgbench.txt" 2>/dev/null \
+        | grep -oE '[0-9.]+%' | head -1 | tr -d '%')
+  tps=$(grep -oE 'tps = [0-9.]+' "$RESULTS/$label.pgbench.txt" 2>/dev/null | head -1 | grep -oE '[0-9.]+')
+  f=${f:-100}; tps=${tps:-0}
+  if awk -v f="$f" -v m="$BENCH_MAX_FAIL_PCT" 'BEGIN{exit !(f+0 > m+0)}'; then
+    echo "  ABORT: ${f}% of '$label' transactions FAILED (> ${BENCH_MAX_FAIL_PCT}%)."
+    echo "         The workload is mis-calibrated for this scale -- almost always BENCH_OPS too high,"
+    echo "         so each transaction exceeds statement_timeout. Lower BENCH_OPS and re-run."
+    exit 2
+  fi
+  if awk -v t="$tps" 'BEGIN{exit !(t+0 < 1)}'; then
+    echo "  ABORT: '$label' tps=$tps -- workload not making progress (check BENCH_OPS / connectivity)."
+    exit 2
+  fi
+  echo "  workload health OK ($label: ${f}% failed, ${tps} tps)"
+}
+
 # ---- 0. preflight ----------------------------------------------------------
 say "preflight"
 q "select version()" | sed 's/^/  /'
@@ -319,6 +342,7 @@ echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_si
 run_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # for pgfr post-run report window
 wal_snapshot _ref                                                # WAL/checkpoint reference point
 run_phase baseline "$BENCH_PHASE_SECS"
+assert_workload_healthy baseline   # bail now if the workload is timing out, before adopt/drain/post
 
 # ---- 3b. prepare: build the PK index CONCURRENTLY under load (keeps adopt online) --
 # pgpm.build_pk_concurrently() schedules the CIC as a pg_cron job and blocks (polling)

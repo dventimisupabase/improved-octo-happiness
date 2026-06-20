@@ -89,6 +89,8 @@ keeps `pgbench`'s own tps/latency numbers meaningful alongside the server-side o
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | pgbench concurrency |
 | `BENCH_OPS` | `50` | server-side ops per `workload_step` call |
 | `BENCH_PHASE_SECS` | `120` | baseline/post load duration |
+| `BENCH_OPS` | `50` | server-side ops per `workload_step` call — **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table will blow `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
+| `BENCH_MAX_FAIL_PCT` | `5` | abort right after baseline if more than this % of transactions failed (catches a mis-calibrated `BENCH_OPS` in minutes instead of hours) |
 | `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step` |
 | `BENCH_DRAIN_SLEEP` | `0` | pause between drain steps (s); `0` = full speed |
 | `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the drain window |
