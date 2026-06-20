@@ -754,15 +754,51 @@ $$;
 
 create or replace function pgpm.maintenance(p_parent regclass)
 returns text language plpgsql as $$
-declare cfg pgpm.config; v_made int; v_dropped int; v_drain text;
+declare
+  cfg pgpm.config;
+  v_made int := 0; v_dropped int := 0; v_drain text := 'skipped';
+  v_note text := '';
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   if cfg.paused then return 'paused'; end if;
-  v_made    := pgpm.premake(p_parent);
-  v_dropped := pgpm.retention(p_parent);
-  v_drain   := pgpm.drain_step(p_parent);
-  return format('premade=%s dropped=%s drain=%s', v_made, v_dropped, v_drain);
+
+  -- Maintenance is a background janitor; it must NEVER block -- let alone deadlock -- the live
+  -- workload. Premaking a future partition takes ACCESS EXCLUSIVE on the parent and scans the
+  -- DEFAULT (to prove no rows fall in the new range); that fights concurrent inserts into the
+  -- default's open cell, and left unbounded the two sides deadlock. So we (1) cap how long any
+  -- lock wait blocks, turning a would-be deadlock into a fast, retryable miss, and (2) isolate
+  -- each step in its own subtransaction. A premake/retention that loses the lock race is then
+  -- DEFERRED (retried on the next tick, during a quieter moment) WITHOUT aborting the drain --
+  -- the drain is the actual online conversion and the priority. The closed-tail drain attaches
+  -- via the scan-skip path (NOT VALID check + VALIDATE under SHARE UPDATE EXCLUSIVE), so it does
+  -- not contend for the parent's ACCESS EXCLUSIVE lock the way premake does, and makes progress
+  -- even while premake keeps deferring.
+  perform set_config('lock_timeout', '3s', true);
+
+  begin
+    v_made := pgpm.premake(p_parent);
+  exception when others then
+    v_note := v_note || ' premake_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'premake_skip', left(sqlerrm, 200));
+  end;
+
+  begin
+    v_dropped := pgpm.retention(p_parent);
+  exception when others then
+    v_note := v_note || ' retention_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'retention_skip', left(sqlerrm, 200));
+  end;
+
+  begin
+    v_drain := pgpm.drain_step(p_parent);
+  exception when others then
+    v_drain := 'deferred';
+    v_note := v_note || ' drain_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'drain_skip', left(sqlerrm, 200));
+  end;
+
+  return format('premade=%s dropped=%s drain=%s%s', v_made, v_dropped, v_drain, v_note);
 end;
 $$;
 

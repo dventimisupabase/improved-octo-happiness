@@ -18,6 +18,16 @@
   even on a 100GB+ table. Run `pgpm.premake()` / `pgpm.maintenance()` afterward to build
   the future partitions online (their `VALIDATE` scans run under a non-blocking lock).
   Until then, writes route to the DEFAULT (correct, just not yet split into future cells).
+- `maintenance` no longer lets a premake/retention failure abort the drain. Premaking a
+  future partition needs `ACCESS EXCLUSIVE` on the parent plus a scan of the DEFAULT, which
+  contends with concurrent inserts into the default's open cell; under sustained write load
+  the two sides could deadlock, and because premake ran first in the same transaction the
+  deadlock aborted the whole maintenance run, so the drain never made progress. `maintenance`
+  now caps lock waits (`lock_timeout`, turning a would-be deadlock into a fast retryable miss)
+  and isolates premake, retention, and the drain in separate subtransactions: a step that
+  loses the lock race is deferred (logged as `*_skip`, retried next tick) without aborting the
+  drain. The closed-tail drain attaches via the scan-skip path, so it keeps converting the
+  table online even while premake repeatedly defers under load.
 
 ## [0.1.0] - 2026-06-19
 
