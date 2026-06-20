@@ -28,6 +28,11 @@
   loses the lock race is deferred (logged as `*_skip`, retried next tick) without aborting the
   drain. The closed-tail drain attaches via the scan-skip path, so it keeps converting the
   table online even while premake repeatedly defers under load.
+- `drain_step`'s "any rows left in this range?" check now uses `EXISTS` instead of `count(*)`.
+  The old `count(*)` re-scanned the entire remaining range after every microbatch -- O(rows^2 /
+  batch) work, and while the default is not all-visible mid-drain the planner seq-scans the
+  range each step (a sequential-scan storm that dominates I/O at scale). `EXISTS` stops at the
+  first row (index scan), which is all the drain needs to decide between draining and attaching.
 
 ## [0.1.0] - 2026-06-19
 

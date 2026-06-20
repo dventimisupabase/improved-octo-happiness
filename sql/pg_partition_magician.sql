@@ -283,7 +283,7 @@ returns text language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_def text; v_cols text; v_batch int;
   v_min text; v_min_native text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text;
-  v_name name; v_open boolean; v_frontier text; v_moved bigint; v_remain bigint;
+  v_name name; v_open boolean; v_frontier text; v_moved bigint; v_more boolean;
   v_excl name; v_method text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -335,9 +335,13 @@ begin
   get diagnostics v_moved = row_count;
   insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'drain_move', v_lo, v_hi, v_moved);
 
-  execute format('select count(*) from %s where %I >= %L and %I < %L',
-                 v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_remain;
-  if v_remain > 0 then return 'moved:' || v_moved; end if;
+  -- Does ANY row remain in [lo,hi)? Use EXISTS (index scan, stops at the first row), NOT
+  -- count(*), which re-scans the whole range every microbatch -- O(rows^2/batch), and while
+  -- the default isn't all-visible mid-drain it seq-scans the range each step (a
+  -- SEQUENTIAL_SCAN_STORM at scale). We only need to know whether to keep draining or attach.
+  execute format('select exists(select 1 from %s where %I >= %L and %I < %L)',
+                 v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
+  if v_more then return 'moved:' || v_moved; end if;
 
   if v_open or not cfg.keep_default then
     execute format('alter table %I.%I attach partition %I.%I for values from (%L) to (%L)',
