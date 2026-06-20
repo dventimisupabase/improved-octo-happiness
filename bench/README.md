@@ -108,8 +108,34 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_OBSERVE_INTERVAL` | `15` | how often (s) the harness samples while pgpm drains |
 | `BENCH_DRAIN_IDLE_SECS` | `120` | drain is "settled" after this long with no pgpm drain activity in `pgpm.log` |
 | `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the observation window |
+| `BENCH_OBSERVE_MODE` | `settle` | `settle` = observe until the drain fully completes; `window` = warm up then measure a fixed window without waiting for completion (see Profiles) |
+| `BENCH_CONVERT_WARMUP_SECS` | `30` | window mode: let the drain reach steady state before measuring |
+| `BENCH_CONVERT_WINDOW_SECS` | `300` | window mode: measure the workload for this long, then stop (drain left running) |
 | `BENCH_PGFR` / `BENCH_PGFR_DIR` | `0` / `bench/vendor/pg_flight_recorder` | install + enable pg_flight_recorder (record + analyze) for WAL/checkpoint/wait telemetry; clone the repo into `BENCH_PGFR_DIR` first |
 | `BENCH_SKIP_GENERATE` | `0` | reuse already-loaded data |
+
+## Profiles (one engine, different questions)
+
+A single benchmark can't be everything at once — *aggressive* (to find limits and bugs) and
+*gentle* (to show the conversion is unnoticeable) and *complete-in-a-window* and *at-scale* are
+contradictory demands. So `bench/run_rung.sh <rung> [profile]` runs the same engine under named
+profiles that bundle drive-intensity + how we observe:
+
+- **`stress`** (default) — aggressive drain (2 s maintenance, large batch), **run to completion**
+  (`BENCH_OBSERVE_MODE=settle`): drive the drain hard so it finishes within the run, then confirm
+  it settled. This is the *stress test* — it deliberately exceeds production load to surface
+  bugs and limits, and it's how most of pgpm's drain/premake hardening was found.
+- **`gentle`** — representative drain (20 s maintenance, small batch sized **under `work_mem`** so
+  it never spills temp), **windowed** (`BENCH_OBSERVE_MODE=window`): warm up until the drain is
+  steadily running, then measure the workload over a fixed window and compare it to baseline —
+  *without* waiting for completion (a gentle drain of a large table takes hours/days and doesn't
+  need to finish to answer "is it unnoticeable?"). Kept under the instance's I/O baseline, so the
+  EBS burst never depletes and the measurement is reproducible.
+
+The two are complementary, not competing: throttling needs no pgpm change (it's just `drain_batch`
++ the maintenance cadence — pgpm's intended gentle mode), and the stress arm earns its keep as a
+bug-finder. Profiles compose with the size ladder as a *rung × profile* matrix; results land in
+`results/<rung>-<profile>/`.
 
 ## Faster reruns
 
