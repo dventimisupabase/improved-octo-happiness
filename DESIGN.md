@@ -49,6 +49,26 @@ minute to minute. "Unnoticeable" means living within the leftover.
   tail out of `DEFAULT` in microbatches is **infinitely divisible**: a batch can be made
   arbitrarily small and spaced arbitrarily far apart.
 
+**The currency of demand is I/O, and its natural unit is the block, not the row and not time.** A
+row is not a unit of constant cost, and the clearest reason is TOAST: a row carrying a wide
+`jsonb` / `bytea` / `text` value stores it out-of-line in the table's TOAST table, and moving that
+row during the drain physically rewrites those bytes (a cross-table `INSERT` cannot move a TOAST
+chunk by reference; it detoasts and re-toasts into the destination partition's own TOAST table). So
+one "row" can cost a few bytes or a few megabytes; measuring the drain in rows inherits all the
+variance of the data model. Time is no better: it is dominated by the substrate (the same work is
+fast on NVMe and slow on a depleted burst balance), exactly the variance section 1 warns against.
+This mirrors a familiar `pg_stat_statements` habit, where `total_exec_time` is hardware-variant and
+noisy while the `shared_blks_{read,hit,dirtied,written}` counters are stable units of actual work.
+
+So the model's unit of account is the **block** (Postgres's 8 KB page, the unit it already uses
+wherever it accounts for I/O: `pg_stat_statements`, `pg_stat_io`, `EXPLAIN (BUFFERS)`, the buffer
+cache). Blocks have two properties that rows and time lack: they are **hardware-invariant**
+(intrinsic to the work, not to the box), and they **subsume TOAST automatically** (a fat row simply
+touches more TOAST-table blocks, with no schema-specific accounting). Bytes would be
+hardware-invariant too, but the block is the native, already-instrumented unit, so it is the natural
+choice; whether an implementation eventually budgets in blocks or raw bytes is a detail that can be
+deferred.
+
 ## 3. The invariant, and why divisibility makes it satisfiable
 
 The prime directive is: **be unnoticeable. Demand stays safely under supply, leaving the real
@@ -115,17 +135,23 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   pressure, recent latency of the ambient workload, replication lag) and adjust the drain rate to
   ride just under it. The bench already shows the symptoms to watch for: forced checkpoints, temp
   spills, sequential-scan storms are what over-driving looks like.
-- **A maintenance-window estimator (mode 3's helper).** Tell the operator how long a window to book.
-  It needs two inputs: the **work size**, which pgpm knows (the closed-tail row count via
-  `check_default` / the registry, plus the one-time CIC cost), and the **full-budget drain rate on
-  this substrate**, which is either supplied by the operator or measured by pgpm with a short
-  on-system **calibration probe** (drain a sample at full tilt, measure rows/s). The estimate must
-  be **regime-aware**: cache-resident and disk-bound are different rates (we measured roughly 15k
-  versus 3k rows/s, see [`bench/SIZE_LADDER.md`](bench/SIZE_LADDER.md)), so it is piecewise across
-  the RAM crossing and the honest output is a *range* with its regime assumption stated. This is
-  exactly the size-ladder calibration curve turned into an operator-facing forecast. A forecast, not
-  a promise: other tenants on shared substrate, run-to-run variance, and the soft disk-bound number
-  all mean the window should carry slack.
+- **Block-budgeted batching.** Today the drain batches by row count (`drain_batch`), which is unsafe
+  when TOAST width varies: 20 000 narrow rows is nothing, but 20 000 rows each carrying a 2 MB
+  document is tens of gigabytes rewritten in one microbatch, a spike that breaks the unnoticeable
+  invariant and can blow `statement_timeout`. Budgeting a batch by blocks (or bytes) instead bounds
+  its I/O footprint regardless of the data model, which is the practical reason for measuring demand
+  in blocks (section 2).
+- **A maintenance-window estimator (mode 3's helper).** Tell the operator how long a window to book,
+  reckoned in blocks rather than rows. It needs two inputs: the **work size**, which pgpm can read
+  from the catalog (the `DEFAULT`'s heap + TOAST + index `relpages`, scaled by the closed-tail
+  fraction, plus the one-time CIC cost), and the **full-budget rate on this substrate** in blocks per
+  second, either supplied by the operator or measured by a short on-system **calibration probe**
+  (drain a sample at full tilt and measure it). The estimate must be **regime-aware**: cache-resident
+  and disk-bound deliver very different rates (the bench measured roughly 15k versus 3k *rows*/s as a
+  uniform-width proxy, see [`bench/SIZE_LADDER.md`](bench/SIZE_LADDER.md)), so it is piecewise across
+  the RAM crossing and the honest output is a *range* with its regime assumption stated. It is a
+  forecast, not a promise: other tenants on shared substrate, run-to-run variance, and the soft
+  disk-bound number all mean the window should carry slack.
 
 ## What already exists toward all this
 
