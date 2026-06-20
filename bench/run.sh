@@ -31,6 +31,9 @@ BENCH_ROWS="${BENCH_ROWS:-300000000}"       # target rows in bench.events (~120G
 BENCH_MONTHS="${BENCH_MONTHS:-12}"          # spread history across this many months
 BENCH_CHUNK="${BENCH_CHUNK:-2000000}"       # generator commit chunk
 BENCH_GEN_JOBS="${BENCH_GEN_JOBS:-1}"       # parallel generator sessions (one INSERT..SELECT is single-core; fan out to use all cores)
+BENCH_PREFREEZE="${BENCH_PREFREEZE:-0}"     # 1 = VACUUM(FREEZE,ANALYZE) after generation so the post-bulk-load
+                                            #     freeze/hint-bit WAL settles BEFORE measuring (gentle arm: keeps the
+                                            #     load aftermath out of the window so windowed I/O reflects the drain)
 BENCH_INTERVAL="${BENCH_INTERVAL:-1 month}" # partition width
 BENCH_PREMAKE="${BENCH_PREMAKE:-3}"
 
@@ -308,7 +311,17 @@ else
     echo "  rebuilding secondary index on the full table (sort build, no statement_timeout)..."
     q "create index if not exists events_user_created_idx on bench.events (user_id, created_at desc)" >/dev/null
   fi
-  q "analyze bench.events" >/dev/null   # fresh stats after load (+ any index rebuild)
+  if [ "$BENCH_PREFREEZE" = "1" ]; then
+    # Settle the post-bulk-load freeze/hint-bit WAL NOW, synchronously, before baseline. A fresh
+    # bulk load leaves tens of millions of unfrozen tuples; the first autovacuum rewrites every
+    # page (FPIs -> WAL), which at scale fires forced checkpoints and temp during the convert
+    # WINDOW and reads as drain I/O. Freezing here pushes that aftermath outside the window so the
+    # windowed pgfr metrics reflect the gentle drain, not the load. (ANALYZE folded in.)
+    echo "  pre-freeze: VACUUM (FREEZE, ANALYZE) bench.events -- settle load aftermath out of the window..."
+    q "vacuum (freeze, analyze) bench.events" >/dev/null
+  else
+    q "analyze bench.events" >/dev/null   # fresh stats after load (+ any index rebuild)
+  fi
 fi
 qf "$BENCH_DIR/sql/20_workload.sql" >/dev/null
 echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_size_pretty(pg_total_relation_size('bench.events'))")"

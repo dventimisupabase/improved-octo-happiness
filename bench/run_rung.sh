@@ -47,9 +47,11 @@ case "$PROFILE" in
   stress) export BENCH_MAINT_INTERVAL='2 seconds' BENCH_OBSERVE_MODE=settle ;;
   gentle) # small batch (fits work_mem -> no temp spill), slow cron (stays under I/O baseline),
           # windowed observe (warm up, then measure -- don't wait for the drain to finish).
+          # Pre-freeze settles the post-bulk-load autovacuum WAL out of the window so the windowed
+          # pgfr metrics reflect the drain, not the load aftermath (see bench-gentle-window confound).
           export BENCH_MAINT_INTERVAL='20 seconds' BENCH_OBSERVE_MODE=window \
                  BENCH_DRAIN_BATCH=20000 BENCH_CONVERT_WARMUP_SECS=60 \
-                 BENCH_CONVERT_WINDOW_SECS=300 BENCH_DRAIN_MAX_SECS=900 ;;
+                 BENCH_CONVERT_WINDOW_SECS=300 BENCH_DRAIN_MAX_SECS=900 BENCH_PREFREEZE=1 ;;
   *)      echo "unknown profile '$PROFILE' (want stress|gentle)"; exit 2 ;;
 esac
 
