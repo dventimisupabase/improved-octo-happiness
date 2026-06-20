@@ -271,13 +271,18 @@
       <div class="section-head reveal">
         <span class="eyebrow">The trick</span>
         <h2 class="display">No data moves. At first.</h2>
-        <p>The heavy lifting runs later, as paced background work, not a big up-front migration. Four moves:</p>
+        <p>The heavy lifting runs later, as paced background work, not a big up-front migration. One prep step, then four moves:</p>
       </div>
       <div class="acts">
         <div class="act reveal">
+          <div class="act-no">0</div>
+          <h3>Prepare</h3>
+          <p>On a large table, build the parent's composite primary-key index <em>online</em> first: <code>build_pk_concurrently</code> runs <code>CREATE&nbsp;INDEX&nbsp;CONCURRENTLY</code> through a <code>pg_cron</code> worker &mdash; no blocking. Adopt then promotes that ready index, so the cutover stays metadata-only instead of rebuilding the key under a lock.</p>
+        </div>
+        <div class="act reveal">
           <div class="act-no">I</div>
           <h3>Adopt</h3>
-          <p>Rename the table aside, create the partitioned parent under the same name, and attach the original as the <code>DEFAULT</code> partition. Zero rows move; the swap takes a lock, then the app carries on against the same table.</p>
+          <p>Rename the table aside, create the partitioned parent under the same name, and attach the original as the <code>DEFAULT</code> partition. Zero rows move; the swap takes a brief lock &mdash; with the key built ahead in step&nbsp;0, no index rebuild happens inside it &mdash; then the app carries on against the same table.</p>
         </div>
         <div class="act reveal">
           <div class="act-no">II</div>

@@ -509,7 +509,7 @@ begin
     from pg_index i join pg_class c on c.oid = i.indexrelid
    where i.indrelid = p_parent and i.indislive and not i.indisprimary and not i.indisunique;
   -- count unique secondary indexes we can't carry over -- but EXCLUDE a pre-built
-  -- index whose columns match the new PK (pgpm.prepare_adopt's index, promoted in step 4).
+  -- index whose columns match the new PK (pgpm.build_pk_concurrently's index, promoted in step 4).
   select count(*) into v_skipped from pg_index i
    where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary
      and (v_pkcols is null or (select array_agg(a.attname::text order by k.ord)
@@ -567,11 +567,11 @@ begin
   end if;
 
   -- 4. establish the default's PK on (partition key, rest of old PK). If a matching
-  -- unique index was pre-built online (pgpm.prepare_adopt -> CREATE UNIQUE INDEX
+  -- unique index was pre-built online (pgpm.build_pk_concurrently -> CREATE UNIQUE INDEX
   -- CONCURRENTLY, run by the operator before adopt), promote THAT -- a metadata-only
   -- step, so adopt holds its ACCESS EXCLUSIVE lock only briefly. Otherwise build the
   -- index in-transaction: correct, but O(rows) under the lock (fine for small tables,
-  -- a multi-minute write-blocking window on very large ones -- prefer prepare_adopt).
+  -- a multi-minute write-blocking window on very large ones -- prefer build_pk_concurrently).
   if v_pkcols is not null then
     select c.relname into v_prebuilt
       from pg_index i join pg_class c on c.oid = i.indexrelid
