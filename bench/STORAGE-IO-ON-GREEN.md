@@ -45,6 +45,21 @@ ceiling** (~2.5× gp3), *not* removing a burst — there wasn't a clean one to r
 - The definitive source for the instance burst-balance itself is the **dashboard "Disk IO Burst
   Balance" chart** (the Management API doesn't expose it).
 
+## Does io2 speed the pgpm conversion? No — on 4XL gp3 was already enough
+Ran the gentle R3 (40 M-row) online conversion on gp3-4XL and again on io2-4XL:
+
+| | gp3-4XL | io2-4XL @32000 |
+|---|---------|----------------|
+| `build_pk` CIC (online PK) | 31.4 s | **31.4 s (identical)** |
+| `adopt()` cutover | 1.5 s | 1.5 s |
+| convert latency vs baseline | tracks baseline | tracks baseline (p50 75.81 vs 75.54; p99 99.8 vs 79.8; n=53816, full window, no stall) |
+
+The CIC time is **identical** — the one-time index build was never IOPS-starved by gp3's 12000, so
+io2's higher ceiling went unused. **io2's ~2.5× IOPS only pays off under *sustained* heavy IOPS; a
+one-time conversion doesn't generate it.** The 322 s CIC that originally motivated io2 was a
+*2XL/end-of-day/over-the-pooler* confound, never reproduced on 4XL. **Bottom line: gp3-4XL is
+sufficient for the pgpm online conversion; io2 is overkill for this workload.**
+
 ## Practical guidance
 - For **IOPS-bound** work (online `CREATE INDEX CONCURRENTLY`, random access, the pgpm drain under
   scattered IO), **io2 is a real upgrade** — ~2.5× the sustained IOPS of gp3 at the same tier.
