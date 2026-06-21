@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- `adopt(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks(parent)`: preserve incoming
+  foreign keys on the id/uuidv7 happy path. When the partition key already is the referenced
+  single-column PK, the partitioned parent keeps that unique key, so an incoming FK need not be
+  denormalized into a composite FK (unlike the widening time case). The drain moves rows through an
+  unattached child, which a live `NO ACTION` FK would reject, so `'preserve'` records and drops each
+  eligible incoming FK at adopt, and `restore_incoming_fks` re-adds it verbatim against the new parent
+  (`NOT VALID` + `VALIDATE`) once the drain is quiescent. `maintenance` calls the restore
+  automatically; the synchronous `drain_all` path calls it by hand. `'preserve'` refuses the widening
+  case (use `'drop'` + `generate_fk_recovery`). New `pgpm.dropped_fk.restorable` column distinguishes
+  the two. (tests/19-21)
 - `build_pk_concurrently(parent, control)`: a procedure that builds the default's
   composite PK index ONLINE before `adopt`, so the cutover stays metadata-only even on
   very large tables (at ~300M rows the previous in-transaction build was a ~28-minute
