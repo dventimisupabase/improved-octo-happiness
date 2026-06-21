@@ -20,6 +20,11 @@ of native `RANGE`-partitioned tables:
 - **retention**: drop partitions older than a policy.
 - **maintenance**: the single procedure `pg_cron` calls (premake + retention + drain).
 
+**Incoming foreign keys** are handled, not ignored: when you partition on the key they reference (the
+`id` / `uuidv7` case) `adopt` keeps them against the new parent with no schema change to the
+referencing tables; when the key widens (the `time` case) it records them and emits a composite-FK
+recovery script. See the [guide](docs/guide.md#incoming-foreign-keys).
+
 Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
 
 ## Why it exists
