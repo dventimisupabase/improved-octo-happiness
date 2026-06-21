@@ -44,10 +44,15 @@ create table if not exists pgpm.config (
   -- when maintenance may next attempt premake for this parent. Under sustained write contention
   -- premake keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
   -- instead of retrying (and risking a wasted default scan) every tick. null = attempt now.
-  premake_retry_after timestamptz
+  premake_retry_after timestamptz,
+  -- optional block budget for the drain: cap each microbatch at ~this many heap+TOAST blocks
+  -- (translated to a row limit via the default's average bytes/row), so wide rows can't make a
+  -- single batch huge. null = cap by drain_batch rows only (default). See DESIGN.md section 8.
+  drain_max_blocks int
 );
--- upgrade path for installs that predate premake_retry_after
+-- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists premake_retry_after timestamptz;
+alter table pgpm.config add column if not exists drain_max_blocks int;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -290,7 +295,7 @@ declare
   cfg pgpm.config; v_nsp name; v_rel name; v_def text; v_cols text; v_batch int;
   v_min text; v_min_native text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text;
   v_name name; v_open boolean; v_frontier text; v_moved bigint; v_more boolean;
-  v_excl name; v_method text;
+  v_excl name; v_method text; v_reltuples real; v_avg numeric; v_blk_limit int;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -298,6 +303,21 @@ begin
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_def   := format('%I.%I', v_nsp, cfg.default_table);
   v_batch := coalesce(p_batch, cfg.drain_batch, 5000);
+
+  -- Block budget (DESIGN.md sec 8): bound the microbatch by heap+TOAST blocks, not just rows, so a
+  -- wide-row table (large jsonb/bytea) can't make one batch tens of GB. Translate the budget to a
+  -- row cap via the default's average bytes/row (pg_table_size / reltuples) and take the smaller of
+  -- the two. Skipped when unset, or when stats are missing (reltuples <= 0): then it is the row cap.
+  if cfg.drain_max_blocks is not null then
+    select c.reltuples into v_reltuples from pg_class c where c.oid = v_def::regclass;
+    if coalesce(v_reltuples, 0) > 0 then
+      v_avg := pg_table_size(v_def::regclass)::numeric / v_reltuples;   -- avg heap+TOAST bytes/row
+      if v_avg > 0 then
+        v_blk_limit := greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int;
+        v_batch := least(v_batch, v_blk_limit);
+      end if;
+    end if;
+  end if;
 
   execute format('select t.%I::text from %s t order by t.%I asc limit 1',
                  cfg.control_column, v_def, cfg.control_column) into v_min;
@@ -431,7 +451,7 @@ declare
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb;
-  v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name;
+  v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name; v_pk_reuse boolean := false;
   v_idmax bigint[]; v_m bigint; v_i int;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
@@ -463,6 +483,34 @@ begin
   elsif p_control_kind = 'uuidv7' and v_typname <> 'uuid' then
     raise exception 'pg_partition_magician: control_kind uuidv7 needs a uuid column (got %)', v_typname;
   end if;
+
+  -- Orphaned-child guard (DESIGN.md sec 8): a drain creates each child partition as a standalone
+  -- table (CREATE TABLE ... LIKE) and only ATTACHes it at the END of that child's drain. An
+  -- interrupted drain therefore leaves an un-attached child -- which DROP TABLE <parent> CASCADE
+  -- does NOT remove (an un-attached table has no dependency on the parent). If the table is later
+  -- recreated/reloaded and re-adopted, the next drain reuses the orphan by name and INSERTs rows
+  -- whose keys already live in it: a cryptic mid-drain "duplicate key" deep inside drain_step.
+  -- Refuse up front -- any standalone (un-attached) table in this schema whose name matches this
+  -- parent's child-partition naming (<rel>_p<digits...>) is an orphan. starts_with handles the
+  -- (un-escaped) rel prefix; the regex only constrains the data-independent suffix.
+  declare v_orphan name;
+  begin
+    select c.relname into v_orphan
+      from pg_class c
+     where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
+       and c.relkind = 'r'
+       and starts_with(c.relname, v_rel || '_p')
+       and case when p_control_kind = 'id'
+                then substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{19}$'
+                else substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{4}(_[0-9]+)*$'
+           end
+       and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
+     limit 1;
+    if v_orphan is not null then
+      raise exception 'pg_partition_magician: %.% already exists as a standalone table matching this parent''s partition naming -- most likely an orphan left by an interrupted drain. Drop it (drop table %.%) and retry adopt.',
+        v_nsp, v_orphan, quote_ident(v_nsp), quote_ident(v_orphan);
+    end if;
+  end;
 
   -- uuidv7 sanity check: the type can't tell us the values are time-ordered, so
   -- sample them -- random (UUIDv4) columns decode to implausible timestamps.
@@ -502,6 +550,12 @@ begin
   -- new PK columns: partition key first, then the rest of the old PK
   if v_oldpk is not null then
     v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
+    -- If the new PK equals the existing PK in the same order, the partition key is already covered
+    -- by the PK (partitioning on a monotonic id, a uuidv7/ULID key, or a PK already led by the
+    -- control column). Keep and REUSE the existing index instead of dropping and rebuilding an
+    -- identical one: step 2's drop and step 4's build are skipped, and step 8's parent PRIMARY KEY
+    -- reconciles the existing index in place (no O(rows) build). See DESIGN.md section 8.
+    v_pk_reuse := (v_pkcols = v_oldpk);
   end if;
 
   -- secondary (non-PK, non-unique) indexes to recreate on the parent
@@ -548,8 +602,9 @@ begin
   execute format('alter table %s rename to %I', p_parent::text, v_default);
   v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
 
-  -- 2. drop the old (sub-)PK
-  if v_pkname is not null then
+  -- 2. drop the old (sub-)PK -- UNLESS the partition key is already covered by it (v_pk_reuse): then
+  -- keep it and reuse its index in place (step 4 is skipped; step 8's parent PK reconciles it).
+  if v_pkname is not null and not v_pk_reuse then
     execute format('alter table %s drop constraint %I', v_defreg::text, v_pkname);
   end if;
 
@@ -572,7 +627,8 @@ begin
   -- step, so adopt holds its ACCESS EXCLUSIVE lock only briefly. Otherwise build the
   -- index in-transaction: correct, but O(rows) under the lock (fine for small tables,
   -- a multi-minute write-blocking window on very large ones -- prefer build_pk_concurrently).
-  if v_pkcols is not null then
+  -- Skipped entirely when v_pk_reuse: the default kept its original PK in step 2.
+  if v_pkcols is not null and not v_pk_reuse then
     select c.relname into v_prebuilt
       from pg_index i join pg_class c on c.oid = i.indexrelid
      where i.indrelid = v_defreg and i.indisunique and i.indisvalid and not i.indisprimary
@@ -900,6 +956,29 @@ begin
            min(ts), max(ts)
     from s
   $q$, p_control, p_table::text, p_sample);
+end;
+$$;
+
+-- check_time_monotonic: how co-monotonic is an id column with a timestamp column? Samples p_sample
+-- rows at random, orders them by the id, and reports the fraction of adjacent pairs whose time is
+-- non-decreasing. ~1.0 means id and time co-increase; backfills and out-of-order arrival drive it
+-- down. This is the tier-2 safety check for time-based retention expressed against an id partition
+-- key (DESIGN.md section 8): mapping "older than T" to an id boundary is only sound when id and
+-- time co-increase. Heuristic, not a proof -- mirrors check_uuidv7's plausibility sampling.
+create or replace function pgpm.check_time_monotonic(
+  p_table regclass, p_id name, p_time name, p_sample int default 1000
+) returns table (sampled bigint, monotonic bigint, fraction numeric)
+language plpgsql as $$
+begin
+  return query execute format($q$
+    with s as (select %2$I::timestamptz as t, %1$I as idv from %3$s order by random() limit %4$s),
+         o as (select t, lag(t) over (order by idv) as prev from s)
+    select count(*) filter (where prev is not null)::bigint,
+           count(*) filter (where prev is not null and t >= prev)::bigint,
+           round(coalesce(count(*) filter (where prev is not null and t >= prev)::numeric
+                          / nullif(count(*) filter (where prev is not null), 0), 0), 4)
+    from o
+  $q$, p_id, p_time, p_table::text, p_sample);
 end;
 $$;
 
