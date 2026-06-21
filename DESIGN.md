@@ -172,6 +172,39 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   setup cost center disappears and only the drain remains. **Implemented**: `adopt` detects when the
   partition key already covers the PK (the `id` / `uuidv7` cases) and reuses the existing index in
   place, skipping the drop+rebuild. Tests in `tests/15`; validated flat (single-digit ms) to ~40M rows.
+- **Preserve incoming foreign keys on the happy path (no denormalization).** Today `adopt` treats
+  every incoming FK the same: refuse (`'error'`) or drop-and-record (`'drop'`), and recovery means
+  denormalizing the partition key into the referencing table and rebuilding a composite FK
+  (`generate_fk_recovery`). That cost is only real when the PK *widens away* from the referenced key,
+  the `time` case (partition on `created_at`, FK references `id`): the single-column unique on `(id)`
+  ceases to exist, so a `-> messages(id)` FK is genuinely impossible and a composite `(created_at, id)`
+  FK is the only way to keep DB-enforced RI. But on the `id` / `uuidv7` happy path (the same
+  partition-key-covers-PK condition as the PK-reuse bullet above), the parent *keeps* its single-column
+  PK on `(id)`: a partitioned table's unique key need only *include* the partition key, and here it
+  equals it, and Postgres has allowed an FK to *reference* a partitioned table since PG 12. So the
+  incoming FK survives against the new parent verbatim, no companion column and no composite key.
+  Verified on PG 17: a single-column PK on an id-partitioned table is legal, an incoming FK to it is
+  enforced, and that same FK re-added against a drained parent enforces correctly. The catch is
+  mechanical, not structural: the drain moves the closed tail through a standalone, not-yet-attached
+  child table, so a referenced row is transiently *outside* the parent while it is moved, and a
+  `NO ACTION` FK rejects the move (verified: `update or delete ... violates foreign key constraint ...
+  still referenced`). So the FK cannot ride through the conversion in place. The design that fits the
+  paced, online drain is **drop-at-adopt, re-add-at-completion**: record the incoming single-column
+  FKs (as `'drop'` does), run the drain, then re-create each FK against the new parent with
+  `NOT VALID` + `VALIDATE` once its referenced ranges are attached, leaving the referencing table
+  untouched. Restoration is driven either by `maintenance` noticing the closed tail has fully drained,
+  or by an explicit `restore_incoming_fks(parent)` the operator runs after `drain_all`. Gating is
+  exact: this path applies only when the FK's referenced columns equal the parent's surviving unique
+  key; anything else (a different referenced column, a multi-column referenced key, the widening
+  `time` case) falls back to the composite-FK recovery. The simpler-looking alternatives do not hold
+  up: a `DEFERRABLE INITIALLY DEFERRED` FK does not help, because the child is attached in a *later*
+  transaction than the move, not the same commit; moving rows only between *attached* partitions hits
+  a chicken-and-egg (you cannot attach a partition for `[lo,hi)` while the default still holds rows in
+  that range); and draining a whole range in one deferred transaction defeats the paced design for
+  large ranges. Open questions for the test matrix (PG 15 to 18): non-`NO ACTION` referential actions
+  (`CASCADE` / `RESTRICT` / `SET NULL`) and `DEFERRABLE` FKs, self-referential FKs, several incoming
+  FKs on one parent, the `VALIDATE` scan cost on a large referencing table, and the contract when a
+  drain never completes (the FK stays dropped and recorded, surfaced by `status`).
 - **Retention on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the
