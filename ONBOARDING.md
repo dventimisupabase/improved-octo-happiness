@@ -6,8 +6,8 @@ It adopts an existing (possibly huge, live) table into a native partitioned tabl
 *online*, then manages the lifecycle (premake → drain → retention) across three
 partition-key dimensions: **time**, **integer/bigint id**, and **UUIDv7/ULID**.
 
-For *what it does and why*, read [`README.md`](./README.md). This file is about
-*working in the repo*.
+For *what it does and how to use it*, read [`README.md`](./README.md) and the
+[user guide](./docs/guide.md). This file is about *working in the repo*.
 
 ## Get it running (5 minutes)
 
@@ -16,7 +16,7 @@ psql, or other tooling needed on the host.
 
 ```bash
 ./test.sh 15        # PG 15: build a pg_cron+pgtap image, install each channel,
-                    # load fixtures, run the 53-test pgTAP suite, verify uninstall
+                    # load fixtures, run the pgTAP suite, verify uninstall
 ./test.sh           # the full matrix: PG 15, 16, 17, 18
 ```
 
@@ -44,7 +44,10 @@ docker compose --profile pg15 down -v
 | `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap), Docker-only |
 | `fixtures/demo.sql` | Builds + adopts the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
-| `README.md` | Product docs: dimensions, install channels, the design, the control-type contract |
+| `README.md` | Overview, quickstart, and links into the docs |
+| `docs/guide.md` | User guide: concepts, install, adopt, schedule, monitor, retention, FKs, ops |
+| `docs/reference.md` | Reference for every public function and catalog object |
+| `DESIGN.md` | The operating model and design rationale |
 | `postgresql_online_partition_migration_summary.md` | The original design doc the project grew from |
 
 ## The mental model (in one breath)
@@ -119,9 +122,38 @@ rollback;
 - **Incoming FKs**: `adopt` refuses by default; `p_incoming_fks => 'drop'` records +
   drops them; `generate_fk_recovery()` emits the rebuild script.
 
+## Releasing and publishing
+
+Tag a version and CI does the rest (`.github/workflows/release.yml`):
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+On a `v*` tag the Release workflow runs the full PG 15-18 channel matrix, creates a GitHub Release
+with the bundle + minified dbdev package + a source tarball (release notes pulled from
+`CHANGELOG.md`), then calls `publish-dbdev.yml` to push the package to
+[database.dev](https://database.dev). You can also run either workflow manually via
+*workflow_dispatch* with an explicit version.
+
+> **One manual step CI can't do:** on a version bump, bump the pinned `version '…'` in the dbdev
+> `create extension` example in [`docs/guide.md`](./docs/guide.md#install). The install page fills it
+> in from the release tag automatically; the docs copy is pinned by hand (dbdev recommends pinning).
+
+**One-time setup for publishing** (the publish job is inert until both exist):
+
+1. Create a [database.dev](https://database.dev) account and an API token.
+2. Add it as a repo secret named **`DBDEV_TOKEN`** (Settings → Secrets and variables → Actions). The
+   package publishes under your account handle as `@dventimisupabase/pg_partition_magician`.
+
+> The dbdev channel is build- and psql-install-tested in CI, but the TLE `CREATE EXTENSION` path
+> itself is exercised at publish/install time (no dbdev account in CI).
+
 ## Where to go deeper
 
-- `README.md`: dimensions, API, the control-type contract, design facts + timings.
+- [`docs/guide.md`](./docs/guide.md) and [`docs/reference.md`](./docs/reference.md): the user-facing
+  guide and the full function/catalog reference.
+- [`DESIGN.md`](./DESIGN.md): the operating model, control-type contract, and design facts + timings.
 - `sql/pg_partition_magician.sql`: heavily commented; the adapter layer
   (`_grid_floor`/`_grid_next`/`_encode`/`_decode`/`_frontier_native`/`_part_name`) is
   where new partition kinds plug in.
