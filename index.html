@@ -440,7 +440,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">2</span> The switch &middot; <code>adopt</code></span>
             <h3>The table you query is swapped for an identical one, mid-show.</h3>
-            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows. The app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the primary key has to widen to include the partition key (move 3), non-key-aligned unique indexes can't be carried, and an incoming foreign key can't follow a table across a repartition, so <code>adopt</code> resolves those up front, or refuses outright.</p>
+            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows. The app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the primary key has to widen to include the partition key (move 3), non-key-aligned unique indexes can't be carried, and an incoming foreign key can't follow when the key widens like this, so <code>adopt</code> resolves those up front, or refuses outright. (Partition on the key the FK already references and it's simply kept, see below.)</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-switch">
@@ -603,7 +603,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, handled</h3><p>An incoming FK can't survive a repartition silently, so <code>adopt</code> refuses by default, or drops and records them, and hands you a composite-FK recovery script.</p></div>
+          <div><h3>Foreign keys, preserved</h3><p>Partition on the key an incoming FK references (the id/uuidv7 case) and <code>adopt</code> keeps it, re-pointed at the new parent, no denormalization. When the key must widen instead (time), it records the FK and emits a composite-FK recovery script. Either way, never silently broken.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>
@@ -611,7 +611,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
-          <div><h3>Proven across versions</h3><p>53 tests on PostgreSQL 15, 16, 17, and 18: each installed three different ways, every partition kind exercised.</p></div>
+          <div><h3>Proven across versions</h3><p>112 tests on PostgreSQL 15, 16, 17, and 18: each installed three different ways, every partition kind exercised.</p></div>
         </div>
       </div>
     </div>
