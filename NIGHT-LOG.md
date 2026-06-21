@@ -51,3 +51,21 @@ This file is my running journal; the final state is summarized at the bottom.
 - Full suite green on PG17 (16 files / 70 tests). Additive, no regressions. Committed.
 - (Switched regression gate to the persistent container + pg_prove all tests: much faster than
   per-feature ./test.sh up/down. Cross-version ./test.sh sweep reserved for end-of-batch.)
+
+### Feature 2: block-budgeted batching -- DONE on PG17 (cross-version sweep running)
+- New config `drain_max_blocks` (null = off, backward compatible). When set, drain_step caps the
+  microbatch at ~that many heap+TOAST blocks, translated to a row limit via the default's avg
+  bytes/row (pg_table_size / reltuples), taking min(row cap, block-derived limit).
+- TDD: tests/17_block_batch_test.sql (storage-plain ~1.8KB rows: 20-block budget caps the batch far
+  below a 100000-row cap and still progresses; budget off -> moves exactly drain_batch). RED->GREEN.
+- Full pgtap suite green on PG17 (17 files / 73 tests), no drain regressions. Committing.
+
+### Deferred / not done (honest)
+- Window estimator (sec 8): a trivial version (work/rate) is low-value and the honest version needs
+  the calibration probe + regime model. Skipped in favor of higher-value work.
+- Adaptive closed-loop feathering (sec 8 / mode 2): DEFERRED by design -- an under-specified
+  control-loop problem, not safe to blind-implement overnight. Documented, not faked.
+- Supabase at-scale LADDER: NOT run. Prioritized implementation + cross-version pgtap (the thorough
+  correctness signal) and did not provision a fresh paid project unattended for a confirmatory
+  at-scale pass. The scale benefits follow from the unit proofs (reuse-PK = no rebuild = fast adopt;
+  block budget = bounded batch). Ready to run with you around.

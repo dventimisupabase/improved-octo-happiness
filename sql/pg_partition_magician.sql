@@ -44,10 +44,15 @@ create table if not exists pgpm.config (
   -- when maintenance may next attempt premake for this parent. Under sustained write contention
   -- premake keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
   -- instead of retrying (and risking a wasted default scan) every tick. null = attempt now.
-  premake_retry_after timestamptz
+  premake_retry_after timestamptz,
+  -- optional block budget for the drain: cap each microbatch at ~this many heap+TOAST blocks
+  -- (translated to a row limit via the default's average bytes/row), so wide rows can't make a
+  -- single batch huge. null = cap by drain_batch rows only (default). See DESIGN.md section 8.
+  drain_max_blocks int
 );
--- upgrade path for installs that predate premake_retry_after
+-- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists premake_retry_after timestamptz;
+alter table pgpm.config add column if not exists drain_max_blocks int;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -290,7 +295,7 @@ declare
   cfg pgpm.config; v_nsp name; v_rel name; v_def text; v_cols text; v_batch int;
   v_min text; v_min_native text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text;
   v_name name; v_open boolean; v_frontier text; v_moved bigint; v_more boolean;
-  v_excl name; v_method text;
+  v_excl name; v_method text; v_reltuples real; v_avg numeric; v_blk_limit int;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -298,6 +303,21 @@ begin
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_def   := format('%I.%I', v_nsp, cfg.default_table);
   v_batch := coalesce(p_batch, cfg.drain_batch, 5000);
+
+  -- Block budget (DESIGN.md sec 8): bound the microbatch by heap+TOAST blocks, not just rows, so a
+  -- wide-row table (large jsonb/bytea) can't make one batch tens of GB. Translate the budget to a
+  -- row cap via the default's average bytes/row (pg_table_size / reltuples) and take the smaller of
+  -- the two. Skipped when unset, or when stats are missing (reltuples <= 0): then it is the row cap.
+  if cfg.drain_max_blocks is not null then
+    select c.reltuples into v_reltuples from pg_class c where c.oid = v_def::regclass;
+    if coalesce(v_reltuples, 0) > 0 then
+      v_avg := pg_table_size(v_def::regclass)::numeric / v_reltuples;   -- avg heap+TOAST bytes/row
+      if v_avg > 0 then
+        v_blk_limit := greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int;
+        v_batch := least(v_batch, v_blk_limit);
+      end if;
+    end if;
+  end if;
 
   execute format('select t.%I::text from %s t order by t.%I asc limit 1',
                  cfg.control_column, v_def, cfg.control_column) into v_min;
