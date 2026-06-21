@@ -69,3 +69,13 @@ This file is my running journal; the final state is summarized at the bottom.
   correctness signal) and did not provision a fresh paid project unattended for a confirmatory
   at-scale pass. The scale benefits follow from the unit proofs (reuse-PK = no rebuild = fast adopt;
   block budget = bounded batch). Ready to run with you around.
+
+### Final state (morning)
+- All 3 features GREEN across PG 15/16/17/18 (full pgtap suite, 73 tests). Branch pushed.
+  - F1 reuse-existing-PK (5fd3f22) -- headline, cross-version.
+  - F2 block-budgeted batching / drain_max_blocks (c90e2a3) -- cross-version.
+  - F3 check_time_monotonic (020dfe2) -- cross-version.
+- TDD throughout (RED->GREEN), branch-isolated, main untouched.
+- Outstanding: the Supabase at-scale ladder (deferred -- see above); adaptive feathering (deferred
+  by design); window estimator (skipped). DESIGN.md sec 8 should later be updated to mark F1/F2/F3
+  implemented (left as-is for now so this branch is pure feature+test).
