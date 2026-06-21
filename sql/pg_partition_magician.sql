@@ -84,8 +84,15 @@ create table if not exists pgpm.dropped_fk (
   definition          text        not null,
   referencing_columns text[]      not null default '{}',
   referenced_columns  text[]      not null default '{}',
+  -- true when adopt dropped this FK with p_incoming_fks => 'preserve': the partitioned parent keeps
+  -- a unique key matching the FK's referenced columns (the id/uuidv7 happy path), so it can be
+  -- re-added verbatim against the parent by restore_incoming_fks once the table is drained. false
+  -- (the 'drop' mode) means it needs the composite-FK rebuild via generate_fk_recovery instead.
+  restorable          boolean     not null default false,
   dropped_at          timestamptz not null default now()
 );
+-- upgrade path for installs that predate the restorable column
+alter table pgpm.dropped_fk add column if not exists restorable boolean not null default false;
 
 -- =============================== adapter layer ===============================
 
@@ -450,15 +457,15 @@ declare
   v_nsp name; v_rel name; v_default name; v_defreg regclass; v_parent regclass;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
-  v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb;
+  v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
   v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name; v_pk_reuse boolean := false;
   v_idmax bigint[]; v_m bigint; v_i int;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
   end if;
-  if p_incoming_fks not in ('error', 'drop') then
-    raise exception 'pg_partition_magician: p_incoming_fks must be ''error'' or ''drop'' (got %)', p_incoming_fks;
+  if p_incoming_fks not in ('error', 'drop', 'preserve') then
+    raise exception 'pg_partition_magician: p_incoming_fks must be ''error'', ''drop'', or ''preserve'' (got %)', p_incoming_fks;
   end if;
 
   select n.nspname, c.relname into v_nsp, v_rel
@@ -577,7 +584,7 @@ begin
   if exists (select 1 from pg_constraint where confrelid = p_parent and contype = 'f') then
     if p_incoming_fks = 'error' then
       raise exception
-        'pg_partition_magician: % has incoming foreign key(s) (%); a single-column FK cannot reference a partitioned table. Re-point them as composite FKs (see generate_fk_recovery), or call with p_incoming_fks => ''drop''.',
+        'pg_partition_magician: % has incoming foreign key(s) (%). If the partition key is the referenced key (the id/uuidv7 case), keep them with p_incoming_fks => ''preserve''; otherwise the PK widens and they must become composite FKs (p_incoming_fks => ''drop'', then generate_fk_recovery).',
         p_parent,
         (select string_agg(conname || ' on ' || conrelid::regclass::text, ', ')
            from pg_constraint where confrelid = p_parent and contype = 'f');
@@ -590,9 +597,22 @@ begin
                   join pg_attribute a on a.attrelid = c.confrelid and a.attnum = k.attnum) as rcols
           from pg_constraint c where c.confrelid = p_parent and c.contype = 'f'
       loop
+        -- Eligible to PRESERVE iff the partitioned parent will keep a unique key on EXACTLY this
+        -- FK's referenced columns. That key is the parent's PK (v_pkcols); on the id/uuidv7 happy
+        -- path it is the single partition-key column, so a single-column FK to it survives verbatim.
+        -- In the widening (time) case v_pkcols gains the partition key, no single-column unique
+        -- remains, and the FK can only become composite (generate_fk_recovery).
+        v_fk_eligible := v_pkcols is not null
+          and (select array_agg(x order by x) from unnest(v_fk.rcols) x)
+            = (select array_agg(x order by x) from unnest(v_pkcols) x);
+        if p_incoming_fks = 'preserve' and not v_fk_eligible then
+          raise exception 'pg_partition_magician: cannot preserve incoming FK % on % -- it references (%), but the partitioned parent will keep a unique key only on (%). Re-point it as a composite FK instead (p_incoming_fks => ''drop'', then generate_fk_recovery).',
+            v_fk.conname, v_fk.reltbl, array_to_string(v_fk.rcols, ', '), array_to_string(coalesce(v_pkcols, '{}'), ', ');
+        end if;
         v_dropped := v_dropped || jsonb_build_object(
           'reltbl', v_fk.reltbl::text, 'conname', v_fk.conname::text, 'def', v_fk.def,
-          'lcols', to_jsonb(v_fk.lcols), 'rcols', to_jsonb(v_fk.rcols));
+          'lcols', to_jsonb(v_fk.lcols), 'rcols', to_jsonb(v_fk.rcols),
+          'restorable', (p_incoming_fks = 'preserve'));
         execute format('alter table %s drop constraint %I', v_fk.reltbl::text, v_fk.conname);
       end loop;
     end if;
@@ -714,10 +734,11 @@ begin
   -- record any dropped incoming FKs (now pointing at the new parent)
   for v_e in select value from jsonb_array_elements(v_dropped) loop
     insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition,
-                                 referencing_columns, referenced_columns)
+                                 referencing_columns, referenced_columns, restorable)
     values (v_parent, (v_e->>'reltbl')::regclass, v_e->>'conname', v_e->>'def',
             array(select jsonb_array_elements_text(v_e->'lcols')),
-            array(select jsonb_array_elements_text(v_e->'rcols')));
+            array(select jsonb_array_elements_text(v_e->'rcols')),
+            coalesce((v_e->>'restorable')::boolean, false));
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
@@ -847,7 +868,7 @@ create or replace function pgpm.maintenance(p_parent regclass)
 returns text language plpgsql as $$
 declare
   cfg pgpm.config;
-  v_made int := 0; v_dropped int := 0; v_drain text := 'skipped';
+  v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0;
   v_note text := '';
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -908,7 +929,18 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'drain_skip', left(sqlerrm, 200));
   end;
 
-  return format('premade=%s dropped=%s drain=%s%s', v_made, v_dropped, v_drain, v_note);
+  -- Once the closed tail is drained, re-add any incoming FKs that adopt(..., 'preserve') dropped, now
+  -- against the new parent. restore_incoming_fks self-gates on quiescence (no closed rows, no in-flight
+  -- child), so it is a no-op until the drain is idle and harmless to attempt every tick. Isolated like
+  -- the steps above: a hiccup here never aborts the drain's progress.
+  begin
+    v_restored := pgpm.restore_incoming_fks(p_parent);
+  exception when others then
+    v_note := v_note || ' restore_fk_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
+  end;
+
+  return format('premade=%s dropped=%s drain=%s restored_fk=%s%s', v_made, v_dropped, v_drain, v_restored, v_note);
 end;
 $$;
 
@@ -1006,6 +1038,62 @@ begin
 end;
 $$;
 
+-- restore_incoming_fks(): re-add the incoming FKs that adopt(..., p_incoming_fks => 'preserve')
+-- recorded, pointing them back at the new partitioned parent (`NOT VALID` then `VALIDATE`, so the
+-- re-add is online), but only once it is SAFE. Safe = the conversion is quiescent: the closed tail is
+-- fully drained (no closed rows linger in the DEFAULT) and no in-flight, not-yet-attached child
+-- partition exists. The drain moves rows out of the DEFAULT through such a child, during which a
+-- referenced row is briefly outside the parent and a live NO ACTION FK would reject the move (see
+-- DESIGN.md section 8), so the FK must stay dropped until the drain is idle. Returns the number
+-- restored, 0 (a no-op) while the drain is still in flight, so `maintenance` can call it every tick
+-- and it acts only when the table is ready.
+create or replace function pgpm.restore_incoming_fks(p_parent regclass)
+returns int language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_rel name; v_closed bigint; v_inflight name;
+  r pgpm.dropped_fk%rowtype; v_n int := 0;
+begin
+  if not exists (select 1 from pgpm.dropped_fk where parent_table = p_parent and restorable) then
+    return 0;
+  end if;
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  -- gate 1: the closed tail must be fully drained (open-interval rows in the DEFAULT are fine, they
+  -- are still in the parent and the drain will not touch them).
+  select closed_rows into v_closed from pgpm.check_default(p_parent);
+  if coalesce(v_closed, 0) > 0 then return 0; end if;
+
+  -- gate 2: no in-flight (un-attached) child partition mid-drain (same shape as adopt's orphan guard).
+  select c.relname into v_inflight
+    from pg_class c
+   where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
+     and c.relkind = 'r'
+     and starts_with(c.relname, v_rel || '_p')
+     and case when cfg.control_kind = 'id'
+              then substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{19}$'
+              else substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{4}(_[0-9]+)*$'
+         end
+     and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
+   limit 1;
+  if v_inflight is not null then return 0; end if;
+
+  -- safe: re-add each preserved FK against the parent. The recorded definition already names the
+  -- parent (it was captured before the rename, and that name is now the parent).
+  for r in select * from pgpm.dropped_fk where parent_table = p_parent and restorable order by id loop
+    execute format('alter table %s add constraint %I %s not valid',
+                   r.referencing_table::text, r.constraint_name, r.definition);
+    execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
+    delete from pgpm.dropped_fk where id = r.id;
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_incoming_fk', r.constraint_name);
+    v_n := v_n + 1;
+  end loop;
+  return v_n;
+end;
+$$;
+
 -- generate_fk_recovery(): per dropped incoming FK, emit a ready-to-review script
 -- that rebuilds it against the partitioned parent. Targets the parent's actual PK:
 -- reuses the existing local column for any PK column the old FK already referenced,
@@ -1028,7 +1116,9 @@ begin
    where c.conrelid = p_parent and c.contype = 'p';
   if v_pkcols is null then return; end if;
 
-  for r in select * from pgpm.dropped_fk where parent_table = p_parent order by id loop
+  -- 'restorable' rows are preserve-managed (re-added verbatim by restore_incoming_fks); only the
+  -- 'drop'-mode rows need the composite-FK rebuild emitted here.
+  for r in select * from pgpm.dropped_fk where parent_table = p_parent and not restorable order by id loop
     v_fk_cols := ''; v_ref_cols := ''; v_adds := ''; v_sets := ''; v_companions := array[]::text[]; sep := '';
     -- backfill join from the original FK mapping (parent cols = referencing cols)
     v_join := '';
