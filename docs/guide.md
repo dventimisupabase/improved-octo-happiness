@@ -181,7 +181,8 @@ additive-increase / halve-on-congestion idea TCP uses to ride just under a link'
 goes above your tuned rate); it only ever feathers *down* from there, as far as one-sixteenth of
 `drain_batch` under sustained pressure. So set `drain_batch` to the rate you want when there is plenty
 of slack and let pgpm back off automatically under load, instead of hand-tuning a safe fixed rate. The
-backoff point is tunable (`config.drain_wal_high_water`, default 0.7 of the sustainable rate); it still
+backoff point is tunable (`config.drain_wal_high_water`, default 1.0 of the sustainable rate; lower
+drains gentler but slower); it still
 respects `drain_max_blocks`. Off by default; turn it back off with
 `pgpm.set_drain_adaptive('public.events', false)`.
 

@@ -205,8 +205,8 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   forced checkpoint fires when WAL written since the last checkpoint reaches ~`max_wal_size` before the
   `checkpoint_timeout` timer does, and the I/O storm of that flush is the R3 latency tail (a 40M drain at
   a fixed cadence triggered ~12 forced checkpoints). So the sustainable rate is
-  `max_wal_size / checkpoint_timeout`: outrun a fraction of it (`drain_wal_high_water`, default 0.7) and a
-  forced checkpoint is coming. Sensing the *rate* (`pg_current_wal_lsn()` deltas, all non-superuser, vs
+  `max_wal_size / checkpoint_timeout`: outrun `drain_wal_high_water` of it (default 1.0, i.e. the
+  sustainable rate itself) and a forced checkpoint is coming. Sensing the *rate* (`pg_current_wal_lsn()` deltas, all non-superuser, vs
   the two settings, in `pgpm._wal_sustainable_bps()` / `pgpm._feather_congested()`) lets the drain ease
   off *before* the checkpoint fires. This is the key correction over the first cut, which keyed on the
   forced-checkpoint *counter*: that counter only moves once the storm is already underway, so a reactive
@@ -233,6 +233,20 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   advances only on a tick that did work, so a fully-drained idle table (the standing-steward state)
   never churns config or bloats the log. Tests in `tests/26`; cross-version PG 15 to 18. Left off by
   default: it is mode 2, a deliberate posture, not a silent change to every existing managed table.
+
+  *What the leading signal bought (clean fresh-2XL A/B, R3/40M, one fresh 2XL per arm, drained to
+  completion or the 45-min cap).* It is a trade, exactly as the "only feathers down" invariant requires,
+  not a free win. At `drain_wal_high_water` 0.7 the controller pinned the budget to the floor (960 of 974
+  ticks backed off): convert p99 fell 328 → 212 ms and p95 237 → 155 ms (the workload became genuinely
+  unnoticeable below the extreme tail), but the drain throttled to ~24% of disk and did **not** finish
+  (9.7M of 26M rows in 45 min). That over-throttling is because the WAL rate is *total cluster* WAL
+  (workload + autovacuum + drain), so under a write-heavy workload it stays over a 0.7 threshold even with
+  the drain at the floor. The default is therefore **1.0** (back off only when WAL is at/over the
+  sustainable rate that actually forces a checkpoint), which lets the drain finish while still capping the
+  genuine over-drive; lower values are the gentler, completion-optional end of the dial. The lone
+  worst-case `max` spike (tens of seconds) did **not** improve under any setting and persists when the
+  drain is a trickle, so it is not drain-WAL-driven (autovacuum on the churned default, the bulk-load
+  checkpoint aftermath, or the one attach lock are the suspects) -- a separate problem from the pace.
 - **Block-budgeted batching.** Today the drain batches by row count (`drain_batch`), which is unsafe
   when TOAST width varies: 20 000 narrow rows is nothing, but 20 000 rows each carrying a 2 MB
   document is tens of gigabytes rewritten in one microbatch, a spike that breaks the unnoticeable
