@@ -112,28 +112,30 @@
       position: absolute; left: 50%; bottom: 28px;
       width: 132px; height: 188px; margin-left: -66px;
       border-radius: 12px;
-      background: linear-gradient(160deg, var(--bg-raised), var(--bg-surface));
-      border: 1px solid var(--border-strong);
+      background: linear-gradient(160deg, #F4F0E6, #ECE7D9);
+      border: 1px solid #DBD3C1;
       transform-origin: 50% 130%;
       transform: rotate(0deg);
       transition: transform 900ms var(--ease), opacity 700ms var(--ease);
       display: flex; flex-direction: column; justify-content: space-between;
-      padding: 14px; box-shadow: 0 18px 40px rgba(0,0,0,0.45);
+      padding: 14px; box-shadow: 0 16px 38px rgba(0,0,0,0.5);
     }
-    .card .suit { font-family: var(--font-display); font-size: 19px; }
-    .card .lbl { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); letter-spacing: 0.04em; }
-    .card .rows { height: 4px; border-radius: 2px; background: var(--border-strong); }
+    .card .suit { font-family: var(--font-display); font-size: 22px; line-height: 1; color: #1C1C1C; }
+    .card .suit.red { color: #C0392B; }
+    .card .lbl { font-family: var(--font-mono); font-size: 11px; color: #6B6357; letter-spacing: 0.04em; }
+    .card .rows { height: 4px; border-radius: 2px; background: #D8D0BE; }
     .card .rows + .rows { margin-top: 5px; width: 70%; }
-    .card.is-default { border-color: var(--brass-dim); background: linear-gradient(160deg, rgba(232,185,107,0.10), var(--bg-surface)); }
-    .card.is-default .suit, .card.is-default .lbl { color: var(--brass); }
-    .card.is-part .suit { color: var(--green); }
-    .card.is-part .rows { background: rgba(62,207,142,0.35); }
+    /* role coding survives on the ivory faces via the label: bronze = the original DEFAULT, green = the new partitions */
+    .card.is-default { border-color: #D8CBA8; background: linear-gradient(160deg, #F7F1E1, #EFE8D5); }
+    .card.is-default .lbl { color: #8A6A2E; }
+    .card.is-part .lbl { color: #1E7A4D; }
     /* fanned-out angles (post-reveal) */
-    .fan.revealed .card:nth-child(1) { transform: rotate(-30deg) translateY(-6px); }
-    .fan.revealed .card:nth-child(2) { transform: rotate(-15deg); }
-    .fan.revealed .card:nth-child(3) { transform: rotate(0deg) translateY(-8px); z-index: 3; }
-    .fan.revealed .card:nth-child(4) { transform: rotate(15deg); }
-    .fan.revealed .card:nth-child(5) { transform: rotate(30deg) translateY(-6px); }
+    /* an even dealer's fan: equal angular steps about a low pivot, natural left-to-right overlap (no card popped on top) */
+    .fan.revealed .card:nth-child(1) { transform: rotate(-28deg); }
+    .fan.revealed .card:nth-child(2) { transform: rotate(-14deg); }
+    .fan.revealed .card:nth-child(3) { transform: rotate(0deg); }
+    .fan.revealed .card:nth-child(4) { transform: rotate(14deg); }
+    .fan.revealed .card:nth-child(5) { transform: rotate(28deg); }
     /* pre-reveal: stacked monolith */
     .card { opacity: 0; }
     .fan.revealed .card { opacity: 1; }
@@ -399,9 +401,9 @@
       <div class="stage">
         <div class="fan" id="fan" aria-hidden="true">
           <div class="card is-default"><div><div class="suit">♠</div><div class="lbl">DEFAULT</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
-          <div class="card is-part"><div><div class="suit">♦</div><div class="lbl">2026_03</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+          <div class="card is-part"><div><div class="suit red">♦</div><div class="lbl">2026_03</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
           <div class="card is-part"><div><div class="suit">♣</div><div class="lbl">2026_04</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
-          <div class="card is-part"><div><div class="suit">♥</div><div class="lbl">2026_05</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+          <div class="card is-part"><div><div class="suit red">♥</div><div class="lbl">2026_05</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
           <div class="card is-part"><div><div class="suit">♠</div><div class="lbl">2026_06</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
         </div>
         <div class="stage-caption">one table, fanned into partitions: <b>no rows moved</b></div>
@@ -680,10 +682,13 @@
       const update = () => {
         ticking = false;
         const vh = window.innerHeight || document.documentElement.clientHeight;
+        const lo = vh * 2 / 3;   // figure center here: p = 0 (the animation begins)
+        const hi = vh / 3;       // figure center here: p = 1 (the animation is done)
         for (const f of figs) {
           const r = f.getBoundingClientRect();
           if (r.bottom < -40 || r.top > vh + 40) continue;                 // off-screen: leave as-is
-          const p = (vh * 0.88 - r.top) / ((r.height * 0.62) || 1);        // 0 as it enters, 1 once well in view
+          const c = r.top + r.height / 2;                                  // the figure's own center
+          const p = (lo - c) / (lo - hi);                                  // linear scrub as the center crosses the middle third
           f.style.setProperty('--p', Math.max(0, Math.min(1, p)).toFixed(3));
         }
       };
