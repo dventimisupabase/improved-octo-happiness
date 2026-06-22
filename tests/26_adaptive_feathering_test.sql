@@ -122,8 +122,12 @@ select isnt((select drain_ambient_baseline from pgpm.config where parent_table =
 update pgpm.config set drain_ambient_factor = 0 where parent_table = 'public.evt'::regclass;
 
 -- ---- a calm tick (baseline == current counter => no congestion) recovers the budget UP toward the
---      ceiling (start below it; drain_batch=8000 is the ceiling, recovery step is 8000/8=1000) --------
-update pgpm.config set drain_budget = 4000, drain_ckpt_seen = pgpm._forced_checkpoints()
+--      ceiling (start below it; drain_batch=8000 is the ceiling, recovery step is 8000/8=1000). Null the
+--      WAL rate baseline too: a prior tick this same statement-batch left drain_wal_lsn/at set, so without
+--      this the next tick would divide WAL by a sub-second interval and read a spurious huge rate (a false
+--      WAL-congestion that halves the budget). Nulling it forces a clean "first tick" => no rate => calm. -
+update pgpm.config set drain_budget = 4000, drain_ckpt_seen = pgpm._forced_checkpoints(),
+                       drain_wal_lsn = null, drain_wal_at = null
   where parent_table = 'public.evt'::regclass;
 select pgpm.maintenance('public.evt');
 select cmp_ok((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
