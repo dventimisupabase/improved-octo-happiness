@@ -30,8 +30,8 @@ pgpm.adopt(
   p_parent       regclass,
   p_control      name,
   p_interval     interval,
-  p_premake      int         default 4,
-  p_retention    interval    default null,
+  p_attain      int         default 4,
+  p_retain    interval    default null,
   p_keep_default boolean     default true,
   p_drain_batch  int         default 5000,
   p_anchor       timestamptz default '2000-01-01 00:00:00+00',
@@ -49,8 +49,8 @@ interval literal is ambiguous against the bigint overload, so cast it: `adopt(t,
 | `p_parent` | The table to convert: a plain (unpartitioned) table whose primary key already includes `p_control`, or which has no primary key. |
 | `p_control` | The column to range-partition on. |
 | `p_interval` | Partition width. Whole-month (`interval '1 month'`, `'1 year'`) aligns to the calendar; fixed-duration (`'1 day'`, `'6 hours'`) tiles from `p_anchor`. Mixing month and duration is rejected. For a `uuid` column it is the time width of each partition. |
-| `p_premake` | How many partitions to keep created ahead of the frontier. |
-| `p_retention` | Drop partitions whose upper bound is older than this interval before the frontier. `null` keeps everything. |
+| `p_attain` | How many partitions to keep created ahead of the frontier. |
+| `p_retain` | Drop partitions whose upper bound is older than this interval before the frontier. `null` keeps everything. |
 | `p_keep_default` | Keep an (expected-empty) `DEFAULT` partition as a safety net. Leave `true`. |
 | `p_drain_batch` | Default rows moved per drain microbatch (see `drain_step`). |
 | `p_anchor` | Grid origin for fixed-duration intervals. Calendar-aligned months ignore it. |
@@ -62,7 +62,7 @@ interval literal is ambiguous against the bigint overload, so cast it: `adopt(t,
 ```sql
 pgpm.adopt(
   p_parent regclass, p_control name, p_step bigint,
-  p_premake int default 4, p_retention bigint default null, p_keep_default boolean default true,
+  p_attain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass
@@ -72,7 +72,7 @@ The bigint overload, for an integer / `bigint` / `numeric` key (including Snowfl
 integer literal selects it with no cast: `adopt(t, c, 10000000)`. Differences from the interval form:
 
 - `p_step` is the partition width in key units (e.g. `10000000` ids per partition).
-- `p_retention` is a `bigint` count of intervals to keep, not an interval.
+- `p_retain` is a `bigint` count of intervals to keep, not an interval.
 - `p_anchor` is a `bigint` grid origin (default `0`).
 - The frontier is `max(control)`.
 
@@ -116,19 +116,19 @@ select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 pgpm.maintenance(p_parent regclass) returns text
 ```
 
-One maintenance tick for one table: premake, then retention, then a single `drain_step`. Returns a
+One maintenance tick for one table: attain, then retain, then a single `drain_step`. Returns a
 short text summary. Respects the `paused` flag (returns `'paused'` and does nothing if paused). Each
 step runs in its own subtransaction under a short `lock_timeout`, so a step that loses a lock race is
-deferred to the next tick rather than aborting the others; premake additionally backs off after a
-deferral (tracked in `config.premake_retry_after`).
+deferred to the next tick rather than aborting the others; attain additionally backs off after a
+deferral (tracked in `config.attain_retry_after`).
 
-### `pgpm.premake`
+### `pgpm.attain`
 
 ```sql
-pgpm.premake(p_parent regclass) returns int
+pgpm.attain(p_parent regclass) returns int
 ```
 
-Creates partitions ahead of the frontier up to `config.premake`, so live writes always land in a
+Creates partitions ahead of the frontier up to `config.attain`, so live writes always land in a
 real partition. Returns the number of partitions created. Uses the scan-skip attach path (a
 `NOT VALID` CHECK validated under a non-blocking lock), so it never blocks the workload on the
 default's scan.
@@ -173,14 +173,14 @@ drains and attaches the current open interval (a brief blocking attach against a
 cheapest done last). Useful for tests and one-shot conversions; for production prefer the paced
 `maintenance` cron.
 
-### `pgpm.retention`
+### `pgpm.retain`
 
 ```sql
-pgpm.retention(p_parent regclass) returns int
+pgpm.retain(p_parent regclass) returns int
 ```
 
-Drops partitions older than `config.retention` (an interval for `time`/`uuidv7`, a count of
-intervals for `id`). Returns the number dropped. Uses plain `DROP` (a brief lock); `null` retention
+Drops partitions older than `config.retain` (an interval for `time`/`uuidv7`, a count of
+intervals for `id`). Returns the number dropped. Uses plain `DROP` (a brief lock); `null` retain
 keeps everything. For very large cold partitions you may prefer to `DETACH ... CONCURRENTLY` by hand.
 
 ### `pgpm.set_drain_adaptive`
@@ -241,8 +241,8 @@ One row per managed table.
 | `parent` | `regclass` | The managed parent table. |
 | `control_kind` | `text` | `time`, `id`, or `uuidv7`. |
 | `partition_step` | `text` | The interval or id step. |
-| `premake` | `int` | Partitions kept ahead. |
-| `retention` | `text` | Retention policy, or null. |
+| `attain` | `int` | Partitions kept ahead. |
+| `retain` | `text` | Retention policy, or null. |
 | `paused` | `boolean` | Whether scheduled maintenance is paused. |
 | `n_partitions` | `bigint` | Registered partitions (excludes the DEFAULT). |
 | `default_rows` | `bigint` | Rows still in the DEFAULT. |
@@ -333,14 +333,14 @@ One row per managed table; the source of truth for its policy. Editable (e.g.
 | `control_kind` | `text` | `time`, `id`, or `uuidv7`. |
 | `partition_step` | `text` | Interval (time/uuidv7) or id step. |
 | `partition_anchor` | `text` | Grid origin. |
-| `premake` | `int` | Partitions to keep ahead. |
-| `retention` | `text` | Retention policy, or null to keep all. |
+| `attain` | `int` | Partitions to keep ahead. |
+| `retain` | `text` | Retention policy, or null to keep all. |
 | `keep_default` | `boolean` | Keep the DEFAULT safety net. |
 | `drain_batch` | `int` | Default rows per drain microbatch. |
 | `default_table` | `name` | Name of the DEFAULT partition (`<parent>_default`). |
 | `paused` | `boolean` | Whether scheduled maintenance acts on this table. |
 | `created_at` | `timestamptz` | When adopted. |
-| `premake_retry_after` | `timestamptz` | Internal premake back-off window; null = attempt now. |
+| `attain_retry_after` | `timestamptz` | Internal attain back-off window; null = attempt now. |
 | `drain_max_blocks` | `int` | Optional block budget per drain batch; null = cap by `drain_batch` rows only. |
 | `drain_adaptive` | `boolean` | Adaptive feathering (mode 2) on/off. Set via `set_drain_adaptive`; default off. |
 | `drain_budget` | `int` | Controller state: current adaptive rows/tick budget; null until the first adaptive tick. |
@@ -367,7 +367,7 @@ ordered by parent then `lo`.
 ### `pgpm.log`
 
 Append-only audit trail of actions. Columns: `id`, `parent_table`, `action` (e.g. `drain_move`,
-`drain_attach`, `premake_skip`), `lo`, `hi`, `method`, `rows`, `at`.
+`drain_attach`, `attain_skip`), `lo`, `hi`, `method`, `rows`, `at`.
 
 ### `pgpm.dropped_fk`
 

@@ -12,9 +12,9 @@ select is(
 );
 
 select is(
-  (select premake from pgpm.config where parent_table = 'public.messages'::regclass),
+  (select attain from pgpm.config where parent_table = 'public.messages'::regclass),
   4,
-  'config: premake = 4'
+  'config: attain = 4'
 );
 
 select cmp_ok(
@@ -30,11 +30,11 @@ select ok(
   'current month is NOT premade while its data is still in the DEFAULT'
 );
 
--- premake is idempotent: everything ahead already exists, current still skipped
+-- attain is idempotent: everything ahead already exists, current still skipped
 select is(
-  pgpm.premake('public.messages'),
+  pgpm.attain('public.messages'),
   0,
-  'premake is idempotent (creates nothing on a second call)'
+  'attain is idempotent (creates nothing on a second call)'
 );
 
 select * from finish();
