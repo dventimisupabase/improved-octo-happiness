@@ -163,6 +163,24 @@ Tune the pace with `config.drain_batch` (rows per microbatch) and the cron caden
 highly variable row width, set `config.drain_max_blocks` to cap each batch by storage size rather
 than row count.
 
+### Adaptive feathering (let the drain tune itself)
+
+Instead of fixing the rate by hand, turn on adaptive mode and let pgpm ride the drain just under the
+system's spare capacity:
+
+```sql
+select pgpm.set_drain_adaptive('public.events', true);
+```
+
+Now each maintenance tick watches for checkpoint pressure (a forced checkpoint means the drain is
+pushing more write traffic than the database can absorb) and adjusts the per-tick budget: it eases up
+gently when there is slack and backs off sharply when it detects pressure, the same
+additive-increase / halve-on-congestion idea TCP uses to ride just under a link's capacity. It still
+respects `drain_max_blocks`, and `drain_batch` becomes the nominal rate it explores around (roughly
+one-eighth to eight times). This keeps the drain unnoticeable without you having to find the right
+fixed `drain_batch` for your hardware. It is off by default; turn it back off with
+`pgpm.set_drain_adaptive('public.events', false)`.
+
 ## Monitor
 
 ```sql

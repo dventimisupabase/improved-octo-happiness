@@ -363,6 +363,15 @@ q "select pgpm.adopt('bench.events','created_at', interval '$BENCH_INTERVAL', $B
 adopt_t1=$(q "select extract(epoch from clock_timestamp())")
 awk -v a="$adopt_t0" -v b="$adopt_t1" 'BEGIN{printf "  adopt() returned in %.1fs (metadata cutover)\n", b-a}'
 
+# 4b. adaptive feathering (DESIGN.md sec 8, mode 2): let the drain ride its budget against checkpoint
+#     pressure (AIMD) instead of the fixed drain_batch. BENCH_DRAIN_ADAPTIVE=0 keeps mode 1 (fixed).
+if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
+  q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null
+  echo "  adaptive feathering ENABLED (drain budget self-tunes around drain_batch=$BENCH_DRAIN_BATCH)"
+else
+  echo "  adaptive feathering off (mode 1: fixed drain_batch=$BENCH_DRAIN_BATCH)"
+fi
+
 # 4c. schedule pgpm.maintenance on pg_cron -- THIS is how pgpm self-drives premake + drain
 #     (standard pgpm operation; the operator schedules it once; pg_cron skips overlapping runs)
 q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
@@ -493,6 +502,9 @@ say "report"
   echo "- conversion window: \`$convert_start\` -> \`$convert_end\`"
   echo "- drain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") moves, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_attach'") partition attaches, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") rows moved"
   echo "- premake: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='premake'") succeeded, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='premake_skip'") deferred under lock contention"
+  if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
+    echo "- adaptive feathering (mode 2): $(q "select coalesce(min(rows),0)||'-'||coalesce(max(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") rows/tick budget range over $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") steps, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method='backoff'") checkpoint-pressure backoffs"
+  fi
   if [ "$BENCH_OBSERVE_MODE" = window ]; then
     echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (still draining -- not expected to be 0 in a windowed run)"
   else

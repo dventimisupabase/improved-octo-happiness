@@ -183,6 +183,20 @@ Drops partitions older than `config.retention` (an interval for `time`/`uuidv7`,
 intervals for `id`). Returns the number dropped. Uses plain `DROP` (a brief lock); `null` retention
 keeps everything. For very large cold partitions you may prefer to `DETACH ... CONCURRENTLY` by hand.
 
+### `pgpm.set_drain_adaptive`
+
+```sql
+pgpm.set_drain_adaptive(p_parent regclass, p_enabled boolean default true) returns void
+```
+
+Turns adaptive feathering (DESIGN.md section 8, mode 2) on or off for one table. When on, each
+`maintenance` tick senses checkpoint pressure (a forced/requested checkpoint since the last tick means
+the drain is over-driving the disk) and rides the per-tick drain budget just under supply via AIMD:
+it probes the budget up by a small step on a calm tick and halves it on a forced checkpoint. The
+budget is bracketed at `drain_batch`/8 to `drain_batch`x8, so `drain_batch` stays the single
+operating-point knob. Off (the default) keeps the fixed `drain_batch` rate. Toggling resets the
+controller state so it restarts cleanly from `drain_batch`.
+
 ## Inspection
 
 ### `pgpm.status`
@@ -299,6 +313,9 @@ One row per managed table; the source of truth for its policy. Editable (e.g.
 | `created_at` | `timestamptz` | When adopted. |
 | `premake_retry_after` | `timestamptz` | Internal premake back-off window; null = attempt now. |
 | `drain_max_blocks` | `int` | Optional block budget per drain batch; null = cap by `drain_batch` rows only. |
+| `drain_adaptive` | `boolean` | Adaptive feathering (mode 2) on/off. Set via `set_drain_adaptive`; default off. |
+| `drain_budget` | `int` | Controller state: current adaptive rows/tick budget; null until the first adaptive tick. |
+| `drain_ckpt_seen` | `bigint` | Controller state: last forced-checkpoint counter observed; null = uninitialized. |
 
 ### `pgpm.part`
 

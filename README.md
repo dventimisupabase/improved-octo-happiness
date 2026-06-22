@@ -19,6 +19,8 @@ of native `RANGE`-partitioned tables:
 - **premake**: keep N partitions ahead of the write frontier so live writes always have a real
   partition.
 - **drain**: move the `DEFAULT` partition's closed tail into proper partitions in paced microbatches.
+  Optionally adaptive (`pgpm.set_drain_adaptive`): the pace self-tunes against checkpoint pressure to
+  stay unnoticeable.
 - **retention**: drop partitions older than a policy.
 - **maintenance**: the single procedure `pg_cron` calls (premake + retention + drain).
 
