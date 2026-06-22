@@ -4,8 +4,8 @@
 --   * Only runtime dependency: pg_cron (and only for scheduling). No compiled
 --     extension. Install with: psql -f this_file.sql.  Schema: pgpm.
 --   * Manages the full lifecycle of native RANGE-partitioned tables: adopt an
---     existing (possibly huge, live) table online, premake ahead of the write
---     frontier, drain the DEFAULT's closed tail, retention, all via maintenance.
+--     existing (possibly huge, live) table online, attain ahead of the write
+--     frontier, drain the DEFAULT's closed tail, retain, all via maintenance.
 --
 -- Control-type contract -- a column works as the partition key if it is:
 --   (a) RANGE-partitionable (btree-ordered),
@@ -34,17 +34,17 @@ create table if not exists pgpm.config (
                    check (control_kind in ('time', 'id', 'uuidv7')),
   partition_step   text        not null,    -- '1 month' (time/uuidv7) | '10000000' (id)
   partition_anchor text        not null,    -- '2000-01-01...' (time/uuidv7) | '0' (id)
-  premake          int         not null default 4,
-  retention        text,                    -- interval (time/uuidv7) | bigint count (id); null = keep
+  attain          int         not null default 4,
+  retain        text,                    -- interval (time/uuidv7) | bigint count (id); null = keep
   keep_default     boolean     not null default true,
   drain_batch      int         not null default 5000,
   default_table    name        not null,
   paused           boolean     not null default true,
   created_at       timestamptz not null default now(),
-  -- when maintenance may next attempt premake for this parent. Under sustained write contention
-  -- premake keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
+  -- when maintenance may next attempt attain for this parent. Under sustained write contention
+  -- attain keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
   -- instead of retrying (and risking a wasted default scan) every tick. null = attempt now.
-  premake_retry_after timestamptz,
+  attain_retry_after timestamptz,
   -- optional block budget for the drain: cap each microbatch at ~this many heap+TOAST blocks
   -- (translated to a row limit via the default's average bytes/row), so wide rows can't make a
   -- single batch huge. null = cap by drain_batch rows only (default). See DESIGN.md section 8.
@@ -81,7 +81,7 @@ create table if not exists pgpm.config (
   drain_ambient_baseline    numeric
 );
 -- upgrade path for installs that predate these columns
-alter table pgpm.config add column if not exists premake_retry_after timestamptz;
+alter table pgpm.config add column if not exists attain_retry_after timestamptz;
 alter table pgpm.config add column if not exists drain_max_blocks int;
 alter table pgpm.config add column if not exists drain_adaptive boolean not null default false;
 alter table pgpm.config add column if not exists drain_budget int;
@@ -297,11 +297,11 @@ begin
   insert into pgpm.part (parent_table, child_name, lo, hi)
     values (format('%I.%I', p_nsp, p_rel)::regclass, p_name, p_lo, p_hi) on conflict do nothing;
   insert into pgpm.log (parent_table, action, lo, hi, method)
-    values (format('%I.%I', p_nsp, p_rel)::regclass, 'premake', p_lo, p_hi, v_method);
+    values (format('%I.%I', p_nsp, p_rel)::regclass, 'attain', p_lo, p_hi, v_method);
 end;
 $$;
 
-create or replace function pgpm.premake(p_parent regclass)
+create or replace function pgpm.attain(p_parent regclass)
 returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_default regclass;
@@ -316,7 +316,7 @@ begin
   v_frontier := pgpm._frontier_native(p_parent);
   v_lo       := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
 
-  for k in 0 .. cfg.premake loop
+  for k in 0 .. cfg.attain loop
     if k > 0 then v_lo := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo); end if;
     v_hi   := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
     v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo);
@@ -457,23 +457,23 @@ begin
 end;
 $$;
 
-create or replace function pgpm.retention(p_parent regclass)
+create or replace function pgpm.retain(p_parent regclass)
 returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_boundary text; v_frontier text; v_ncast text; r record; v_dropped int := 0;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
-  if cfg.retention is null then return 0; end if;
+  if cfg.retain is null then return 0; end if;
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
   if cfg.control_kind = 'id' then
     v_frontier := pgpm._frontier_native(p_parent);
     v_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                   (v_frontier::numeric - cfg.retention::numeric)::text);
+                                   (v_frontier::numeric - cfg.retain::numeric)::text);
   else
     v_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                   (now() - cfg.retention::interval)::text);
+                                   (now() - cfg.retain::interval)::text);
   end if;
   v_ncast := pgpm._native_type(cfg.control_kind);
 
@@ -483,7 +483,7 @@ begin
   loop
     execute format('drop table %I.%I', v_nsp, r.child_name);
     delete from pgpm.part where parent_table = p_parent and child_name = r.child_name;
-    insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retention_drop', r.lo, r.hi);
+    insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
     v_dropped := v_dropped + 1;
   end loop;
   return v_dropped;
@@ -494,7 +494,7 @@ $$;
 
 create or replace function pgpm._adopt(
   p_parent regclass, p_control name, p_control_kind text,
-  p_step text, p_anchor text, p_premake int, p_retention text,
+  p_step text, p_anchor text, p_attain int, p_retain text,
   p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text
 )
 returns regclass language plpgsql as $$
@@ -732,13 +732,13 @@ begin
 
   -- 10. register
   insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
-                           premake, retention, keep_default, drain_batch, default_table, paused)
-  values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_premake, p_retention,
+                           attain, retain, keep_default, drain_batch, default_table, paused)
+  values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_attain, p_retain,
           p_keep_default, p_drain_batch, v_default, p_paused)
   on conflict (parent_table) do update set
     control_column = excluded.control_column, control_kind = excluded.control_kind,
     partition_step = excluded.partition_step, partition_anchor = excluded.partition_anchor,
-    premake = excluded.premake, retention = excluded.retention, keep_default = excluded.keep_default,
+    attain = excluded.attain, retain = excluded.retain, keep_default = excluded.keep_default,
     drain_batch = excluded.drain_batch, default_table = excluded.default_table, paused = excluded.paused;
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'adopt');
@@ -751,14 +751,14 @@ begin
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
-  -- NOTE: premake is intentionally NOT run inside adopt. It attaches future partitions,
+  -- NOTE: attain is intentionally NOT run inside adopt. It attaches future partitions,
   -- and attaching a partition to a parent whose DEFAULT already holds data makes Postgres
   -- scan the default -- which, inside this ACCESS EXCLUSIVE transaction, blocks ALL access
   -- for the whole scan (O(default), minutes on a large table). adopt() therefore does the
   -- metadata-only cutover ONLY (a fresh parent with just the DEFAULT attached scans nothing),
-  -- so it stays online even at scale. Run pgpm.premake(parent) (or pgpm.maintenance, or the
+  -- so it stays online even at scale. Run pgpm.attain(parent) (or pgpm.maintenance, or the
   -- scheduled maintenance job) AFTER adopt to build the future partitions online -- its
-  -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until premake
+  -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until attain
   -- runs, new writes route to the DEFAULT (correct, just not yet split into future cells).
   return v_parent;
 end;
@@ -780,7 +780,7 @@ drop function if exists pgpm.generate_fk_recovery(regclass);
 -- callers cast: adopt(t, c, interval '1 month').
 create or replace function pgpm.adopt(
   p_parent regclass, p_control name, p_interval interval,
-  p_premake int default 4, p_retention interval default null, p_keep_default boolean default true,
+  p_attain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
@@ -788,19 +788,19 @@ create or replace function pgpm.adopt(
     case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
                  where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
          then 'uuidv7' else 'time' end,
-    p_interval::text, p_anchor::text, p_premake,
-    p_retention::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
+    p_interval::text, p_anchor::text, p_attain,
+    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
 $$;
 
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
 create or replace function pgpm.adopt(
   p_parent regclass, p_control name, p_step bigint,
-  p_premake int default 4, p_retention bigint default null, p_keep_default boolean default true,
+  p_attain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
-  select pgpm._adopt(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_premake,
-                     p_retention::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
+  select pgpm._adopt(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_attain,
+                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
 $$;
 
 -- ============================== maintenance / observability ==============================
@@ -963,42 +963,42 @@ begin
   -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
   -- is DEFERRED (retried next tick) WITHOUT aborting the drain.
   --
-  -- premake/retention get a VERY SHORT lock_timeout. Premaking a future partition's first step
+  -- attain/retain get a VERY SHORT lock_timeout. Attaining a future partition's first step
   -- (ADD CONSTRAINT on the default, for the scan-skip path) takes ACCESS EXCLUSIVE on the default
   -- -- which the live workload's inserts hold almost continuously. A long timeout there is doubly
   -- bad: it blocks the workload for the whole wait (the pending ACCESS EXCLUSIVE queues every new
   -- locker behind it), AND if it does win the lock it goes on to VALIDATE-scan the entire default
   -- before the CREATE -- a scan that is wasted whenever the CREATE then can't get its lock. Failing
-  -- fast makes a deferral nearly free: no long block, and it bails before that scan. premake is
+  -- fast makes a deferral nearly free: no long block, and it bails before that scan. attain is
   -- optional (the future cells aren't written yet; the DEFAULT catches anything), so it simply
   -- retries when the workload next has a gap.
   perform set_config('lock_timeout', '200ms', true);
 
-  -- premake back-off: once a deferral happens, don't retry every tick -- under sustained write
-  -- contention premake can't win the lock for minutes, and each attempt risks a wasted default
+  -- attain back-off: once a deferral happens, don't retry every tick -- under sustained write
+  -- contention attain can't win the lock for minutes, and each attempt risks a wasted default
   -- scan. Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches
-  -- them), so deferring premake is harmless. A successful premake clears the back-off.
-  if coalesce(cfg.premake_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
+  -- them), so deferring attain is harmless. A successful attain clears the back-off.
+  if coalesce(cfg.attain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
     begin
-      v_made := pgpm.premake(p_parent);
-      if cfg.premake_retry_after is not null then
-        update pgpm.config set premake_retry_after = null where parent_table = p_parent;
+      v_made := pgpm.attain(p_parent);
+      if cfg.attain_retry_after is not null then
+        update pgpm.config set attain_retry_after = null where parent_table = p_parent;
       end if;
     exception when others then
-      v_note := v_note || ' premake_deferred';
-      update pgpm.config set premake_retry_after = clock_timestamp() + interval '30 seconds'
+      v_note := v_note || ' attain_deferred';
+      update pgpm.config set attain_retry_after = clock_timestamp() + interval '30 seconds'
         where parent_table = p_parent;
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'premake_skip', left(sqlerrm, 200));
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'attain_skip', left(sqlerrm, 200));
     end;
   else
-    v_note := v_note || ' premake_backoff';
+    v_note := v_note || ' attain_backoff';
   end if;
 
   begin
-    v_dropped := pgpm.retention(p_parent);
+    v_dropped := pgpm.retain(p_parent);
   exception when others then
-    v_note := v_note || ' retention_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'retention_skip', left(sqlerrm, 200));
+    v_note := v_note || ' retain_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'retain_skip', left(sqlerrm, 200));
   end;
 
   -- Adaptive feathering (mode 2, DESIGN.md sec 8): ride the per-tick drain budget just under the WAL
@@ -1161,7 +1161,7 @@ $$;
 -- check_time_monotonic: how co-monotonic is an id column with a timestamp column? Samples p_sample
 -- rows at random, orders them by the id, and reports the fraction of adjacent pairs whose time is
 -- non-decreasing. ~1.0 means id and time co-increase; backfills and out-of-order arrival drive it
--- down. This is the tier-2 safety check for time-based retention expressed against an id partition
+-- down. This is the tier-2 safety check for retaining by time against an id partition
 -- key (DESIGN.md section 8): mapping "older than T" to an id boundary is only sound when id and
 -- time co-increase. Heuristic, not a proof -- mirrors check_uuidv7's plausibility sampling.
 create or replace function pgpm.check_time_monotonic(
@@ -1183,7 +1183,7 @@ $$;
 
 create or replace function pgpm.status()
 returns table (
-  parent regclass, control_kind text, partition_step text, premake int, retention text,
+  parent regclass, control_kind text, partition_step text, attain int, retain text,
   paused boolean, n_partitions bigint, default_rows bigint, default_oldest text, newest_bound text
 )
 language plpgsql as $$
@@ -1198,7 +1198,7 @@ begin
     execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass',
                    pgpm._native_type(r.control_kind), r.parent_table::text) into v_new;
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
-    premake := r.premake; retention := r.retention; paused := r.paused; n_partitions := v_np;
+    attain := r.attain; retain := r.retain; paused := r.paused; n_partitions := v_np;
     default_rows := v_drows; default_oldest := v_old; newest_bound := v_new;
     return next;
   end loop;

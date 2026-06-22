@@ -12,7 +12,7 @@ rationale see [DESIGN.md](../DESIGN.md); for a visual overview see the
 - [Adopt a table](#adopt-a-table)
 - [Run it](#run-it)
 - [Monitor](#monitor)
-- [Retention](#retention)
+- [Retain](#retain)
 - [Incoming foreign keys](#incoming-foreign-keys)
 - [Secondary indexes](#secondary-indexes)
 - [How the conversion stays online](#how-the-conversion-stays-online)
@@ -48,18 +48,18 @@ still receiving writes) and "closed" once the frontier moves past its upper boun
 
 **The DEFAULT is a safety net.** Adoption attaches your original table as the `DEFAULT` partition, so
 any row that does not match a real partition still has a home (no lost writes, ever). In steady state
-premake keeps the current and future intervals covered, so the DEFAULT holds only the open interval
+attain keeps the current and future intervals covered, so the DEFAULT holds only the open interval
 and otherwise stays empty. `check_default()` tells you if anything is stuck there.
 
 **The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintenance_all()`, drives
 three jobs per table:
 
-- **premake**: create up to N partitions ahead of the frontier, so live writes always land in a real
+- **attain**: create up to N partitions ahead of the frontier, so live writes always land in a real
   partition.
 - **drain**: move the DEFAULT's closed tail into proper partitions, a small microbatch at a time,
   then attach each interval's partition when it empties. The only range ever drained is one that has
   closed (no contention with live writes).
-- **retention**: drop partitions older than your policy.
+- **retain**: drop partitions older than your policy.
 
 ## Install
 
@@ -149,7 +149,7 @@ select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 update pgpm.config set paused = false where parent_table = 'public.events'::regclass;
 ```
 
-From there, each tick premakes ahead, drains a microbatch of the closed tail, and applies retention.
+From there, each tick attains ahead, drains a microbatch of the closed tail, and applies retention.
 You can also adopt with `p_paused => false` to skip the manual unpause.
 
 To convert a table synchronously (tests, one-shot migrations) instead of waiting for the paced cron,
@@ -227,17 +227,17 @@ that a timestamp column rises with the id:
 select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
 ```
 
-## Retention
+## Retain
 
-Set a policy at adopt time (`p_retention`) or later via `config.retention`, and maintenance drops
-partitions past it. Retention is an interval for `time`/`uuidv7` and a count of intervals for `id`.
+Set a policy at adopt time (`p_retain`) or later via `config.retain`, and maintenance drops
+partitions past it. Retain is an interval for `time`/`uuidv7` and a count of intervals for `id`.
 `null` keeps everything.
 
 ```sql
-update pgpm.config set retention = '90 days' where parent_table = 'public.events'::regclass;
+update pgpm.config set retain = '90 days' where parent_table = 'public.events'::regclass;
 ```
 
-Retention uses plain `DROP` (a brief lock). `DETACH ... CONCURRENTLY` cannot run inside a function,
+Retain uses plain `DROP` (a brief lock). `DETACH ... CONCURRENTLY` cannot run inside a function,
 so for very large cold partitions you may prefer to detach them concurrently by hand.
 
 ## Incoming foreign keys
@@ -275,7 +275,7 @@ in-flight child partition), so it is safe to call early or repeatedly. An incomi
 a non-PK key that cannot survive partitioning is refused by `'preserve'` with guidance.
 
 After it is restored, `maintenance` keeps a managed FK on a leash: a preserve-managed FK is live only
-while the closed tail is empty. If a later drain appears (for example premake falls behind and rows
+while the closed tail is empty. If a later drain appears (for example attain falls behind and rows
 land in the DEFAULT for an interval that then closes), `maintenance` suspends the FK before draining
 (`pgpm.suspend_incoming_fks` keeps them safe across that drain) and restores it afterward, so the
 catch-up drain neither stalls nor (for a `CASCADE` / `SET NULL` FK) silently deletes or nulls the
@@ -300,7 +300,7 @@ Two facts about Postgres drive the design:
    `ACCESS EXCLUSIVE`, which would block the workload.
 
 pgpm sidesteps #2 for every range that receives no concurrent writes (closed past intervals on the
-drain, future intervals on premake) with a scan-skip attach:
+drain, future intervals on attain) with a scan-skip attach:
 
 ```sql
 ADD CONSTRAINT excl CHECK (control < lo OR control >= hi) NOT VALID  -- catalog only, instant
@@ -384,9 +384,9 @@ What to do:
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
   clock-skew/late-arrival window; the don't-close-until-frontier-past rule plus the DEFAULT safety
   net absorb stragglers. Arbitrary backdated keys break it.
-- **Empty DEFAULT kept as a safety net** (`keep_default`). In steady state premake stays ahead so the
+- **Empty DEFAULT kept as a safety net** (`keep_default`). In steady state attain stays ahead so the
   DEFAULT stays empty; `check_default()` flags any stray row.
-- **Retention uses plain `DROP`** (a brief lock); detach huge cold partitions concurrently by hand.
+- **Retain uses plain `DROP`** (a brief lock); detach huge cold partitions concurrently by hand.
 - **Unique secondary indexes** are not auto-propagated (a partitioned unique index must include the
   partition key); recreate them on the parent by hand.
 - **The primary key is never rewritten.** The control column must already be part of the table's

@@ -3,7 +3,7 @@
 Welcome. This repo is **`pg_partition_magician`**: a lightweight, **pure-SQL**
 RANGE-partition manager for PostgreSQL whose only runtime dependency is **pg_cron**.
 It adopts an existing (possibly huge, live) table into a native partitioned table
-*online*, then manages the lifecycle (premake → drain → retention) across three
+*online*, then manages the lifecycle (attain → drain → retain) across three
 partition-key dimensions: **time**, **integer/bigint id**, and **UUIDv7/ULID**.
 
 For *what it does and how to use it*, read [`README.md`](./README.md) and the
@@ -45,7 +45,7 @@ docker compose --profile pg15 down -v
 | `fixtures/demo.sql` | Builds + adopts the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
 | `README.md` | Overview, quickstart, and links into the docs |
-| `docs/guide.md` | User guide: concepts, install, adopt, schedule, monitor, retention, FKs, ops |
+| `docs/guide.md` | User guide: concepts, install, adopt, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |
 | `DESIGN.md` | The operating model and design rationale |
 | `postgresql_online_partition_migration_summary.md` | The original design doc the project grew from |

@@ -28,9 +28,9 @@ pgpm partitions on a *monotonic* key: a timestamp, an integer/bigint id (includi
 
 You schedule one procedure, `pgpm.maintenance_all()`, on `pg_cron`. Each tick it does three things:
 
-- **premake**: keep N real partitions ahead of the write frontier, so live inserts always land in a real partition and never pile up in the `DEFAULT`.
+- **attain**: keep N real partitions ahead of the write frontier, so live inserts always land in a real partition and never pile up in the `DEFAULT`.
 - **drain**: move the `DEFAULT`'s closed tail (the rows that now belong in a real partition) into that partition, in small paced batches.
-- **retention**: drop partitions older than your policy.
+- **retain**: drop partitions older than your policy.
 
 ![A 40M-row table partitioned live: rows draining out of the DEFAULT while partitions are created, the workload running throughout.](../bench/figures/01-online-conversion.png)
 
@@ -72,8 +72,8 @@ select pgpm.adopt(
   p_parent    => 'public.events',
   p_control   => 'created_at',        -- the monotonic key to range-partition on
   p_interval  => interval '1 month',  -- daily / weekly / monthly / yearly ...
-  p_premake   => 7,                   -- keep 7 partitions ahead of writes
-  p_retention => '90 days',           -- drop partitions older than this (null = keep)
+  p_attain   => 7,                   -- keep 7 partitions ahead of writes
+  p_retain => '90 days',           -- drop partitions older than this (null = keep)
   p_paused    => false                -- let scheduled maintenance run
 );
 
@@ -84,4 +84,4 @@ select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 select * from pgpm.status();
 ```
 
-That is the whole thing. The cutover is metadata-only, the backlog drains itself in the background without anyone noticing, and retention keeps the table trim, all from a single SQL file on any Postgres that has `pg_cron`.
+That is the whole thing. The cutover is metadata-only, the backlog drains itself in the background without anyone noticing, and retain keeps the table trim, all from a single SQL file on any Postgres that has `pg_cron`.
