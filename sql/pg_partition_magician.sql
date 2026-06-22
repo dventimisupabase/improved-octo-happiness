@@ -48,11 +48,23 @@ create table if not exists pgpm.config (
   -- optional block budget for the drain: cap each microbatch at ~this many heap+TOAST blocks
   -- (translated to a row limit via the default's average bytes/row), so wide rows can't make a
   -- single batch huge. null = cap by drain_batch rows only (default). See DESIGN.md section 8.
-  drain_max_blocks int
+  drain_max_blocks int,
+  -- adaptive closed-loop feathering (DESIGN.md section 8, mode 2). When on, maintenance senses
+  -- checkpoint pressure each tick and rides the per-tick drain budget just under supply via AIMD
+  -- (additive-increase when calm, halve on a forced checkpoint), instead of the fixed drain_batch.
+  -- off = mode 1 (today's fixed gentle rate). drain_budget is the controller's current row budget
+  -- (null until the first adaptive tick seeds it from drain_batch); drain_ckpt_seen is the last
+  -- forced-checkpoint counter it observed (null = uninitialized, so the first tick can't be congested).
+  drain_adaptive   boolean not null default false,
+  drain_budget     int,
+  drain_ckpt_seen  bigint
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists premake_retry_after timestamptz;
 alter table pgpm.config add column if not exists drain_max_blocks int;
+alter table pgpm.config add column if not exists drain_adaptive boolean not null default false;
+alter table pgpm.config add column if not exists drain_budget int;
+alter table pgpm.config add column if not exists drain_ckpt_seen bigint;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -764,12 +776,58 @@ $$;
 
 -- ============================== maintenance / observability ==============================
 
+-- ===================== adaptive closed-loop feathering (DESIGN.md sec 8, mode 2) =====================
+
+-- The congestion sensor: the cluster's forced/requested-checkpoint counter. A *requested* checkpoint
+-- means WAL hit max_wal_size (or an explicit CHECKPOINT) -- i.e. writes outran what the checkpointer
+-- absorbs, the exact symptom the bench saw over-driving the drain produce at 40M (FORCED_CHECKPOINT x12,
+-- the I/O storm behind the latency tail). *Timed* checkpoints (the checkpoint_timeout rhythm) are normal
+-- and deliberately NOT counted. The counter moved from pg_stat_bgwriter to pg_stat_checkpointer in PG 17.
+create or replace function pgpm._forced_checkpoints()
+returns bigint language plpgsql stable as $$
+declare v bigint;
+begin
+  if current_setting('server_version_num')::int >= 170000 then
+    select num_requested into v from pg_stat_checkpointer;
+  else
+    select checkpoints_req into v from pg_stat_bgwriter;
+  end if;
+  return coalesce(v, 0);
+end;
+$$;
+
+-- The controller: one AIMD step (the same additive-increase / multiplicative-decrease law TCP uses to
+-- ride just under a link's capacity). Calm => probe the budget up by a small increment; congested =>
+-- halve it. Clamped to [floor, ceiling] so it always makes forward progress and never over-probes.
+-- Pure arithmetic, no side effects -- unit-tested directly.
+create or replace function pgpm._aimd_next(
+  p_current int, p_congested boolean, p_floor int, p_ceiling int, p_increment int
+) returns int language sql immutable as $$
+  select greatest(p_floor, least(p_ceiling,
+    case when p_congested then floor(p_current / 2.0)::int
+         else p_current + p_increment end));
+$$;
+
+-- Operator switch for mode 2. Off (default) keeps today's fixed gentle rate (drain_batch); on lets the
+-- controller above ride the budget against checkpoint pressure. Resets the controller state so a toggle
+-- starts cleanly from drain_batch.
+create or replace function pgpm.set_drain_adaptive(p_parent regclass, p_enabled boolean default true)
+returns void language plpgsql as $$
+begin
+  update pgpm.config
+     set drain_adaptive = p_enabled, drain_budget = null, drain_ckpt_seen = null
+   where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+end;
+$$;
+
 create or replace function pgpm.maintenance(p_parent regclass)
 returns text language plpgsql as $$
 declare
   cfg pgpm.config;
   v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
   v_note text := '';
+  v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -817,6 +875,25 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'retention_skip', left(sqlerrm, 200));
   end;
 
+  -- Adaptive feathering (mode 2, DESIGN.md sec 8): ride the per-tick drain budget just under supply.
+  -- Sense whether a forced checkpoint fired since the last tick (over-driving the disk), take one AIMD
+  -- step on the budget, and drain that many rows this tick instead of the fixed drain_batch. The floor
+  -- and ceiling bracket drain_batch (the nominal operating point) at /8 and x8; the additive increment
+  -- is ~the floor, so it probes up gently and halves hard. Off => v_batch stays null => drain_step uses
+  -- the fixed drain_batch exactly as before. drain_max_blocks (if set) still caps wide rows on top of
+  -- whichever row target applies. Computed here; committed below only if the drain actually does work.
+  if cfg.drain_adaptive then
+    v_ckpt      := pgpm._forced_checkpoints();
+    v_congested := cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen;
+    v_budget    := pgpm._aimd_next(
+                     coalesce(cfg.drain_budget, cfg.drain_batch),       -- seed from the nominal rate
+                     v_congested,
+                     greatest(1, cfg.drain_batch / 8),                  -- floor: keep forward progress
+                     greatest(cfg.drain_batch, cfg.drain_batch * 8),    -- ceiling: bound the probe
+                     greatest(1, cfg.drain_batch / 8));                 -- additive increment (~floor)
+    v_batch := v_budget;
+  end if;
+
   -- The drain IS the conversion: give its (infrequent) partition attach room to win its lock,
   -- so progress isn't starved. Its scans run under SHARE UPDATE EXCLUSIVE (non-blocking to the
   -- workload); only the brief final ATTACH needs a stronger lock.
@@ -829,12 +906,23 @@ begin
     -- the drain on purpose: if it cannot drop a live FK, the drain_step below never runs (the whole
     -- block rolls back), so the drain never moves rows past a live FK -- it just defers and retries.
     v_suspended := pgpm.suspend_incoming_fks(p_parent);
-    v_drain := pgpm.drain_step(p_parent);
+    v_drain := pgpm.drain_step(p_parent, v_batch);
   exception when others then
     v_drain := 'deferred';
     v_note := v_note || ' drain_deferred';
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'drain_skip', left(sqlerrm, 200));
   end;
+
+  -- Commit the adaptive step ONLY when the drain did work (moved rows or attached). A fully-drained,
+  -- idle table must not churn config or log a budget row every tick (a standing steward ticks forever).
+  -- Leaving the ckpt baseline stale across an idle gap just makes the next active tick treat any
+  -- idle-period checkpoints as congestion and back off once -- the safe direction.
+  if cfg.drain_adaptive and (v_drain like 'moved:%' or v_drain like 'attached:%') then
+    update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt where parent_table = p_parent;
+    v_note := v_note || format(' adaptive[%s%s]', v_budget, case when v_congested then ' backoff' else '' end);
+    insert into pgpm.log (parent_table, action, rows, method)
+      values (p_parent, 'drain_budget', v_budget, case when v_congested then 'backoff' else 'probe' end);
+  end if;
 
   -- Once the closed tail is drained, re-add any incoming FKs that adopt(..., 'preserve') dropped, now
   -- against the new parent. restore_incoming_fks self-gates on quiescence (no closed rows, no in-flight

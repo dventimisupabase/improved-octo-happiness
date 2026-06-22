@@ -137,9 +137,10 @@ at different points on the same dial.
 1. **Unnoticeable / online (today's default).** Supply is the leftover headroom. Demand is feathered
    under it, currently at a fixed gentle rate. Completion is best-effort and possibly never, which
    is safe because of `DEFAULT`. This is pgpm's intended posture.
-2. **Adaptive / online (a direction, not built).** Same invariant, but the feather rate becomes
-   closed-loop: sense the leftover supply and ride just under it. Faster when there's slack, still
-   invisible when there isn't. Removes the arbitrariness of the fixed constant.
+2. **Adaptive / online (IMPLEMENTED).** Same invariant, but the feather rate becomes closed-loop:
+   sense the leftover supply and ride just under it. Faster when there's slack, still invisible when
+   there isn't. Removes the arbitrariness of the fixed constant. Shipped as the `drain_adaptive` mode
+   (off by default); see section 8 for the controller.
 3. **Maintenance window / offline (a direction, not built).** The operator clears the field (stops
    serving traffic), so supply jumps to roughly the *full system budget*, and pgpm spends it
    aggressively to converge inside a bounded window. This trades the invariant for speed and a
@@ -196,10 +197,30 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   becomes opinionated and predictable: bring a time-ordered key that *is* your primary key and it
   partitions flawlessly, always online, always cheap. Less ambitious, more reliable, the right trade
   for a background steward.
-- **Adaptive closed-loop feathering (mode 2).** Sense leftover supply (wait events, checkpoint
-  pressure, recent latency of the ambient workload, replication lag) and adjust the drain rate to
-  ride just under it. The bench already shows the symptoms to watch for: forced checkpoints, temp
-  spills, sequential-scan storms are what over-driving looks like.
+- **Adaptive closed-loop feathering (mode 2) (IMPLEMENTED).** The drain rate is no longer a fixed
+  constant: when `drain_adaptive` is on, each `pgpm.maintenance` tick senses checkpoint pressure and
+  rides the per-tick row budget just under supply, instead of always draining `drain_batch` rows.
+
+  *The signal.* A *forced* (requested) checkpoint, the cluster counter that the at-scale bench pinned
+  as the cause of the R3 latency tail (a 40M drain at a fixed aggressive cadence triggered ~12 forced
+  checkpoints, and the I/O storm behind each one was the tail). It means WAL outran what the
+  checkpointer absorbs, i.e. the drain is over-driving the disk. *Timed* checkpoints (the
+  `checkpoint_timeout` rhythm) are normal and deliberately ignored. The counter moved from
+  `pg_stat_bgwriter.checkpoints_req` to `pg_stat_checkpointer.num_requested` in PG 17, so the sensor
+  (`pgpm._forced_checkpoints()`) is version-aware. Of the candidate signals (wait events, recent
+  ambient latency, replication lag), forced checkpoints are the cleanest root-cause proxy and need no
+  sampling; the others are natural future refinements.
+
+  *The controller.* AIMD, the additive-increase / multiplicative-decrease law TCP uses to ride just
+  under a link's capacity: a calm tick probes the budget up by a small increment, a tick that saw a
+  forced checkpoint halves it. It is a pure function (`pgpm._aimd_next`), unit-tested directly. The
+  floor and ceiling bracket `drain_batch` at /8 and x8, so `drain_batch` stays the one operating-point
+  knob and the controller just explores around it; the floor guarantees forward progress, the ceiling
+  bounds the probe. It composes with `drain_max_blocks` (the controller sets the row target; the block
+  budget still caps wide rows on top). The controller state advances only on a tick that did work, so
+  a fully-drained idle table (the standing-steward state) never churns config or bloats the log. Tests
+  in `tests/26`; cross-version PG 15 to 18. Left off by default: it is mode 2, a deliberate posture,
+  not a silent change to every existing managed table.
 - **Block-budgeted batching.** Today the drain batches by row count (`drain_batch`), which is unsafe
   when TOAST width varies: 20 000 narrow rows is nothing, but 20 000 rows each carrying a 2 MB
   document is tens of gigabytes rewritten in one microbatch, a spike that breaks the unnoticeable
