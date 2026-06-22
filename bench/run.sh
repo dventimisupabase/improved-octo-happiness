@@ -389,6 +389,7 @@ echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- p
 echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
 drain_started=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
+warned_stall_settle=0; last_closed_check=0
 while :; do
   sleep "$BENCH_OBSERVE_INTERVAL"
   # ONE round-trip per poll (fewer fresh connections over the NAT'd path = less churn/risk):
@@ -423,7 +424,22 @@ while :; do
   else
     printf '\r  observing: %ss, default~%s rows, %s partitions, %s drain ops, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$moves" "$age"
     if [ "$drain_started" = 1 ] && [ "$age" != '-1' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
-      echo; echo "  pgpm drain settled -- $moves drain ops, none for ${age}s (default drained to the open interval)"; break
+      # Idle for IDLE_SECS. In run-to-completion (settle) mode, "settled" must mean the closed tail is
+      # actually EMPTY -- not merely that the drain log went quiet. An I/O stall (a forced-checkpoint
+      # storm on a burst-limited disk) also looks idle, and breaking on it falsely reports completion
+      # with millions of rows still in the DEFAULT. Distinguish the two with a closed-rows check, run at
+      # most once per idle window (the count scan is not free at scale): closed==0 => truly done;
+      # closed>0 => a stall, so keep observing until the drain resumes or we hit the cap.
+      if [ "$last_closed_check" = 0 ] || awk -v n="$now_s" -v l="$last_closed_check" -v w="$BENCH_DRAIN_IDLE_SECS" 'BEGIN{exit !(n-l >= w)}'; then
+        last_closed_check="$now_s"
+        closed=$(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)" 2>/dev/null || echo -1)
+        if [ "$closed" = 0 ]; then
+          echo; echo "  pgpm drain settled -- $moves drain ops, closed tail empty (0 rows below the frontier)"; break
+        elif [ "$warned_stall_settle" = 0 ]; then
+          warned_stall_settle=1
+          echo; echo "  NOTE: drain idle ${age}s but ${closed} closed rows remain -- I/O stall, not completion; observing to the cap"
+        fi
+      fi
     fi
   fi
 
