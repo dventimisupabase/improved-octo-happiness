@@ -63,7 +63,7 @@ create table if not exists pgpm.config (
   drain_ckpt_seen      bigint,
   drain_wal_lsn        pg_lsn,
   drain_wal_at         timestamptz,
-  drain_wal_high_water numeric not null default 0.7
+  drain_wal_high_water numeric not null default 1.0
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists premake_retry_after timestamptz;
@@ -73,7 +73,7 @@ alter table pgpm.config add column if not exists drain_budget int;
 alter table pgpm.config add column if not exists drain_ckpt_seen bigint;
 alter table pgpm.config add column if not exists drain_wal_lsn pg_lsn;
 alter table pgpm.config add column if not exists drain_wal_at timestamptz;
-alter table pgpm.config add column if not exists drain_wal_high_water numeric not null default 0.7;
+alter table pgpm.config add column if not exists drain_wal_high_water numeric not null default 1.0;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).

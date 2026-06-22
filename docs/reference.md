@@ -192,7 +192,7 @@ pgpm.set_drain_adaptive(p_parent regclass, p_enabled boolean default true) retur
 Turns adaptive feathering (DESIGN.md section 8, mode 2) on or off for one table. When on, each
 `maintenance` tick measures the WAL generation rate and compares it to the rate the checkpointer can
 sustain (`max_wal_size / checkpoint_timeout`). If the drain is outrunning a fraction of that
-(`drain_wal_high_water`, default 0.7) a forced checkpoint and its I/O storm are imminent, so it backs
+(`drain_wal_high_water`, default 1.0 = the sustainable rate itself) a forced checkpoint and its I/O storm are imminent, so it backs
 off *before* the storm (the leading signal); a forced checkpoint that slips through anyway is a reactive
 backstop. The budget moves by AIMD (recover up a small step when calm, halve when congested). The
 ceiling is `drain_batch` itself (a bigger batch means a bigger WAL spike, so the budget never exceeds
@@ -319,7 +319,7 @@ One row per managed table; the source of truth for its policy. Editable (e.g.
 | `drain_max_blocks` | `int` | Optional block budget per drain batch; null = cap by `drain_batch` rows only. |
 | `drain_adaptive` | `boolean` | Adaptive feathering (mode 2) on/off. Set via `set_drain_adaptive`; default off. |
 | `drain_budget` | `int` | Controller state: current adaptive rows/tick budget; null until the first adaptive tick. |
-| `drain_wal_high_water` | `numeric` | Back off when the WAL rate exceeds this fraction of the sustainable rate (`max_wal_size`/`checkpoint_timeout`); default 0.7. |
+| `drain_wal_high_water` | `numeric` | Back off when the WAL rate exceeds this fraction of the sustainable rate (`max_wal_size`/`checkpoint_timeout`); default 1.0. Lower (e.g. 0.7) is gentler on the workload but drains slower. |
 | `drain_wal_lsn` | `pg_lsn` | Controller state: previous tick's WAL position (to compute the WAL rate). |
 | `drain_wal_at` | `timestamptz` | Controller state: previous tick's timestamp (to compute the WAL rate). |
 | `drain_ckpt_seen` | `bigint` | Controller state: last forced-checkpoint counter (reactive backstop); null = uninitialized. |
