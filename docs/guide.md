@@ -364,14 +364,33 @@ select count(*) from public.events_snapshot;  -- the parent UNION every in-fligh
 child, so it sees the moved rows too. It is read-only and point-in-time (re-call it to refresh against
 the current in-flight child).
 
-**Writes: there is no fix, and you should know that.** An `INSERT` / `UPDATE` / `DELETE` issued through
-the parent that targets a row already moved into the unattached child finds **no row** and is a silent
-no-op (it reports `0 rows affected`) until the interval attaches. `snapshot()` cannot help: it is
-read-only, and you cannot write through it. There is no way around this on the online drain path; it is
-the write-side face of the same gap. For the workloads pgpm targets it is a non-issue, because the
-drained rows are the old, closed tail, which is typically immutable. If your workload does mutate old
-rows, drive that interval to completion with `drain_all()` (one transaction, no gap) before issuing
-such writes, or `pause` the table while you do.
+**Writes: there is no fix, and you should know that.** The write side of the gap is narrow but real,
+and it helps to be exact about what is and isn't affected. A fresh `INSERT` is never affected: a new
+row (even a back-dated one whose key lands in the draining range) routes to the `DEFAULT`, and the next
+drain batch sweeps it up. What bites is an `UPDATE` or `DELETE` through the parent that targets a row
+*already moved* into the unattached child: it finds **no row** and is a silent no-op (reports `0 rows
+affected`) until the interval attaches. `snapshot()` cannot help here; it is read-only, and you cannot
+write through it. One sharper edge: an `INSERT ... ON CONFLICT (pk)` (upsert) that targets an
+already-moved row won't find it in the parent, takes the INSERT path, and writes a *duplicate* key into
+the `DEFAULT`; the next drain batch then tries to move that key into the child, which already holds it,
+and the drain **stalls on a duplicate-key error**. So on a table that upserts into historical ranges
+the gap is not merely a no-op, it can wedge the drain.
+
+**Does this affect you?** The deciding question is not "is the data old" but **"is the closed tail
+effectively immutable."** You are in the clear when:
+
+- the table is append-only (logs, events, metrics, audit, clickstream), the canonical reason to reach
+  for time-range partitioning, so old rows simply never get `UPDATE`/`DELETE`/upsert; and/or
+- retention is `DROP`-based, which is what pgpm does (`retain` drops whole partitions), so the usual
+  "delete old rows" DML never happens. `retain` drops the *oldest attached* partitions while the drain
+  works the *newest-closed* interval through an unattached child, so the two never even collide.
+
+Even then the footprint is small: at most one interval is exposed at a time, only during its drain, and
+only for mutations of already-moved rows. You should think twice only if your workload mutates
+historical rows after their interval has closed (a status flip on an old `orders` row, a
+slowly-changing dimension) or upserts into historical ranges. In that case, drive the interval to
+completion with `drain_all()` (one transaction, no gap) before issuing those writes, or `pause` the
+table while you do.
 
 ## WAL and checkpoint sizing
 

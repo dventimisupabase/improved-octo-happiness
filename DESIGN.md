@@ -386,7 +386,12 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   means that during a multi-batch drain the already-moved rows of the draining interval are durable
   but not reachable through the parent. A plain `SELECT` against the parent mid-drain *undercounts*
   that interval, and a write through the parent that targets an already-moved row is a silent no-op
-  (`0 rows`) until the interval attaches. This is inherent: Postgres exposes no way to make an
+  (`0 rows`) until the interval attaches. A fresh `INSERT` is unaffected (it routes to the DEFAULT and
+  the next batch sweeps it up), but an upsert (`INSERT ... ON CONFLICT`) against an already-moved row
+  misses it, writes a duplicate key into the DEFAULT, and the next batch then stalls the drain on a
+  duplicate-key error, so the gap can wedge the drain on tables that upsert into historical ranges, not
+  merely no-op. The deciding question for an operator is whether the closed tail is effectively
+  immutable (append-only, or `DROP`-based retention), not whether the data is old. This is inherent: Postgres exposes no way to make an
   unattached relation visible through a partitioned parent, and forbids attaching `[lo,hi)` while the
   DEFAULT holds rows in that range. Both rejected fixes were worse: a copy-then-swap (leave rows in
   the DEFAULT, fill the child, then atomic delete+attach) closes the read gap but risks *silent* lost
