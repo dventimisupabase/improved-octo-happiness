@@ -376,21 +376,29 @@ the `DEFAULT`; the next drain batch then tries to move that key into the child, 
 and the drain **stalls on a duplicate-key error**. So on a table that upserts into historical ranges
 the gap is not merely a no-op, it can wedge the drain.
 
-**Does this affect you?** The deciding question is not "is the data old" but **"is the closed tail
-effectively immutable."** You are in the clear when:
+**Does this affect you?** The deciding question is not "is the data old," and not even strictly "is the
+closed tail immutable," but **"does a row settle before its interval closes?"** Three common shapes
+clear that bar:
 
-- the table is append-only (logs, events, metrics, audit, clickstream), the canonical reason to reach
-  for time-range partitioning, so old rows simply never get `UPDATE`/`DELETE`/upsert; and/or
-- retention is `DROP`-based, which is what pgpm does (`retain` drops whole partitions), so the usual
-  "delete old rows" DML never happens. `retain` drops the *oldest attached* partitions while the drain
-  works the *newest-closed* interval through an unattached child, so the two never even collide.
+- **Append-only facts** (logs, events, metrics, audit, clickstream), the canonical reason to reach for
+  time-range partitioning. Old rows are never mutated, so the gap is unreachable.
+- **Mutable but time-local entity tables** (`orders`, tickets, subscriptions) whose rows churn near
+  creation and then freeze. That churn happens while the interval is still *open*, where the rows live
+  in the fully-writable `DEFAULT` with no gap; by the time the interval closes and drains, they are
+  frozen. The lever is the **partition interval**: size it coarser than your mutation-settling window
+  (monthly partitions for orders that settle within days) and the churn lands entirely in the open
+  interval. A daily partition on that same table would let more mutation happen after close.
+- **`DROP`-based retention**, which is what pgpm does (`retain` drops whole partitions), so the one
+  routine write to old rows never happens as DML. `retain` drops the *oldest attached* partitions while
+  the drain works the *newest-closed* interval through an unattached child, so the two never collide.
 
-Even then the footprint is small: at most one interval is exposed at a time, only during its drain, and
-only for mutations of already-moved rows. You should think twice only if your workload mutates
-historical rows after their interval has closed (a status flip on an old `orders` row, a
-slowly-changing dimension) or upserts into historical ranges. In that case, drive the interval to
-completion with `drain_all()` (one transaction, no gap) before issuing those writes, or `pause` the
-table while you do.
+Even when a mutation does land in the danger window the footprint is small: at most one interval is
+exposed at a time, only during its drain, and only for writes to already-moved rows. The genuine
+exposure is tables that mutate **arbitrarily old** rows, a ledger with backdated adjustments, a
+document store editing years-old rows, anything that upserts into historical ranges. No partition
+interval is coarse enough to localize that. For those, drive the interval to completion with
+`drain_all()` (one transaction, no gap) before the writes, `pause` the table while you do, or partition
+on a different axis.
 
 ## WAL and checkpoint sizing
 

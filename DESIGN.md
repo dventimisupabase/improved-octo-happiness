@@ -390,8 +390,12 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   the next batch sweeps it up), but an upsert (`INSERT ... ON CONFLICT`) against an already-moved row
   misses it, writes a duplicate key into the DEFAULT, and the next batch then stalls the drain on a
   duplicate-key error, so the gap can wedge the drain on tables that upsert into historical ranges, not
-  merely no-op. The deciding question for an operator is whether the closed tail is effectively
-  immutable (append-only, or `DROP`-based retention), not whether the data is old. This is inherent: Postgres exposes no way to make an
+  merely no-op. The deciding question for an operator is not whether the data is old but whether a row
+  *settles before its interval closes*: append-only facts and `DROP`-based retention are immune, and so
+  are mutable-but-time-local entity tables (orders, tickets) as long as the partition interval is
+  coarser than the mutation-settling window (the churn then lands while the interval is open, in the
+  fully-writable DEFAULT). Only tables that mutate *arbitrarily old* rows (backdated ledgers, historical
+  upserts) are genuinely exposed; for those, `drain_all`/`pause` or a different partition axis. This is inherent: Postgres exposes no way to make an
   unattached relation visible through a partitioned parent, and forbids attaching `[lo,hi)` while the
   DEFAULT holds rows in that range. Both rejected fixes were worse: a copy-then-swap (leave rows in
   the DEFAULT, fill the child, then atomic delete+attach) closes the read gap but risks *silent* lost
