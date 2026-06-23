@@ -5,7 +5,7 @@
 # attains + drains the default autonomously, inside the database. So this harness only
 # (1) generates the bulk data SERVER-SIDE, (2) drives an ambient OLTP workload that has
 # nothing to do with pgpm, (3) triggers the conversion once (transmute + schedule
-# pgpm.maintenance) and marks the phase boundaries, and (4) writes a report. It never
+# pgpm.maintain) and marks the phase boundaries, and (4) writes a report. It never
 # drives drain_step/attain itself; the conversion runs server-side.
 #
 # The SYSTEM metrics (WAL, checkpoints, pg_stat_io, wait/lock events, table sizes) are
@@ -46,7 +46,7 @@ BENCH_MAX_FAIL_PCT="${BENCH_MAX_FAIL_PCT:-5}"  # abort if baseline workload exce
 
 BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step (configured on transmute; pgpm uses it)
 BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-3600}"  # safety cap on the observation window
-BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-5 seconds}"  # pg_cron schedule for pgpm.maintenance (pgpm self-drives the drain)
+BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-5 seconds}"  # pg_cron schedule for pgpm.maintain (pgpm self-drives the drain)
 BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-15}"     # how often (s) the harness samples while pgpm drains
 BENCH_DRAIN_IDLE_SECS="${BENCH_DRAIN_IDLE_SECS:-120}"      # drain is "settled" after this long with no pgpm drain activity
 
@@ -342,7 +342,7 @@ assert_workload_healthy baseline   # bail now if the workload is timing out, bef
 
 # ---- 4. conversion: trigger pgpm ONCE, then OBSERVE it self-drive -----------
 # The benchmark does NOT perform the partitioning. It sets pgpm up the way an operator
-# does -- fire transmute() once (unpaused) and schedule pgpm.maintenance on pg_cron -- and then
+# does -- fire transmute() once (unpaused) and schedule pgpm.maintain on pg_cron -- and then
 # pgpm's OWN cron jobs attain + drain the default autonomously, inside the database. The
 # harness only runs the ambient workload and OBSERVES (samples + watches pgpm.log) until the
 # drain settles. Nothing here calls drain_step or attain; a dropped observer connection
@@ -396,11 +396,11 @@ else
   echo "  adaptive feathering off (mode 1: fixed drain_batch=$BENCH_DRAIN_BATCH)"
 fi
 
-# 4c. schedule pgpm.maintenance on pg_cron -- THIS is how pgpm self-drives attain + drain
+# 4c. schedule pgpm.maintain on pg_cron -- THIS is how pgpm self-drives attain + drain
 #     (standard pgpm operation; the operator schedules it once; pg_cron skips overlapping runs)
 q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
-q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintenance_all()')" >/dev/null
-echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now draining itself"
+q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintain_all()')" >/dev/null
+echo "  scheduled pgpm.maintain on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now draining itself"
 
 # 4d. OBSERVE. settle mode -> watch pgpm.log until the drain STARTS (>=1 op) and then goes quiet
 #     for BENCH_DRAIN_IDLE_SECS (closed tail fully drained). window mode -> warm up until the
@@ -493,7 +493,7 @@ while :; do
   # Stall detector (both modes): maintenance was scheduled but no drain op has landed.
   if [ "$drain_started" = 0 ] && [ "$warned_stall" = 0 ] && [ "$elapsed" -ge 60 ]; then
     warned_stall=1
-    echo; echo "  WARNING: no drain activity after ${elapsed}s -- pgpm.maintenance may be failing. Recent cron runs:"
+    echo; echo "  WARNING: no drain activity after ${elapsed}s -- pgpm.maintain may be failing. Recent cron runs:"
     q "select start_time::time(0)||' '||status||' '||left(coalesce(return_message,''),80)
          from cron.job_run_details where jobid in (select jobid from cron.job where jobname='pgpm_maint_bench')
          order by start_time desc limit 3" 2>/dev/null | sed 's/^/    /' || true

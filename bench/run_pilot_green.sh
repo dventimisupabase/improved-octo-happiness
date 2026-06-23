@@ -30,7 +30,7 @@ export BENCH_PHASE_SECS=45        # baseline / post (short -- enough for stable 
 # ---- conversion (pgpm self-drives; harness only observes) ----
 # (no PK pre-build: transmute never rewrites the PK, so the cutover is always metadata-only)
 export BENCH_DRAIN_BATCH=100000   # rows per drain_step (~15 batches for the tail)
-export BENCH_MAINT_INTERVAL='2 seconds'   # pg_cron tick for pgpm.maintenance
+export BENCH_MAINT_INTERVAL='2 seconds'   # pg_cron tick for pgpm.maintain
 export BENCH_OBSERVE_INTERVAL=10
 export BENCH_DRAIN_IDLE_SECS=45   # "settled" after 45s with no drain activity (and >=1 drain op)
 export BENCH_DRAIN_MAX_SECS=600   # 10-min safety cap (tail is ~1.5M rows)

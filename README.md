@@ -24,7 +24,7 @@ of native `RANGE`-partitioned tables:
   Optionally adaptive (`pgpm.set_drain_adaptive`): the pace self-tunes against checkpoint pressure to
   stay unnoticeable.
 - **retain**: drop partitions older than a policy.
-- **maintenance**: the single procedure `pg_cron` calls (attain, drain, retain).
+- **maintain**: the single procedure `pg_cron` calls (attain, drain, retain).
 
 **Incoming foreign keys** are handled, not ignored. `transmute` never rewrites the primary key, so the
 referenced unique key always survives partitioning: with `p_incoming_fks => 'preserve'` it records
@@ -68,7 +68,7 @@ select pgpm.transmute(
 );
 
 -- 2. Schedule the one entry point (pg_cron). It stays idle while the table is paused:
-select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
+select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
 
 -- 3. Inspect, then go live. Maintenance only starts attaining and draining once you resume:
 select * from pgpm.status();

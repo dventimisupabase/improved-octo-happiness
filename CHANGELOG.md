@@ -18,7 +18,7 @@
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in
   `pgpm.dropped_fk`, and re-adds it verbatim against the new parent (`NOT VALID` + `VALIDATE`) once the
-  drain is idle. `maintenance` manages the lifecycle: a managed FK is live only while the closed tail is
+  drain is idle. `maintain` manages the lifecycle: a managed FK is live only while the closed tail is
   empty, so it suspends (re-drops) a live FK before a drain that would move referenced rows and restores
   it after, and a later attain-miss drain neither stalls (`NO ACTION`) nor silently deletes/nulls the
   referencing rows (`CASCADE` / `SET NULL`). Referential actions, `DEFERRABLE`-ness, and self-referential
@@ -29,14 +29,14 @@
   transmute's `ACCESS EXCLUSIVE` transaction that scan blocked all access for its duration
   (~minutes per premade partition at scale). `transmute` now does the metadata-only cutover
   only (a fresh parent with just the DEFAULT attached scans nothing), so it stays online
-  even on a 100GB+ table. Run `pgpm.attain()` / `pgpm.maintenance()` afterward to build
+  even on a 100GB+ table. Run `pgpm.attain()` / `pgpm.maintain()` afterward to build
   the future partitions online (their `VALIDATE` scans run under a non-blocking lock).
   Until then, writes route to the DEFAULT (correct, just not yet split into future cells).
-- `maintenance` no longer lets an attain/retain failure abort the drain. Attaining a
+- `maintain` no longer lets an attain/retain failure abort the drain. Attaining a
   future partition needs `ACCESS EXCLUSIVE` on the parent plus a scan of the DEFAULT, which
   contends with concurrent inserts into the default's open cell; under sustained write load
   the two sides could deadlock, and because attain ran first in the same transaction the
-  deadlock aborted the whole maintenance run, so the drain never made progress. `maintenance`
+  deadlock aborted the whole maintenance run, so the drain never made progress. `maintain`
   now caps lock waits (`lock_timeout`, turning a would-be deadlock into a fast retryable miss)
   and isolates attain, retain, and the drain in separate subtransactions: a step that
   loses the lock race is deferred (logged as `*_skip`, retried next tick) without aborting the

@@ -150,7 +150,7 @@ at different points on the same dial.
 
 The fixed gentle rate we ship today is just one arbitrary point on this dial. The throttle
 primitives that move along it already exist: `drain_batch` (set at `transmute`) and the
-`pgpm.maintenance` cron cadence. "Gentle" versus "aggressive" is nothing more than those two knobs.
+`pgpm.maintain` cron cadence. "Gentle" versus "aggressive" is nothing more than those two knobs.
 
 ## 8. Future directions (raw material, not commitments)
 
@@ -198,7 +198,7 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   partitions flawlessly, always online, always cheap. Less ambitious, more reliable, the right trade
   for a background steward.
 - **Adaptive closed-loop feathering (mode 2) (IMPLEMENTED).** The drain rate is no longer a fixed
-  constant: when `drain_adaptive` is on, each `pgpm.maintenance` tick senses checkpoint pressure and
+  constant: when `drain_adaptive` is on, each `pgpm.maintain` tick senses checkpoint pressure and
   rides the per-tick row budget just under supply, instead of always draining `drain_batch` rows.
 
   *The signal (leading).* The **WAL generation rate** versus the rate the checkpointer can sustain. A
@@ -345,7 +345,7 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   paced, online drain is **drop-at-transmute, re-add-at-completion**: record the incoming single-column
   FKs (as `'drop'` does), run the drain, then re-create each FK against the new parent with
   `NOT VALID` + `VALIDATE` once its referenced ranges are attached, leaving the referencing table
-  untouched. Restoration is driven either by `maintenance` noticing the closed tail has fully drained,
+  untouched. Restoration is driven either by `maintain` noticing the closed tail has fully drained,
   or by an explicit `restore_incoming_fks(parent)` the operator runs after `drain_all`. Gating is
   exact: this path applies only when the FK's referenced columns equal the parent's surviving unique
   key; anything else (a different referenced column, a multi-column referenced key, the widening
@@ -367,14 +367,14 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   drain never completes (the FK stays dropped and recorded, surfaced by `status`). **Implemented**:
   `p_incoming_fks => 'preserve'` records and drops eligible incoming FKs at transmute (and refuses the
   widening case), and `pgpm.restore_incoming_fks(parent)` re-adds them against the new parent once the
-  drain is quiescent; `maintenance` calls it automatically. Tests in `tests/19`-`tests/23`,
+  drain is quiescent; `maintain` calls it automatically. Tests in `tests/19`-`tests/23`,
   cross-version PG 15 to 18. Covered on the id/uuidv7 happy path: single and multiple incoming FKs,
   their referential actions (`CASCADE` / `SET NULL` / `RESTRICT`) and `DEFERRABLE`-ness (both ride
   along in the recorded definition), and self-referential FKs (verified: a single-column FK to a
   partitioned-by-id table is legal and enforced). The self-referential re-add is validating, not
   online, because the referencing side is then the partitioned parent and Postgres rejects a
   `NOT VALID` FK there; acceptable as a one-time step. The lifecycle is managed: a preserve-managed FK
-  is **live if and only if the closed tail is empty**. `maintenance` suspends (re-drops) a live managed
+  is **live if and only if the closed tail is empty**. `maintain` suspends (re-drops) a live managed
   FK before any drain that would move referenced rows and restores it once the tail is drained, so a
   later attain-miss drain neither stalls (`NO ACTION`) nor silently mutates the referencing side
   (`CASCADE` / `SET NULL`, verified on PG 17). `suspend_incoming_fks` shares the drain's subtransaction:
