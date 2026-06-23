@@ -23,7 +23,7 @@ select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   true, 'transmute registers the table paused by default');
 select is(
-  pgpm.maintenance('public.pr'),
+  pgpm.maintain('public.pr'),
   'paused', 'maintenance is a no-op while paused');
 
 -- resume: scheduled maintenance acts.
@@ -34,7 +34,7 @@ select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   false, 'resume clears the paused flag');
 select isnt(
-  pgpm.maintenance('public.pr'),
+  pgpm.maintain('public.pr'),
   'paused', 'maintenance acts once resumed');
 
 -- pause: back to a no-op.
@@ -45,7 +45,7 @@ select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   true, 'pause sets the paused flag');
 select is(
-  pgpm.maintenance('public.pr'),
+  pgpm.maintain('public.pr'),
   'paused', 'maintenance is a no-op again while paused');
 
 -- a table pgpm does not manage cannot be paused/resumed.

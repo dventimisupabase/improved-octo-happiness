@@ -1,4 +1,4 @@
--- Incoming-FK preservation, scheduled path: maintenance() restores the preserved FK on its own once
+-- Incoming-FK preservation, scheduled path: maintain() restores the preserved FK on its own once
 -- the closed tail has drained. restore_incoming_fks self-gates on quiescence, so it is a no-op while
 -- closed rows remain and fires only when the drain is idle. See DESIGN.md section 8.
 create extension if not exists pgtap;
@@ -30,7 +30,7 @@ select is(
   0, 'restore is a no-op while closed rows remain in the DEFAULT');
 
 -- drive the scheduled path: a handful of maintenance ticks drain the closed tail and then auto-restore
-do $$ begin for i in 1..12 loop perform pgpm.maintenance('public.m'); end loop; end $$;
+do $$ begin for i in 1..12 loop perform pgpm.maintain('public.m'); end loop; end $$;
 
 select is(
   (select closed_rows from pgpm.check_default('public.m')),

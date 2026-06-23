@@ -24,7 +24,7 @@ pgpm partitions on a *monotonic* key: a timestamp, an integer/bigint id (includi
 
 ### Then pg_cron drives the lifecycle
 
-You schedule one procedure, `pgpm.maintenance_all()`, on `pg_cron`. Each tick it does three things:
+You schedule one procedure, `pgpm.maintain_all()`, on `pg_cron`. Each tick it does three things:
 
 - **attain**: keep N real partitions ahead of the write frontier, so live inserts always land in a real partition and never pile up in the `DEFAULT`.
 - **drain**: move the `DEFAULT`'s closed tail (the rows that now belong in a real partition) into that partition, in small paced batches.
@@ -76,7 +76,7 @@ select pgpm.transmute(
 );
 
 -- 2. Schedule the one entry point (pg_cron). It stays idle while the table is paused:
-select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
+select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
 
 -- 3. Inspect, then go live. Maintenance only starts attaining and draining once you resume:
 select * from pgpm.status();

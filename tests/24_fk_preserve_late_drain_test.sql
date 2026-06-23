@@ -35,7 +35,7 @@ select cmp_ok(
   'a referenced row sits in the closed tail of the DEFAULT (attain miss)');
 
 -- maintenance must suspend the FK before draining, drain the tail, then re-restore
-do $$ begin for i in 1..8 loop perform pgpm.maintenance('public.m'); end loop; end $$;
+do $$ begin for i in 1..8 loop perform pgpm.maintain('public.m'); end loop; end $$;
 
 select is(
   (select count(*)::int from public.refx where m_id = 150),

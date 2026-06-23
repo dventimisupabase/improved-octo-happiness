@@ -46,7 +46,7 @@ ambient workload, and *observes*. Three phases:
 
 1. **baseline**: ambient workload against the *unpartitioned* table.
 2. **convert**: fire `pgpm.transmute()` once (`p_paused => false`) and schedule
-   `pgpm.maintenance` on pg_cron, then **pgpm** attains and drains the default on its
+   `pgpm.maintain` on pg_cron, then **pgpm** attains and drains the default on its
    own while the harness drives the workload and watches `pgpm.log` until the drain settles.
    The harness never calls `drain_step`; because the conversion runs server-side, a
    dropped harness connection can't stop it.
@@ -103,7 +103,7 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_PHASE_SECS` | `120` | baseline/post observation duration |
 | `BENCH_MAX_FAIL_PCT` | `5` | abort right after baseline if more than this % of transactions failed (catches a mis-calibrated `BENCH_OPS` in minutes instead of hours) |
 | `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step`, set on `transmute`; **pgpm** uses it when *it* drains |
-| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintenance`, how often pgpm drives attain + drain |
+| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintain`, how often pgpm drives attain + drain |
 | `BENCH_OBSERVE_INTERVAL` | `15` | how often (s) the harness samples while pgpm drains |
 | `BENCH_DRAIN_IDLE_SECS` | `120` | drain is "settled" after this long with no pgpm drain activity in `pgpm.log` |
 | `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the observation window |

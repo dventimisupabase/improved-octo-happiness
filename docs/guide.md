@@ -51,7 +51,7 @@ any row that does not match a real partition still has a home (no lost writes, e
 attain keeps the current and future intervals covered, so the DEFAULT holds only the open interval
 and otherwise stays empty. `check_default()` tells you if anything is stuck there.
 
-**The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintenance_all()`, drives
+**The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives
 three jobs per table:
 
 - **attain**: create up to N partitions ahead of the frontier, so live writes always land in a real
@@ -146,7 +146,7 @@ Schedule the single entry point with `pg_cron`. It stays idle while the table is
 with [`status()`](#monitor) first, then `resume` to go live:
 
 ```sql
-select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
+select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
 select * from pgpm.status();              -- looks right?
 select pgpm.resume('public.events');      -- go live
 ```
@@ -262,7 +262,7 @@ dropped for the duration and re-added against the new parent once the drain is d
   idle.
 
 With `'preserve'`, once the closed tail has fully drained, `pgpm.restore_incoming_fks(parent)` re-adds
-each FK against the new parent (`NOT VALID` + `VALIDATE`). `maintenance` calls `restore_incoming_fks`
+each FK against the new parent (`NOT VALID` + `VALIDATE`). `maintain` calls `restore_incoming_fks`
 automatically, so on the scheduled path you do nothing; on the synchronous path, call it yourself
 after `drain_all`:
 
@@ -276,9 +276,9 @@ select pgpm.restore_incoming_fks('public.events');   -- maintenance does this fo
 in-flight child partition), so it is safe to call early or repeatedly. An incoming FK that references
 a non-PK key that cannot survive partitioning is refused by `'preserve'` with guidance.
 
-After it is restored, `maintenance` keeps a managed FK on a leash: a preserve-managed FK is live only
+After it is restored, `maintain` keeps a managed FK on a leash: a preserve-managed FK is live only
 while the closed tail is empty. If a later drain appears (for example attain falls behind and rows
-land in the DEFAULT for an interval that then closes), `maintenance` suspends the FK before draining
+land in the DEFAULT for an interval that then closes), `maintain` suspends the FK before draining
 (`pgpm.suspend_incoming_fks` keeps them safe across that drain) and restores it afterward, so the
 catch-up drain neither stalls nor (for a `CASCADE` / `SET NULL` FK) silently deletes or nulls the
 referencing rows. Referential actions, `DEFERRABLE`-ness, and self-referential FKs are all preserved
@@ -363,7 +363,7 @@ What to do:
 ## Operations and troubleshooting
 
 - **Pause / resume.** `select pgpm.pause('public.events');` / `select pgpm.resume('public.events');`.
-  A paused table is registered but untouched by `maintenance` (you can still drive `drain_*`
+  A paused table is registered but untouched by `maintain` (you can still drive `drain_*`
   manually).
 - **The closed tail is growing.** `check_default()` shows `closed_rows > 0`: the table is unpaused
   but the drain is not keeping up. Raise `drain_batch`, run the cron more often, or run

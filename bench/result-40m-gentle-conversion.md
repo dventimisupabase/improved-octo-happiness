@@ -19,7 +19,7 @@ PostgreSQL 17.6, staging "green"). Same engine and same 40M-row workload as the
 - **39.9 M rows**, ~2 months of history → ~12 GB heap+indexes unpartitioned. Generated server-side
   by 8 parallel sessions, then **`VACUUM (FREEZE, ANALYZE)`** so the post-bulk-load freeze WAL
   settles *before* measurement (`BENCH_PREFREEZE=1`; see "I/O attribution").
-- Conversion: `build_pk_concurrently` (online PK) → `transmute()` → `pgpm.maintenance` on pg_cron
+- Conversion: `build_pk_concurrently` (online PK) → `transmute()` → `pgpm.maintain` on pg_cron
   **every 20 s**, **drain batch 20 000**. pgpm self-drives attain + drain; the harness observes.
 - Observe mode: **window**, 60 s warm-up to steady-state draining, then a 300 s measurement window.
   Convert metrics are restricted to that window (the one-time transmute cutover is excluded).

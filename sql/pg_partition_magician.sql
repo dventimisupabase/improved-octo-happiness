@@ -756,7 +756,7 @@ begin
   -- scan the default -- which, inside this ACCESS EXCLUSIVE transaction, blocks ALL access
   -- for the whole scan (O(default), minutes on a large table). transmute() therefore does the
   -- metadata-only cutover ONLY (a fresh parent with just the DEFAULT attached scans nothing),
-  -- so it stays online even at scale. Run pgpm.attain(parent) (or pgpm.maintenance, or the
+  -- so it stays online even at scale. Run pgpm.attain(parent) (or pgpm.maintain, or the
   -- scheduled maintenance job) AFTER transmute to build the future partitions online -- its
   -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until attain
   -- runs, new writes route to the DEFAULT (correct, just not yet split into future cells).
@@ -1080,7 +1080,12 @@ begin
 end;
 $$;
 
-create or replace function pgpm.maintenance(p_parent regclass)
+-- renamed maintenance -> maintain / maintenance_all -> maintain_all (completes the attain/drain/retain
+-- rhyme). Drop the old names so re-running the installer over a prior version does not strand them.
+drop function if exists pgpm.maintenance(regclass);
+drop procedure if exists pgpm.maintenance_all();
+
+create or replace function pgpm.maintain(p_parent regclass)
 returns text language plpgsql as $$
 declare
   cfg pgpm.config;
@@ -1247,12 +1252,12 @@ begin
 end;
 $$;
 
-create or replace procedure pgpm.maintenance_all()
+create or replace procedure pgpm.maintain_all()
 language plpgsql as $$
 declare r record;
 begin
   for r in select parent_table from pgpm.config loop
-    perform pgpm.maintenance(r.parent_table);
+    perform pgpm.maintain(r.parent_table);
   end loop;
 end;
 $$;
@@ -1348,7 +1353,7 @@ $$;
 -- partition exists. The drain moves rows out of the DEFAULT through such a child, during which a
 -- referenced row is briefly outside the parent and a live NO ACTION FK would reject the move (see
 -- DESIGN.md section 8), so the FK must stay dropped until the drain is idle. Returns the number
--- restored, 0 (a no-op) while the drain is still in flight, so `maintenance` can call it every tick
+-- restored, 0 (a no-op) while the drain is still in flight, so `maintain` can call it every tick
 -- and it acts only when the table is ready.
 create or replace function pgpm.restore_incoming_fks(p_parent regclass)
 returns int language plpgsql as $$
