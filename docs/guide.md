@@ -147,14 +147,23 @@ time-ordered-PK data model (bigint/Snowflake, UUIDv7, ULID).
 
 ## Run it
 
-Schedule the single entry point with `pg_cron`. It stays idle while the table is paused, so inspect
-with [`status()`](#monitor) first, then `resume` to go live:
+Schedule maintenance with `pgpm.schedule()`, a thin wrapper around `pg_cron` for the one job pgpm
+needs. It stays idle while the table is paused, so inspect with [`status()`](#monitor) first, then
+`resume` to go live:
 
 ```sql
-select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
+select pgpm.schedule();                   -- one pg_cron job (every minute) drives maintain_all() for all tables
 select * from pgpm.status();              -- looks right?
 select pgpm.resume('public.events');      -- go live
 ```
+
+`pgpm.schedule(p_every)` takes a `pg_cron` schedule (`'* * * * *'` every minute is the default;
+`'*/5 * * * *'` every 5 minutes; `'30 seconds'` for pg_cron's sub-minute syntax). Note pg_cron does
+not accept `'1 minute'`-style interval strings; minute cadence goes through cron syntax. It registers
+one job named `pgpm` that calls `maintain_all()` for every managed table, targeting the current
+database, and re-running it updates the interval in place. `pgpm.unschedule()` removes it. Run these
+from the database where `pg_cron` is installed (its `cron` schema must be present). If you prefer, the
+raw equivalent is `cron.schedule('pgpm', '* * * * *', 'call pgpm.maintain_all()')`.
 
 From there, each tick obtains ahead, drains a microbatch of the closed tail, and applies retention.
 You can also transmute with `p_paused => false` to go live immediately and skip the `resume` step.
