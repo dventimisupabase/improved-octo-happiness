@@ -304,8 +304,13 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   its I/O footprint regardless of the data model, which is the practical reason for measuring demand
   in blocks (section 2). **Implemented** as the `drain_max_blocks` config knob: `drain_step` caps
   each microbatch at roughly that many heap+TOAST blocks (translated to a row limit via the default's
-  average bytes/row) and falls back to the old row cap when unset. Tests in `tests/17`; cross-version
-  PG 15 to 18.
+  average bytes/row) and falls back to the old row cap when unset. The average bytes/row is
+  `pg_table_size / reltuples` when row stats exist; when they do not -- a freshly transmuted or
+  never-analyzed default, exactly the early-drain window when the default is largest -- the budget no
+  longer disables itself (issue #93) but estimates the average by sampling `pg_column_size`, which
+  reads each toasted value's post-compression external size from its TOAST pointer without fetching it
+  (cheap and TOAST-aware: a compressible column scores small, an incompressible wide one near its full
+  width). Tests in `tests/17` and `tests/36`; cross-version PG 15 to 18.
 - **A maintenance-window estimator (mode 3's helper).** Tell the operator how long a window to book,
   reckoned in blocks rather than rows. It needs two inputs: the **work size**, which pgpm can read
   from the catalog (the `DEFAULT`'s heap + TOAST + index `relpages`, scaled by the closed-tail

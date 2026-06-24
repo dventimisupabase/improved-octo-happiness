@@ -353,17 +353,25 @@ begin
   v_batch := coalesce(p_batch, cfg.drain_batch, 5000);
 
   -- Block budget (DESIGN.md sec 8): bound the microbatch by heap+TOAST blocks, not just rows, so a
-  -- wide-row table (large jsonb/bytea) can't make one batch tens of GB. Translate the budget to a
-  -- row cap via the default's average bytes/row (pg_table_size / reltuples) and take the smaller of
-  -- the two. Skipped when unset, or when stats are missing (reltuples <= 0): then it is the row cap.
+  -- wide-row table (large jsonb/bytea) can't make one batch tens of GB. Translate the budget to a row
+  -- cap via the default's average bytes/row and take the smaller of the two. When row stats exist that
+  -- average is pg_table_size / reltuples. When they DON'T (a freshly transmuted / never-analyzed
+  -- default -- exactly the early-drain window when the default is largest and widest), do NOT silently
+  -- disable the budget (issue #93): estimate the average by sampling pg_column_size, which reads each
+  -- toasted value's stored (post-compression) external size from its TOAST pointer WITHOUT fetching it,
+  -- so the sample is cheap and TOAST-aware -- it scores a compressible column small (correctly, since
+  -- it is cheap to move) and an incompressible wide one near its full width.
   if cfg.drain_max_blocks is not null then
     select c.reltuples into v_reltuples from pg_class c where c.oid = v_def::regclass;
     if coalesce(v_reltuples, 0) > 0 then
       v_avg := pg_table_size(v_def::regclass)::numeric / v_reltuples;   -- avg heap+TOAST bytes/row
-      if v_avg > 0 then
-        v_blk_limit := greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int;
-        v_batch := least(v_batch, v_blk_limit);
-      end if;
+    else
+      execute format('select avg(pg_column_size(t))::numeric from (select * from %s limit 1000) t', v_def)
+        into v_avg;
+    end if;
+    if coalesce(v_avg, 0) > 0 then
+      v_blk_limit := greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int;
+      v_batch := least(v_batch, v_blk_limit);
     end if;
   end if;
 
