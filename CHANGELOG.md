@@ -31,6 +31,13 @@
   non-time-ordered key scatters rows across meaningless partitions on a garbage frontier (mirroring the
   float-key and PK refusals). A new `p_force_uuidv7 => true` overrides it for an operator certain the
   column is time-ordered. (tests/13, tests/39)
+- **The block budget no longer disables itself when row stats are missing (issue #93).**
+  `drain_max_blocks` translates to a row cap via the default's average bytes/row. When `reltuples <= 0`
+  (a freshly transmuted or never-analyzed default -- the early-drain window when it is largest and
+  widest) the budget previously fell back to the raw `drain_batch` row count, so a batch of wide
+  incompressible rows could be the multi-GB spike the feature exists to prevent. It now estimates the
+  average by sampling `pg_column_size` (cheap and TOAST-aware), so the budget holds even before ANALYZE.
+  (tests/36)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in

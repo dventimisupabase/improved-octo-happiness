@@ -451,7 +451,7 @@ for the `paused` flag, [`set_drain_adaptive`](#pgpmset_drain_adaptive) /
 | `paused` | `boolean` | Whether scheduled maintenance acts on this table. |
 | `created_at` | `timestamptz` | When transmuted. |
 | `obtain_retry_after` | `timestamptz` | Internal obtain back-off window; null = attempt now. |
-| `drain_max_blocks` | `int` | Optional block budget per drain batch; null = cap by `drain_batch` rows only. |
+| `drain_max_blocks` | `int` | Optional block budget per drain batch; null = cap by `drain_batch` rows only. The row cap is derived from the default's average bytes/row (`pg_table_size / reltuples`, or a `pg_column_size` sample when row stats are missing), so it holds even on a freshly transmuted, never-analyzed default. |
 | `drain_adaptive` | `boolean` | Adaptive feathering (mode 2) on/off. Set via `set_drain_adaptive`; default off. |
 | `drain_budget` | `int` | Controller state: current adaptive rows/tick budget; null until the first adaptive tick. |
 | `drain_wal_high_water` | `numeric` | Back off when the WAL rate exceeds this fraction of the sustainable rate (`max_wal_size`/`checkpoint_timeout`); default 1.0. Lower (e.g. 0.7) is gentler on the workload but drains slower. |
