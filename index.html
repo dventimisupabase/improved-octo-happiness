@@ -436,7 +436,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">1</span> The setup</span>
             <h3>A live table can't <em>become</em> partitioned.</h3>
-            <p>Postgres has no <code>ALTER TABLE &hellip; PARTITION BY</code>. The only built-in route is to create a fresh partitioned table and copy every row into it: a long lock, or a long migration with a risky cutover at the end. On a 200-million-row table that's the part nobody wants. <strong style="color:var(--fg)">pg_partition_magician never copies the table.</strong> Watch the hands.</p>
+            <p>Postgres has no <code>ALTER TABLE &hellip; PARTITION BY</code>. The only built-in path is to build a fresh partitioned table and copy every row, a long lock, or a long migration with a risky cutover. <strong style="color:var(--fg)">pg_partition_magician copies nothing.</strong> Watch the hands.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-setup">
@@ -452,7 +452,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">2</span> The switch &middot; <code>transmute</code></span>
             <h3>The table you query is swapped for an identical one, mid-show.</h3>
-            <p><code>transmute()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows. The app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the partition key must already be part of the primary key (pgpm never rewrites it, move 3), non-key-aligned unique indexes can't be carried, and incoming foreign keys are kept against the new parent. If the table isn't shaped for that, <code>transmute</code> refuses up front and tells you how to fix it, rather than mangling it. And the switch reverses cleanly: as long as no real partition has been built yet, <code>untransmute</code> puts the original table back exactly as it was, no rows moved.</p>
+            <p><code>transmute()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>) and builds a partitioned parent under the <em>same name</em>, with the old table attached as its <code>DEFAULT</code>. Same name, same rows, a catalog-only swap the app never sees. The one requirement: the partition key must already be in the primary key (move 3); if not, <code>transmute</code> refuses and tells you how, rather than mangling it. And it reverses cleanly, until the first real partition exists, <code>untransmute</code> puts the table back exactly as it was.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-switch">
@@ -470,7 +470,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">3</span> The index is already in hand</span>
             <h3>There's no hard part to hide.</h3>
-            <p>A partitioned table's primary key must contain the partition key. pgpm's bet is that it already does, because the modern data model makes a time-ordered key (a Snowflake <code>bigint</code>, a UUIDv7, a ULID) the primary key. So there's nothing to widen and no index to rebuild: <code>transmute</code> reuses the existing key in place and the cutover is pure metadata, online at any size. If the partition key <em>isn't</em> part of your primary key, <code>transmute</code> says so up front and points you at the one-time migration, rather than quietly rebuilding the key under an <code>ACCESS EXCLUSIVE</code> lock (<code>O(rows)</code>, about 28&nbsp;minutes at 300M rows). Predictable beats clever.</p>
+            <p>A partitioned table's primary key must contain the partition key, and the modern time-ordered key (Snowflake <code>bigint</code>, UUIDv7, ULID) already <em>is</em> the primary key. So nothing widens and no index rebuilds: <code>transmute</code> reuses the key in place, pure metadata, online at any size. The alternative pgpm refuses, rebuilding the key under <code>ACCESS EXCLUSIVE</code>, runs <code>O(rows)</code>: about 28&nbsp;minutes at 300M rows. Predictable beats clever.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-prepare">
@@ -486,7 +486,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">4</span> The one rule of the act</span>
             <h3>Never touch the interval that's live.</h3>
-            <p>Everything keys off one moving point: the <b style="color:var(--brass)">frontier</b>, the line between the settled past and the active present. Intervals <em>behind</em> it are <b style="color:var(--green)">closed</b>: no new row will ever land there, so they're safe to rebuild into real partitions. The interval <em>straddling</em> it is <b style="color:var(--brass)">open</b> (writes are arriving now), and pgpm's single rule is to leave it alone. New rows fall into a <b style="color:var(--green)">premade</b> future partition, or, if none fits yet, safely into <code>DEFAULT</code>. The frontier advances; the open interval closes; only <em>then</em> does it get reorganized.</p>
+            <p>Everything keys off the <b style="color:var(--brass)">frontier</b>: the line between settled past and live present. Intervals behind it are <b style="color:var(--green)">closed</b>, safe to rebuild into real partitions; the one <em>straddling</em> it is <b style="color:var(--brass)">open</b>, still taking writes, and pgpm's lone rule is to leave it be. New rows land in a partition <b style="color:var(--green)">obtained</b> ahead, or in <code>DEFAULT</code>. Once the frontier passes and the interval closes, only <em>then</em> is it reorganized.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-frontier">
@@ -501,7 +501,7 @@
                 <div class="frontier"><span>frontier &middot; now</span></div>
               </div>
               <div class="axis"></div>
-              <div class="legend"><span class="k part">real partition</span><span class="k tail">closed tail &middot; DEFAULT</span><span class="k open">open</span><span class="k future">premade</span></div>
+              <div class="legend"><span class="k part">real partition</span><span class="k tail">closed tail &middot; DEFAULT</span><span class="k open">open</span><span class="k future">obtained ahead</span></div>
             </div>
           </figure>
         </div>
@@ -511,7 +511,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">5</span> The misdirection</span>
             <h3>Attaching a partition looks like it needs a full scan. It doesn't.</h3>
-            <p>Attach a partition while <code>DEFAULT</code> holds data and Postgres scans the whole <code>DEFAULT</code> under <code>ACCESS EXCLUSIVE</code> (a hard lock) to prove no row belongs in the new partition. pgpm proves it the other way first: <code>ADD&nbsp;CHECK&nbsp;(&hellip;)&nbsp;NOT&nbsp;VALID</code> is catalog-only and instant, then <code>VALIDATE</code> runs the scan under <code>SHARE UPDATE EXCLUSIVE</code>, a gentle lock that lets reads <em>and</em> writes continue. With the proof in hand, the <code>ATTACH</code> skips its scan and is metadata-only. A 4-million-row attach drops from <strong style="color:var(--fg)">101&nbsp;ms to 0.4&nbsp;ms</strong>; the cost moves to the lock nobody waits on.</p>
+            <p>A normal <code>ATTACH</code> scans all of <code>DEFAULT</code> under <code>ACCESS EXCLUSIVE</code> to prove no row belongs in the new partition. pgpm proves it first: <code>CHECK&nbsp;&hellip;&nbsp;NOT&nbsp;VALID</code> is instant, then <code>VALIDATE</code> scans under a gentle <code>SHARE UPDATE EXCLUSIVE</code> lock that lets reads <em>and</em> writes continue, so the <code>ATTACH</code> skips its scan. A 4M-row attach: <strong style="color:var(--fg)">101&nbsp;ms &rarr; 0.4&nbsp;ms</strong>.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-lock">
@@ -531,7 +531,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">6</span> Vanishing the backlog &middot; <code>drain</code></span>
             <h3>The old rows leave <code>DEFAULT</code> a chunk at a time.</h3>
-            <p>The closed tail still sitting in <code>DEFAULT</code> is moved into its real partitions in small microbatches: <code>DELETE&nbsp;&hellip;&nbsp;RETURNING</code> a chunk, <code>INSERT</code> it where it belongs, commit, repeat. Background, paced, and pausable: <code>DEFAULT</code> shrinks toward empty and the workload is never blocked. Each newly-filled interval is attached by the misdirection above, so even that is a blink. We are upfront about the one cost: until an interval finishes and attaches, its already-moved rows sit in that not-yet-attached child, so a mid-drain read of the parent undercounts that interval. <code>pgpm.snapshot</code> reads the complete set, and the guide says exactly when this can matter.</p>
+            <p>The closed tail leaves <code>DEFAULT</code> in small microbatches, <code>DELETE&nbsp;&hellip;&nbsp;RETURNING</code> a chunk, <code>INSERT</code> it home, repeat, paced and pausable so the workload never blocks. One honest cost: until an interval finishes attaching, its already-moved rows sit in an unattached child, so a mid-drain read of the parent undercounts it. <code>pgpm.snapshot</code> reads the complete set.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-drain">
@@ -550,7 +550,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">7</span> The act runs itself &middot; <code>maintain_all</code></span>
             <h3>One <code>pg_cron</code> tick repeats every move, and shows its hands.</h3>
-            <p>A single scheduled call ties it together: <b style="color:var(--green)">obtain</b> keeps the future stocked, <b style="color:var(--green)">drain</b> empties the closed tail, <b style="color:var(--green)">retain</b> drops cold partitions. It loops on <code>pg_cron</code> forever, and every action is written to an audit log in <code>pgpm.log</code>, the magician keeping his hands open. And the act waits for your cue: <code>transmute</code> registers the table <em>paused</em>, so you inspect first, then <code>resume()</code> to go live (and <code>pause()</code> to stop it anytime); the <code>DEFAULT</code> keeps everything safe in the meantime.</p>
+            <p>One scheduled call ties it together: <b style="color:var(--green)">obtain</b> stocks the future, <b style="color:var(--green)">drain</b> empties the closed tail, <b style="color:var(--green)">retain</b> drops cold partitions, looping on <code>pg_cron</code> with every step written to <code>pgpm.log</code>, the magician keeping his hands open. It starts <em>paused</em>: <code>resume()</code> to go live, <code>pause()</code> to stop.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-loop">
