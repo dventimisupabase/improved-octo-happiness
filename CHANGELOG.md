@@ -9,9 +9,9 @@
   month')`. `transmute` no longer drops or rebuilds the primary key, so the cutover is always metadata-only:
   it reuses the existing PK when the control column is a member of it (Postgres requires only that a
   partitioned PK include the partition key, not lead it, so `PK (tenant_id, id)` partitioned by `id`
-  qualifies), works with a no-PK table, and refuses (with a suggested migration) a table whose PK
-  excludes the control column, betting on a time-ordered primary key (Snowflake bigint / UUIDv7 / ULID)
-  as the data model. Forbidding PK rewrites removed `build_pk_concurrently`, the composite-FK recovery
+  qualifies), and refuses (with a suggested migration) a table whose primary key excludes the control
+  column, or that has no primary key at all (pgpm does not support no-PK tables), betting on a
+  time-ordered primary key (Snowflake bigint / UUIDv7 / ULID) as the data model. Forbidding PK rewrites removed `build_pk_concurrently`, the composite-FK recovery
   path (`generate_fk_recovery`, the `'drop'` incoming-FK mode, the `dropped_fk` composite columns), and
   the build-path complexity; every incoming FK is now the `preserve` path. (tests/25)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:

@@ -599,17 +599,21 @@ begin
   -- pgpm NEVER rewrites the primary key (DESIGN.md sec 8). Postgres only requires a partitioned
   -- table's PK to INCLUDE the partition key (column order is irrelevant), so when the control column
   -- is already a member of the existing PK we reuse that PK verbatim -- the parent's PRIMARY KEY
-  -- (step 8) reconciles the default's kept index in place, no drop, no O(rows) rebuild. If the table
-  -- has a PK that does NOT include the control column (the classic id-PK table that wants time
-  -- partitioning), we refuse with guidance rather than widen the key behind the operator's back. A
-  -- table with no PK at all is fine (there is nothing to preserve).
-  if v_oldpk is not null then
-    if not (p_control::text = any(v_oldpk)) then
-      raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite primary keys, and the primary key (%) does not include %. Make % part of the primary key first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen the PK to include % via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
-        p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control, p_control;
-    end if;
-    v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
+  -- (step 8) reconciles the default's kept index in place, no drop, no O(rows) rebuild. Two cases are
+  -- refused up front (before the rename, so the table is left untouched) rather than partitioned on a
+  -- weak key: a PK that does NOT include the control column (the classic id-PK table that wants time
+  -- partitioning -- widening it is the operator's deliberate job, not something transmute does behind
+  -- their back), and NO primary key at all. pgpm does not support no-PK tables: the control column
+  -- must already be part of the table's primary key, which also guarantees it is NOT NULL, so the
+  -- per-column SET NOT NULL below is always a metadata no-op and never an O(rows) blocking scan.
+  if v_oldpk is null then
+    raise exception 'pg_partition_magician: cannot transmute % -- it has no primary key, and pgpm requires the control column (%) to be part of the table''s primary key (a partitioned table''s primary key must include the partition key). Add a primary key that includes % first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID).',
+      p_parent, p_control, p_control;
+  elsif not (p_control::text = any(v_oldpk)) then
+    raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite primary keys, and the primary key (%) does not include %. Make % part of the primary key first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen the PK to include % via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
+      p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control, p_control;
   end if;
+  v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
 
   -- secondary (non-PK, non-unique) indexes to recreate on the parent
   select array_agg(c.relname::text), array_agg(pg_get_indexdef(i.indexrelid)) into v_idx_names, v_idx_defs
@@ -666,7 +670,7 @@ begin
 
   -- 2. the existing PK is KEPT in place -- pgpm never drops or rebuilds it. The default carries its
   -- original PK index forward; step 8's parent PRIMARY KEY reconciles that index (metadata-only, no
-  -- O(rows) build). (When the table had no PK there is nothing to keep, and the parent gets none.)
+  -- O(rows) build). (transmute refuses a no-PK table above, so there is always an index to reuse.)
 
   -- 3. drop identity on the default; key columns NOT NULL
   if v_idcols is not null then

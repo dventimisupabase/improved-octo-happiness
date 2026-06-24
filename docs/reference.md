@@ -51,7 +51,7 @@ cast it: `transmute(t, c, interval '1 month')`.
 
 | Parameter | Meaning |
 |---|---|
-| `p_parent` | The table to convert: a plain (unpartitioned) table whose primary key already includes `p_control`, or which has no primary key. |
+| `p_parent` | The table to convert: a plain (unpartitioned) table whose primary key already includes `p_control`. A table with no primary key is refused. |
 | `p_control` | The column to range-partition on. |
 | `p_interval` | Partition width. Whole-month (`interval '1 month'`, `'1 year'`) aligns to the calendar; fixed-duration (`'1 day'`, `'6 hours'`) tiles from `p_anchor`. Mixing month and duration is rejected. For a `uuid` column it is the time width of each partition. |
 | `p_obtain` | How many partitions to keep created ahead of the frontier. |
@@ -98,9 +98,9 @@ nothing drains until you [`resume`](#pgpmpause--pgpmresume) it (or drive `drain_
 `transmute` never drops or rebuilds the primary key, so the cutover is always metadata-only (no `O(rows)`
 index build, ever). It reuses the existing PK in place when `p_control` is already a member of it
 (Postgres requires a partitioned PK only to *include* the partition key, not lead it, so a composite
-`PK (tenant_id, id)` partitioned by `id` qualifies), and a table with no PK is fine. If the table has
-a primary key that does NOT include `p_control` (the classic `events(id PRIMARY KEY, created_at)` that
-wants time partitioning), transmute refuses with guidance: make `p_control` part of the primary key first
+`PK (tenant_id, id)` partitioned by `id` qualifies). A table with **no primary key**, or a primary key
+that does NOT include `p_control` (the classic `events(id PRIMARY KEY, created_at)` that wants time
+partitioning), is refused with guidance: make `p_control` part of the primary key first
 (a single-column time-ordered key is simplest; or widen the PK yourself via
 `CREATE UNIQUE INDEX CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`), then re-transmute.
 

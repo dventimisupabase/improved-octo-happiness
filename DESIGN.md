@@ -176,10 +176,11 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   *Never rewrites the primary key.* `transmute` reuses the existing PK when the control column is already
   a **member** of it (Postgres requires a partitioned table's PK only to *include* the partition key,
   not to lead it, so `PK (tenant_id, id)` partitioned by `id` qualifies with zero rebuild, broader
-  than today's control-must-lead test), and it works with a table that has no PK at all. If the table
-  has a PK that *excludes* the control column, the classic `events(id PRIMARY KEY, created_at)` that
-  wants time partitioning, `transmute` refuses and emits a suggested migration (how to get the control
-  column into the PK) rather than just erroring. The widening that today's drop-and-rebuild performs
+  than today's control-must-lead test). If the table has a PK that *excludes* the control column, the
+  classic `events(id PRIMARY KEY, created_at)` that wants time partitioning, or no primary key at all,
+  `transmute` refuses and emits a suggested migration (how to get the control column into the PK)
+  rather than just erroring. pgpm does not support no-PK tables: requiring the control column to be a
+  PK member also keeps it `NOT NULL`, so the cutover never pays an `O(rows)` `SET NOT NULL` scan. The widening that today's drop-and-rebuild performs
   becomes the operator's deliberate job, not something `transmute` attempts online behind their back.
 
   *Why this is a net subtraction.* Forbidding widening lets whole subsystems be deleted, not merely
