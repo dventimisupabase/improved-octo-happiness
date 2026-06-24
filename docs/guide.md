@@ -141,7 +141,8 @@ nothing until you `resume` it (see [Run it](#run-it)). All parameters are docume
 The one requirement is that the control column already be part of the primary key. Postgres only
 requires a partitioned PK to *include* the partition key, not lead it, so a single-column PK on the
 control column qualifies, and so does a composite PK that contains it (e.g. `(tenant_id, id)`
-partitioned by `id`). A table with no primary key at all is fine too.
+partitioned by `id`). A table with no primary key at all is refused: the control column must be part
+of a primary key for pgpm to partition on it.
 
 If the table has a PK that *excludes* the control column (the classic `events(id PRIMARY KEY,
 created_at)` wanting time partitioning), `transmute` refuses with a clear error: make the control column
@@ -499,7 +500,7 @@ What to do:
 - **Unique secondary indexes** are not auto-propagated (a partitioned unique index must include the
   partition key); recreate them on the parent by hand.
 - **The primary key is never rewritten.** The control column must already be part of the table's
-  primary key (a table with no PK is fine); a PK that excludes the control column is refused. See
+  primary key; a table with no primary key, or a PK that excludes the control column, is refused. See
   [transmute a table](#transmute-a-table).
 - **Incoming foreign keys**: refused by default, or preserved (dropped for the conversion and re-added
   against the new parent) with `p_incoming_fks => 'preserve'`; see above.
