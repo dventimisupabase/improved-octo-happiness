@@ -350,10 +350,13 @@
     .reveal.in { opacity: 1; transform: none; }
 
     @media (max-width: 920px) {
-      /* tighten the top void so the fan AND the headline are both above the fold on open */
-      .hero { padding: 24px 0 56px; }
-      .hero-inner { grid-template-columns: 1fr; gap: 22px; }
-      .stage { height: 320px; order: -1; }
+      /* tighten the top void so the fan AND the headline are both above the fold on open. The fan is
+         bottom-anchored with empty space above it, so on mobile we shrink both the stage and the fan's
+         own height to pull the cards up under the nav, instead of reserving a tall centered block. */
+      .hero { padding: 20px 0 48px; }
+      .hero-inner { grid-template-columns: 1fr; gap: 18px; }
+      .stage { height: 248px; order: -1; }
+      .stage .fan { height: 230px; }
     }
     @media (prefers-reduced-motion: reduce) {
       * { scroll-behavior: auto !important; }
