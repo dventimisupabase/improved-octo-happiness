@@ -50,16 +50,17 @@ select ok(
   'a premade partition inherited the secondary index'
 );
 
--- 5. a drained (closed-month) partition also has it
-select pgpm.drain_all('public.messages', p_include_open => true);
-select ok(
-  exists (
-    select 1 from pg_index i
-     where i.indrelid = ('public.messages_p' ||
-            to_char(date_trunc('month', now()) - interval '1 month', 'YYYY_MM'))::regclass
-       and pg_get_indexdef(i.indexrelid) ilike '%tenant_id%created_at%'
-  ),
-  'a drained partition has the secondary index'
+-- 5. the secondary index propagated to EVERY managed partition -- the monolith (holding all the closed
+--    history) and the forward cells -- not just the default
+select is(
+  (select count(*) from pgpm.part p
+     where p.parent_table = 'public.messages'::regclass and p.attached
+       and not exists (
+         select 1 from pg_index i
+          where i.indrelid = ('public.' || p.child_name)::regclass
+            and pg_get_indexdef(i.indexrelid) ilike '%tenant_id%created_at%'))::int,
+  0,
+  'every managed partition (monolith + forward cells) carries the secondary index'
 );
 
 select * from finish();

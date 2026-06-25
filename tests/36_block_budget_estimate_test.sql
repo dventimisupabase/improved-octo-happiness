@@ -1,8 +1,8 @@
--- Regression test for issue #93. drain_max_blocks bounds a microbatch by heap+TOAST blocks. When the
--- default has no row stats yet (reltuples <= 0: freshly transmuted / never-analyzed -- exactly the
--- early-drain window when it is largest and widest), the budget must NOT silently disable itself: it
+-- Regression test for issue #93, in the monolith model. drain_max_blocks bounds a microbatch by
+-- heap+TOAST blocks. When the DEFAULT has no row stats yet (reltuples <= 0: a freshly created,
+-- never-analyzed default with strays just inserted), the budget must NOT silently disable itself: it
 -- estimates the average on-disk bytes/row by sampling pg_column_size (TOAST-aware, no fetch), so a
--- batch of wide INCOMPRESSIBLE rows is still capped tightly.
+-- batch of wide INCOMPRESSIBLE strays is still capped tightly.
 create extension if not exists pgtap;
 
 begin;
@@ -14,21 +14,17 @@ create table public.blk_t (
   doc        text not null,
   primary key (created_at, id)
 );
--- STORAGE EXTERNAL = out-of-line, uncompressed, so each row really is ~12 KB on disk. (A compressible
--- value would shrink to ~nothing on disk, and then a tight cap would be WRONG -- it would be cheap to
--- move; the sample-based estimate scores such a column small, which is the correct behaviour.)
+-- STORAGE EXTERNAL = out-of-line, uncompressed, so each row really is ~12 KB on disk.
 alter table public.blk_t alter column doc set storage external;
--- 40 wide rows in one CLOSED month so the drain will move them
 insert into public.blk_t (created_at, doc)
-  select date_trunc('month', now()) - interval '40 days', repeat('x', 12000)
-  from generate_series(1, 40) g;
-
--- tiny 1-block budget, large row batch; do NOT analyze -> reltuples stays unset
-select pgpm.transmute('public.blk_t', 'created_at', interval '1 month',
-                  p_drain_batch => 5000, p_paused => false);
+  select now() - (g || ' minutes')::interval, repeat('x', 12000) from generate_series(1, 3) g;   -- recent -> monolith
+select pgpm.transmute('public.blk_t', 'created_at', interval '1 month', p_drain_batch => 5000, p_paused => false);
+-- 40 wide strays in one CLOSED month land in the freshly created DEFAULT; do NOT analyze it
+insert into public.blk_t (created_at, doc)
+  select date_trunc('month', now()) - interval '40 days', repeat('x', 12000) from generate_series(1, 40) g;
 update pgpm.config set drain_max_blocks = 1 where parent_table = 'public.blk_t'::regclass;
 
--- setup: the un-analyzed default has no usable row stats (so the old code skipped the budget)
+-- setup: the un-analyzed default has no usable row stats (so the old code would have skipped the budget)
 select cmp_ok(
   (select c.reltuples
      from pg_class c

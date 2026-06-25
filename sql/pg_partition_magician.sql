@@ -266,10 +266,21 @@ begin
 end;
 $$;
 
-create or replace function pgpm._part_name(p_relname name, p_kind text, p_step text, p_lo_native text)
+-- _part_name maps a partition's NATIVE [lo, hi) to its child table name. A one-step range (hi is the
+-- next grid value after lo, the common fine partition) keeps the historical name _p<lo>; a wider range
+-- (a coarse / monolith child, REDESIGN.md section 6) is named _p<lo>_to_<hi> so it can never collide
+-- with the fine child at its low edge. Both bounds are formatted at the step's granularity. hi is
+-- optional: omitted (or equal to the one-step value) yields the fine name, so existing callers are
+-- unchanged. The name is a human-facing LABEL only -- pgpm.part holds the authoritative bounds, so the
+-- 63-byte identifier limit is cosmetic, never a correctness concern (a hash fallback is future work).
+drop function if exists pgpm._part_name(name, text, text, text);
+create or replace function pgpm._part_name(p_relname name, p_kind text, p_step text, p_lo_native text,
+                                           p_hi_native text default null)
 returns name language plpgsql immutable as $$
-declare v_months int; v_secs double precision; fmt text;
+declare v_months int; v_secs double precision; fmt text; v_coarse boolean; v_lo text; v_hi text;
 begin
+  v_coarse := p_hi_native is not null
+          and pgpm._native_gt(p_kind, p_hi_native, pgpm._grid_next(p_kind, p_step, p_lo_native));
   if p_kind in ('time', 'uuidv7') then
     v_months := (extract(year from p_step::interval) * 12 + extract(month from p_step::interval))::int;
     v_secs   := extract(epoch from p_step::interval);
@@ -279,9 +290,19 @@ begin
     elsif v_secs  >= 3600                        then fmt := 'YYYY_MM_DD_HH24';
     else                                              fmt := 'YYYY_MM_DD_HH24MI';
     end if;
-    return (p_relname || '_p' || to_char(p_lo_native::timestamptz, fmt))::name;
+    v_lo := to_char(p_lo_native::timestamptz, fmt);
+    if v_coarse then
+      v_hi := to_char(p_hi_native::timestamptz, fmt);
+      return (p_relname || '_p' || v_lo || '_to_' || v_hi)::name;
+    end if;
+    return (p_relname || '_p' || v_lo)::name;
   else
-    return (p_relname || '_p' || lpad(floor(p_lo_native::numeric)::text, 19, '0'))::name;
+    v_lo := lpad(floor(p_lo_native::numeric)::text, 19, '0');
+    if v_coarse then
+      v_hi := lpad(floor(p_hi_native::numeric)::text, 19, '0');
+      return (p_relname || '_p' || v_lo || '_to_' || v_hi)::name;
+    end if;
+    return (p_relname || '_p' || v_lo)::name;
   end if;
 end;
 $$;
@@ -360,8 +381,17 @@ begin
   for k in 0 .. cfg.obtain loop
     if k > 0 then v_lo := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo); end if;
     v_hi   := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
-    v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo);
+    v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo, v_hi);
     continue when to_regclass(format('%I.%I', v_nsp, v_name)) is not null;
+    -- skip a candidate that overlaps an EXISTING attached partition (e.g. the coarse monolith that
+    -- covers the active interval, REDESIGN.md section 7). Half-open [v_lo,v_hi) overlaps [p.lo,p.hi)
+    -- iff p.hi > v_lo and v_hi > p.lo. Creating it would error on an overlapping partition; pgpm.part
+    -- is the source of truth, and the non-overlap invariant holds over attached rows only.
+    continue when exists (
+      select 1 from pgpm.part p
+       where p.parent_table = p_parent and p.attached
+         and pgpm._native_gt(cfg.control_kind, p.hi, v_lo)
+         and pgpm._native_gt(cfg.control_kind, v_hi, p.lo));
     v_lo_lit := pgpm._encode(cfg.control_kind, v_lo);
     v_hi_lit := pgpm._encode(cfg.control_kind, v_hi);
     -- skip a range the DEFAULT still holds data for (only the active interval)
@@ -461,7 +491,7 @@ begin
   end if;
 
   if to_regclass(format('%I.%I', v_nsp, v_name)) is null then
-    execute format('create table %I.%I (like %I.%I including defaults including indexes including constraints excluding identity)',
+    execute format('create table %I.%I (like %I.%I including defaults including storage including indexes including constraints excluding identity)',
                    v_nsp, v_name, v_nsp, v_rel);
     execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
                    v_nsp, v_name, (v_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
@@ -576,6 +606,136 @@ begin
 end;
 $$;
 
+-- ============================== refine ==============================
+
+-- refine(): split a FROZEN coarse child (the monolith, or a coarser child from a prior pass) into finer
+-- children. It COPIES the rows into standalone children and swaps them in for the coarse child in one
+-- transaction, then DROPs the now-vestigial source. No DELETE, so no dead tuples, no vacuum, no bloat
+-- (REDESIGN.md section 10): the costs are transient ~2x disk for the child being refined and the one-time
+-- copy I/O. Preconditions, refused rather than improvised: the child is FROZEN (its whole range at/below
+-- the current grid floor, so the copy is a consistent snapshot -- the monolith freezes once the frontier
+-- crosses B), the target step SUBDIVIDES it, and the DEFAULT holds no rows inside its range (a stray there
+-- is the assistant drain's job first). Returns the number of fine children created. p_target_step defaults
+-- to the configured partition_step (the finest grid); the hierarchical monolith -> coarse -> fine path is
+-- just repeated calls with chosen steps. The swap takes a brief ACCESS EXCLUSIVE on the parent (small N
+-- children, all metadata-only attaches); a caller that must stay unnoticeable bounds it with a short
+-- lock_timeout and retries. (The copy is currently a single INSERT per sub-range; feathering it through
+-- the adaptive controller, like the drain, is a follow-up -- it is a pacing concern, not correctness.)
+create or replace function pgpm.refine(p_parent regclass, p_child name, p_target_step text default null)
+returns int language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols text;
+  v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean;
+  v_sub_lo text; v_sub_hi text; v_sub_name name; v_made int := 0;
+  v_fine name[] := '{}'; v_fine_lo text[] := '{}'; v_fine_hi text[] := '{}'; i int;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_step := coalesce(p_target_step, cfg.partition_step);
+
+  select lo, hi into v_lo, v_hi from pgpm.part
+   where parent_table = p_parent and child_name = p_child and attached;
+  if not found then
+    raise exception 'pg_partition_magician: % is not an attached managed partition of %', p_child, p_parent;
+  end if;
+  v_child := format('%I.%I', v_nsp, p_child)::regclass;
+
+  -- PRECONDITION 1: frozen. The whole range must be at/below the current grid floor, so no live write
+  -- still lands in it and the copy is a consistent snapshot.
+  v_frontier := pgpm._frontier_native(p_parent);
+  v_floor    := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
+  if pgpm._native_gt(cfg.control_kind, v_hi, v_floor) then
+    raise exception 'pg_partition_magician: cannot refine % -- it is still active (upper bound % is above the current grid floor %); wait until the frontier passes its upper bound',
+      p_child, v_hi, v_floor;
+  end if;
+
+  -- PRECONDITION 2: the target step must actually subdivide the child.
+  if not pgpm._native_gt(cfg.control_kind, v_hi, pgpm._grid_next(cfg.control_kind, v_step, v_lo)) then
+    raise exception 'pg_partition_magician: cannot refine % -- target step % does not subdivide [%, %)',
+      p_child, v_step, v_lo, v_hi;
+  end if;
+
+  -- PRECONDITION 3: the DEFAULT must hold no rows inside the child's range (else a sub-child ATTACH would
+  -- fail because the DEFAULT still owns rows there).
+  execute format('select exists (select 1 from %I.%I where %I >= %L and %I < %L)',
+                 v_nsp, cfg.default_table, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, v_hi)) into v_has;
+  if v_has then
+    raise exception 'pg_partition_magician: cannot refine % -- the DEFAULT holds rows inside its range; drain them first', p_child;
+  end if;
+
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
+
+  -- 1. build the fine sub-ranges as STANDALONE children, each born with its validated bound CHECK, and
+  -- COPY the matching rows in (no DELETE on the source).
+  v_sub_lo := v_lo;
+  loop
+    exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_sub_lo);
+    v_sub_hi := pgpm._grid_next(cfg.control_kind, v_step, v_sub_lo);
+    if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;   -- clamp last
+    v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
+    execute format('create table %I.%I (like %I.%I including defaults including storage including indexes including constraints excluding identity)',
+                   v_nsp, v_sub_name, v_nsp, v_rel);
+    execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
+                   v_nsp, v_sub_name, (v_sub_name || '_ck'),
+                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_lo),
+                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_hi));
+    execute format('insert into %I.%I (%s) select %s from %s where %I >= %L and %I < %L',
+                   v_nsp, v_sub_name, v_cols, v_cols, v_child::text,
+                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_lo),
+                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_hi));
+    insert into pgpm.part (parent_table, child_name, lo, hi, attached)
+      values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false) on conflict (parent_table, child_name) do nothing;
+    v_fine    := array_append(v_fine, v_sub_name);
+    v_fine_lo := array_append(v_fine_lo, v_sub_lo);
+    v_fine_hi := array_append(v_fine_hi, v_sub_hi);
+    v_made    := v_made + 1;
+    v_sub_lo  := v_sub_hi;
+  end loop;
+
+  -- 2. the swap (atomic in this transaction): detach the coarse child, attach each fine child
+  -- (metadata-only -- the child's validated CHECK skips its scan, the empty DEFAULT scans trivially),
+  -- drop the now-redundant CHECK, flip it attached, and remove the coarse pgpm.part row.
+  execute format('alter table %s detach partition %s', p_parent::text, v_child::text);
+  for i in 1 .. v_made loop
+    execute format('alter table %s attach partition %I.%I for values from (%L) to (%L)',
+                   p_parent::text, v_nsp, v_fine[i],
+                   pgpm._encode(cfg.control_kind, v_fine_lo[i]), pgpm._encode(cfg.control_kind, v_fine_hi[i]));
+    execute format('alter table %I.%I drop constraint %I', v_nsp, v_fine[i], (v_fine[i] || '_ck'));
+    update pgpm.part set attached = true where parent_table = p_parent and child_name = v_fine[i];
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (p_parent, 'refine_attach', v_fine_lo[i], v_fine_hi[i], 'check_skip');
+  end loop;
+  delete from pgpm.part where parent_table = p_parent and child_name = p_child;
+
+  -- 3. drop the now-vestigial coarse child -- COPY, not move, so just DROP (no DELETE, no dead tuples).
+  execute format('drop table %s', v_child::text);
+  insert into pgpm.log (parent_table, action, lo, hi, rows, method)
+    values (p_parent, 'refine', v_lo, v_hi, v_made, 'copy_swap_drop');
+  return v_made;
+end;
+$$;
+
+-- refine_history(): convenience -- refine the oldest coarse child (the monolith: the smallest-lo attached
+-- partition) to p_target_step (default: the configured partition_step). Hierarchical refinement is just
+-- repeated refine() calls with chosen steps.
+create or replace function pgpm.refine_history(p_parent regclass, p_target_step text default null)
+returns int language plpgsql as $$
+declare cfg pgpm.config; v_ncast text; v_mon name;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+  execute format('select child_name from pgpm.part where parent_table = %L::regclass and attached order by lo::%s asc limit 1',
+                 p_parent::text, v_ncast) into v_mon;
+  if v_mon is null then raise exception 'pg_partition_magician: % has no partitions to refine', p_parent; end if;
+  return pgpm.refine(p_parent, v_mon, p_target_step);
+end;
+$$;
+
 -- ============================== transmute ==============================
 
 create or replace function pgpm._transmute(
@@ -592,6 +752,8 @@ declare
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
   v_uchk_n bigint; v_uchk_frac numeric;
   v_idmax bigint[]; v_m bigint; v_i int;
+  v_monolith name; v_monreg regclass;
+  v_frontier_native text; v_min_raw text; v_max_raw text; v_min_native text; v_lo_native text; v_hi_native text;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
@@ -775,30 +937,61 @@ begin
     end if;
   end if;
 
-  -- 1. rename the live table to the DEFAULT partition name
-  execute format('alter table %s rename to %I', p_parent::text, v_default);
-  v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
+  -- ===== monolith cutover (REDESIGN.md sections 1, 2, 11) =====
+  -- Bounds for the bounded coarse child the original table becomes: lo = grid_floor(min(control)),
+  -- hi = B = the grid boundary just above the frontier. The monolith covers all history AND the
+  -- current interval, so live writes keep landing in it until the frontier crosses B (then obtain's
+  -- forward partitions take over and the monolith freezes). Every row satisfies [lo, B): lo <= min and
+  -- B > frontier >= every row. An empty table anchors lo at the frontier's grid floor (empty monolith).
+  -- frontier (now() for time, max(control) for id/uuidv7) and min(control), computed directly:
+  -- pgpm.config does not exist yet, so _frontier_native (which reads config) cannot be used here.
+  if p_control_kind = 'time' then
+    v_frontier_native := now()::text;
+  else
+    execute format('select t.%I::text from %s t order by t.%I desc limit 1', p_control, p_parent::text, p_control)
+      into v_max_raw;
+    v_frontier_native := coalesce(pgpm._decode(p_control_kind, v_max_raw),
+                                  case when p_control_kind = 'id' then p_anchor else now()::text end);
+  end if;
+  execute format('select t.%I::text from %s t order by t.%I asc limit 1', p_control, p_parent::text, p_control)
+    into v_min_raw;
+  v_min_native := coalesce(pgpm._decode(p_control_kind, v_min_raw),
+                           pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native));
+  v_lo_native  := pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_min_native);
+  v_hi_native  := pgpm._grid_next(p_control_kind, p_step,
+                    pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native));
+  v_monolith   := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
 
-  -- 2. the existing PK is KEPT in place -- pgpm never drops or rebuilds it. The default carries its
-  -- original PK index forward; step 8's parent PRIMARY KEY reconciles that index (metadata-only, no
-  -- O(rows) build). (transmute refuses a no-PK table above, so there is always an index to reuse.)
+  -- 0b. VALIDATE the monolith bound online (SHARE UPDATE EXCLUSIVE, no writer block), BEFORE the rename,
+  -- so the ATTACH below is metadata-only and ACCESS EXCLUSIVE is never held across the scan. This is the
+  -- one O(rows) read; the old model deferred it into a perpetual row-rewriting drain instead.
+  execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
+                 p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native),
+                 p_control, pgpm._encode(p_control_kind, v_hi_native));
+  execute format('alter table %s validate constraint pgpm_monolith_bound', p_parent::text);
 
-  -- 3. drop identity on the default; key columns NOT NULL
+  -- 1. rename the live table to the MONOLITH (coarse child) name
+  execute format('alter table %s rename to %I', p_parent::text, v_monolith);
+  v_monreg := format('%I.%I', v_nsp, v_monolith)::regclass;
+
+  -- 2. the existing PK is KEPT in place; step 8 reconciles the monolith's promoted index (metadata-only).
+
+  -- 3. drop identity on the monolith; key columns NOT NULL (metadata no-ops: PK => NOT NULL)
   if v_idcols is not null then
     foreach v_col in array v_idcols loop
-      execute format('alter table %s alter column %I drop identity if exists', v_defreg::text, v_col);
+      execute format('alter table %s alter column %I drop identity if exists', v_monreg::text, v_col);
     end loop;
   end if;
-  execute format('alter table %s alter column %I set not null', v_defreg::text, p_control);
+  execute format('alter table %s alter column %I set not null', v_monreg::text, p_control);
   if v_pkcols is not null then
     foreach v_col in array v_pkcols loop
-      execute format('alter table %s alter column %I set not null', v_defreg::text, v_col);
+      execute format('alter table %s alter column %I set not null', v_monreg::text, v_col);
     end loop;
   end if;
 
   -- 5. create the partitioned parent under the original name (no PK yet)
-  execute format('create table %I.%I (like %s including defaults including generated) partition by range (%I)',
-                 v_nsp, v_rel, v_defreg::text, p_control);
+  execute format('create table %I.%I (like %s including defaults including generated including storage) partition by range (%I)',
+                 v_nsp, v_rel, v_monreg::text, p_control);
   v_parent := format('%I.%I', v_nsp, v_rel)::regclass;
 
   -- 6. re-establish identity on the parent
@@ -808,19 +1001,20 @@ begin
     end loop;
   end if;
 
-  -- 7. attach the existing table as the DEFAULT partition
-  execute format('alter table %s attach partition %s default', v_parent::text, v_defreg::text);
+  -- 7. attach the original as the bounded MONOLITH child (metadata-only via the validated CHECK), then
+  -- drop the now-redundant CHECK (the partition bound enforces it).
+  execute format('alter table %s attach partition %s for values from (%L) to (%L)',
+                 v_parent::text, v_monreg::text,
+                 pgpm._encode(p_control_kind, v_lo_native), pgpm._encode(p_control_kind, v_hi_native));
+  execute format('alter table %s drop constraint pgpm_monolith_bound', v_monreg::text);
 
-  -- 8. parent PRIMARY KEY -- reuses the default's promoted PK index (no rebuild)
+  -- 8. parent PRIMARY KEY -- reuses the monolith's promoted PK index (no rebuild)
   if v_pkcols is not null then
     execute format('alter table %s add primary key (%s)', v_parent::text,
                    (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
   end if;
 
-  -- 8b. advance each identity sequence past the largest existing value -- using the max captured
-  -- up front (index lookup), NOT a fresh max() here (which would seq-scan the default now that the
-  -- id-leading index is gone). The parent's identity sequence was freshly created in step 6, so
-  -- this advance is REQUIRED: without it the next insert would collide at id = 1.
+  -- 8b. advance each identity sequence past the largest existing value (captured up front: index lookup).
   if v_idcols is not null then
     for v_i in 1 .. array_length(v_idcols, 1) loop
       execute format('select setval(pg_get_serial_sequence(%L, %L), %s, false)',
@@ -828,13 +1022,7 @@ begin
     end loop;
   end if;
 
-  -- 9. keep autovacuum ahead on the default during the drain
-  execute format('alter table %s set ('
-              || 'autovacuum_vacuum_scale_factor = 0.0, autovacuum_vacuum_threshold = 1000, '
-              || 'autovacuum_analyze_scale_factor = 0.0, autovacuum_analyze_threshold = 1000, '
-              || 'autovacuum_vacuum_cost_limit = 2000, autovacuum_vacuum_cost_delay = 2)', v_defreg::text);
-
-  -- 9b. recreate secondary indexes as partitioned indexes, attaching the default's
+  -- 9b. recreate secondary indexes as partitioned indexes, attaching the monolith's
   if v_idx_names is not null then
     for j in 1 .. array_length(v_idx_names, 1) loop
       v_old  := v_idx_names[j]::name;
@@ -845,6 +1033,12 @@ begin
       execute format('alter index %I.%I attach partition %I.%I', v_nsp, v_new, v_nsp, v_old);
     end loop;
   end if;
+
+  -- 9c. create a fresh EMPTY default LAST as the leading-edge safety net (REDESIGN.md section 3). Created
+  -- after the parent's PK and secondary indexes exist, it auto-inherits matching (empty) indexes. Kept
+  -- empty, it keeps obtain on its cheap plain path; the janitor drain evacuates any stray that lands here.
+  execute format('create table %I.%I partition of %I.%I default', v_nsp, v_default, v_nsp, v_rel);
+  v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
 
   -- 10. register
   insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
@@ -860,6 +1054,11 @@ begin
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
 
+  -- record the original table, now the bounded MONOLITH coarse child, as an attached partition
+  -- (REDESIGN.md section 7) so obtain's overlap check and status() see it.
+  insert into pgpm.part (parent_table, child_name, lo, hi, attached)
+    values (v_parent, v_monolith, v_lo_native, v_hi_native, true);
+
   -- record any dropped incoming FKs (the recorded definition already names the new parent); these are
   -- always preserve-managed now, re-added by restore_incoming_fks once the drain is idle.
   for v_e in select value from jsonb_array_elements(v_dropped) loop
@@ -868,15 +1067,11 @@ begin
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
-  -- NOTE: obtain is intentionally NOT run inside transmute. It attaches future partitions,
-  -- and attaching a partition to a parent whose DEFAULT already holds data makes Postgres
-  -- scan the default -- which, inside this ACCESS EXCLUSIVE transaction, blocks ALL access
-  -- for the whole scan (O(default), minutes on a large table). transmute() therefore does the
-  -- metadata-only cutover ONLY (a fresh parent with just the DEFAULT attached scans nothing),
-  -- so it stays online even at scale. Run pgpm.obtain(parent) (or pgpm.maintain, or the
-  -- scheduled maintenance job) AFTER transmute to build the future partitions online -- its
-  -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until obtain
-  -- runs, new writes route to the DEFAULT (correct, just not yet split into future cells).
+  -- NOTE: obtain is intentionally NOT run inside transmute. The cutover above is the online work (one
+  -- SHARE UPDATE EXCLUSIVE validate scan, then a brief metadata-only ACCESS EXCLUSIVE rename and attach).
+  -- Run pgpm.obtain(parent) (or pgpm.maintain, or the scheduled job) AFTER transmute to build the forward
+  -- partitions; with an EMPTY default, obtain takes the cheap plain path (no scan). Until the frontier
+  -- crosses B, live writes land in the monolith (the current interval lives there too).
   return v_parent;
 end;
 $$;
@@ -942,8 +1137,9 @@ $$;
 create or replace function pgpm.untransmute(p_parent regclass)
 returns regclass language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_defreg regclass; v_restored regclass;
-  v_nreal int; v_idcols name[]; v_idmax bigint[]; v_col name; v_m bigint; v_i int;
+  cfg pgpm.config; v_nsp name; v_rel name; v_monreg regclass; v_restored regclass;
+  v_mon name; v_mon_lo text; v_mon_hi text; v_ncast text; v_outside boolean;
+  v_idcols name[]; v_idmax bigint[]; v_col name; v_m bigint; v_i int;
   r pgpm.dropped_fk%rowtype;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -953,21 +1149,31 @@ begin
 
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_defreg := format('%I.%I', v_nsp, cfg.default_table)::regclass;
+  v_ncast := pgpm._native_type(cfg.control_kind);
 
-  -- THE GATE: reversible only while the DEFAULT is the sole partition. Any other attached child means
-  -- obtain/maintenance has run, live writes have begun routing into real partitions (and the drain may
-  -- have moved rows out of the DEFAULT), so the DEFAULT no longer holds the whole table. One-way door.
-  select count(*) into v_nreal
-    from pg_inherits where inhparent = p_parent and inhrelid <> v_defreg;
-  if v_nreal > 0 then
-    raise exception 'pg_partition_magician: cannot untransmute % -- % real partition(s) already exist, so the DEFAULT no longer holds the whole table. Reversal is only possible before maintenance/obtain runs; this is a one-way door once draining begins.',
-      p_parent, v_nreal;
+  -- THE GATE (REDESIGN.md section 13): a clean (metadata-only) reverse needs the original table still
+  -- intact as the MONOLITH, holding the whole table, with nothing landed outside it. The monolith is the
+  -- attached partition with the smallest lo (it starts at grid_floor(min(control)), strictly below B,
+  -- while every forward partition starts at B or higher). The reverse is a one-way door once any row
+  -- lives outside the monolith's [lo, hi): a forward partition after the frontier crosses B, a backdated
+  -- stray in the DEFAULT, or finer children from a refinement (Tier 2 foldback / Tier 3 merge not built).
+  execute format('select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached order by lo::%s asc limit 1',
+                 p_parent::text, v_ncast) into v_mon, v_mon_lo, v_mon_hi;
+  if v_mon is null then
+    raise exception 'pg_partition_magician: cannot untransmute % -- no managed partition found', p_parent;
+  end if;
+  v_monreg := format('%I.%I', v_nsp, v_mon)::regclass;
+  execute format('select exists (select 1 from %s where %I >= %L or %I < %L)',
+                 p_parent::text, cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_hi),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_lo)) into v_outside;
+  if v_outside then
+    raise exception 'pg_partition_magician: cannot untransmute % -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a refinement has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or refinement begins.',
+      p_parent;
   end if;
 
   -- capture the identity columns and their current max BEFORE dropping anything (transmute moved
   -- identity from the table to the parent; dropping the parent loses it, so we re-establish it on the
-  -- restored table). The max is an index lookup (the PK is intact), not a seq-scan.
+  -- restored monolith). The max is an index lookup (the PK is intact), not a seq-scan.
   select array_agg(a.attname order by a.attnum) into v_idcols
     from pg_attribute a where a.attrelid = p_parent and a.attidentity in ('a', 'd') and not a.attisdropped;
   if v_idcols is not null then
@@ -979,40 +1185,33 @@ begin
 
   -- preserved incoming FKs: drop any currently LIVE on the parent so the parent can be dropped (an
   -- incoming FK is a constraint on the referencing table pointing AT the parent). All recorded FKs are
-  -- re-added against the restored table at the end. Under the gate maintenance has not run, so these
-  -- are all still in the DROPPED state and this loop is a no-op -- it is here for robustness.
+  -- re-added against the restored table at the end.
   for r in select * from pgpm.dropped_fk
             where parent_table = p_parent and restored_at is not null order by id loop
     execute format('alter table %s drop constraint %I', r.referencing_table::text, r.constraint_name);
   end loop;
 
-  -- detach the DEFAULT (now a standalone table again, PK + secondary indexes intact), then drop the
-  -- childless parent (which takes the parent PK, the partitioned _pgpm indexes, and the parent's
-  -- identity sequence with it). DETACH FIRST: dropping a partitioned parent cascades to its
-  -- partitions, which would destroy the data.
-  execute format('alter table %s detach partition %s', p_parent::text, v_defreg::text);
+  -- detach the MONOLITH (the original table, holding everything; PK + secondary indexes intact), then
+  -- drop the childless parent -- which cascades the empty DEFAULT and any empty forward partitions, and
+  -- takes the parent PK, the partitioned _pgpm indexes, and the parent's identity sequence with it.
+  -- DETACH FIRST: dropping a partitioned parent cascades to its partitions, which would destroy the data.
+  execute format('alter table %s detach partition %s', p_parent::text, v_monreg::text);
   execute format('drop table %s', p_parent::text);
 
-  -- re-establish identity on the restored table and reseed past the captured max (mirrors transmute's
+  -- re-establish identity on the restored monolith and reseed past the captured max (mirrors transmute's
   -- step 6/8b, applied back to the table); without the reseed the next insert would collide at 1.
   if v_idcols is not null then
     for v_i in 1 .. array_length(v_idcols, 1) loop
       execute format('alter table %s alter column %I add generated by default as identity',
-                     v_defreg::text, v_idcols[v_i]);
+                     v_monreg::text, v_idcols[v_i]);
       execute format('select setval(pg_get_serial_sequence(%L, %L), %s, false)',
-                     v_defreg::text, v_idcols[v_i], v_idmax[v_i] + 1);
+                     v_monreg::text, v_idcols[v_i], v_idmax[v_i] + 1);
     end loop;
   end if;
 
-  -- reset the autovacuum knobs transmute set on the DEFAULT to keep the drain ahead.
-  execute format('alter table %s reset ('
-              || 'autovacuum_vacuum_scale_factor, autovacuum_vacuum_threshold, '
-              || 'autovacuum_analyze_scale_factor, autovacuum_analyze_threshold, '
-              || 'autovacuum_vacuum_cost_limit, autovacuum_vacuum_cost_delay)', v_defreg::text);
-
-  -- rename the DEFAULT back to the original table name. (transmute never renamed the kept PK or
+  -- rename the monolith back to the original table name. (transmute never renamed the kept PK or
   -- secondary indexes, so those names are already the originals.)
-  execute format('alter table %s rename to %I', v_defreg::text, v_rel);
+  execute format('alter table %s rename to %I', v_monreg::text, v_rel);
   v_restored := format('%I.%I', v_nsp, v_rel)::regclass;
 
   -- re-add every preserved incoming FK against the restored table. The recorded definition names the
@@ -1543,16 +1742,20 @@ $$;
 -- drain, a standing value if the drain never finishes); fks_unvalidated = FKs re-added NOT VALID
 -- (enforcing new writes) but blocked from full validation by pre-existing orphans (see
 -- incoming_fk_orphans() / validate_incoming_fks()).
+-- dropped/recreated (not CREATE OR REPLACE) because the redesign widens the return shape with
+-- coarse_partitions + history_unrefined (REDESIGN.md section 14).
+drop function if exists pgpm.status();
 create or replace function pgpm.status()
 returns table (
   parent regclass, control_kind text, partition_step text, obtain int, retain text,
-  paused boolean, n_partitions bigint, inflight_partitions bigint, default_rows bigint, closed_rows bigint,
+  paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
+  default_rows bigint, closed_rows bigint,
   default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint,
-  fks_suspended bigint, fks_unvalidated bigint
+  fks_suspended bigint, fks_unvalidated bigint, history_unrefined boolean
 )
 language plpgsql as $$
 declare
-  r pgpm.config; v_nsp name; v_np bigint; v_inflight bigint; v_new text;
+  r pgpm.config; v_nsp name; v_np bigint; v_coarse bigint; v_inflight bigint; v_new text;
   v_drows bigint; v_closed bigint; v_old text;
   v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
   v_fks_susp bigint; v_fks_unval bigint;
@@ -1562,9 +1765,14 @@ begin
     -- backlog via the canonical check_default: default_rows (total), closed_rows (drainable now), oldest
     select cd.default_rows, cd.closed_rows, cd.oldest into v_drows, v_closed, v_old
       from pgpm.check_default(r.parent_table) cd;
-    -- n_partitions counts attached (real) partitions; inflight_partitions the not-yet-attached drain children
-    select count(*) filter (where attached), count(*) filter (where not attached)
-      into v_np, v_inflight from pgpm.part where parent_table = r.parent_table;
+    -- n_partitions = attached (real) partitions; coarse_partitions = the un-refined coarse children (a
+    -- wider-than-one-step range, REDESIGN.md section 14) -- the refinement backlog; inflight = the
+    -- not-yet-attached drain/refine children.
+    select count(*) filter (where attached),
+           count(*) filter (where attached
+                            and pgpm._native_gt(r.control_kind, hi, pgpm._grid_next(r.control_kind, r.partition_step, lo))),
+           count(*) filter (where not attached)
+      into v_np, v_coarse, v_inflight from pgpm.part where parent_table = r.parent_table;
     execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',
                    pgpm._native_type(r.control_kind), r.parent_table::text) into v_new;
     -- drain progress vs stall, from the append-only log. drain_skips counts deferrals logged AFTER the
@@ -1581,7 +1789,7 @@ begin
       from pgpm.dropped_fk where parent_table = r.parent_table;
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
-    inflight_partitions := v_inflight;
+    coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unrefined := v_coarse > 0;
     default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
     last_drained := v_last_drained; drain_skips := v_skips;
     fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval;

@@ -1,8 +1,7 @@
--- Regression test for issue #92. pgpm.status() surfaces the drainable backlog (closed_rows) and a
--- stall signal (last_drained + drain_skips), so a WEDGED drain -- closed_rows stuck > 0, no recent
--- progress, climbing drain_skips -- is distinguishable from a merely slow one (closed_rows falling,
--- drain_skips ~0). Before this, status() showed only default_rows (open + closed), so the two looked
--- identical.
+-- Regression test for issue #92, in the monolith model. pgpm.status() surfaces the assistant drain's
+-- backlog (closed_rows -- strays awaiting evacuation) and a stall signal (last_drained + drain_skips),
+-- so a WEDGED drain (closed_rows stuck > 0, no recent progress, climbing drain_skips) is distinguishable
+-- from a merely slow one. The backlog here is a closed STRAY interval in the otherwise-empty DEFAULT.
 create extension if not exists pgtap;
 
 begin;
@@ -14,15 +13,13 @@ create table public.s_t (
   body       text,
   primary key (created_at, id)
 );
--- a closed tail (two past months, 20 rows) plus 5 rows in the current (open) interval
+insert into public.s_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 5) g;  -- recent -> monolith
+select pgpm.transmute('public.s_t', 'created_at', interval '1 month', p_paused => false);
+select pgpm.obtain('public.s_t');
+-- a closed stray backlog in the DEFAULT (two past months, 20 rows); the recent rows are in the monolith
 insert into public.s_t (created_at, body)
   select date_trunc('month', now()) - make_interval(months => m) + interval '10 days', 'x'
   from generate_series(1, 2) m, generate_series(1, 10) g;
-insert into public.s_t (created_at, body)
-  select now(), 'x' from generate_series(1, 5) g;
-
-select pgpm.transmute('public.s_t', 'created_at', interval '1 month', p_paused => false);
-select pgpm.obtain('public.s_t');
 
 -- (1) closed_rows is surfaced and matches the canonical check_default backlog
 select is(
@@ -30,10 +27,10 @@ select is(
   (select closed_rows from pgpm.check_default('public.s_t')),
   'status() surfaces closed_rows, matching check_default');
 
--- (2) there is a drainable backlog before draining (the open-interval rows are NOT counted)
+-- (2) there is a drainable stray backlog before draining
 select cmp_ok(
   (select closed_rows from pgpm.status() where parent = 'public.s_t'::regclass),
-  '>', 0::bigint, 'closed_rows shows the drainable backlog before draining');
+  '>', 0::bigint, 'closed_rows shows the drainable stray backlog before draining');
 
 -- (3) no progress yet -> last_drained is null
 select ok(
@@ -56,8 +53,7 @@ select is(
   (select closed_rows from pgpm.status() where parent = 'public.s_t'::regclass),
   0::bigint, 'after draining, closed_rows is 0 (caught up)');
 
--- (6) progress reset the stall signal: the earlier skip predates the last progress (lower log id),
---     so drain_skips is 0 again -- "done", not "stalled"
+-- (6) progress reset the stall signal: the earlier skip predates the last progress (lower log id)
 select is(
   (select drain_skips from pgpm.status() where parent = 'public.s_t'::regclass),
   0::bigint, 'drain_skips resets to 0 once the drain makes progress');
