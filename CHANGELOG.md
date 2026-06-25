@@ -11,14 +11,30 @@
   rename/attach. The historical bulk no longer drains row-by-row; it stays in the monolith until
   **`refine()`** splits it into proper partitions by **copying** (no dead tuples, no vacuum), atomically
   (synchronous `refine` / `refine_history`) or paced across maintenance ticks (`set_refine` auto-refine,
-  budget-feathered like the drain). Refine is retention-aware (below-horizon sub-ranges are reclaimed, not
+  budget-feathered like the drain). Refine is retention-aware (below-horizon sub-ranges are skipped, not
   materialized) and optional (a coarse monolith is a correct, permanent state). The drain is demoted to the
   **assistant**: it keeps the empty `DEFAULT` empty by evacuating strays, so `obtain` takes a cheap
   scan-free attach. `status()` gains `coarse_partitions` and `history_unrefined` (the refinement backlog);
   `untransmute`'s gate is now monolith/data-based (reversible until a row lands outside the monolith or
-  refinement begins); `maintain` suspends preserve-managed incoming FKs around a cross-tick refine, the
-  same leash it uses for the drain. Partitions wider than one step are named `_p<lo>_to_<hi>`.
-  (PRs #116-#119, #123; tests/42-47; REDESIGN.md)
+  refinement begins); `maintain` suspends preserve-managed incoming FKs around the drain's row movement (a
+  copy-`refine` needs no such leash; its swap handles the FK atomically -- see the refine-copy fix below).
+  Partitions wider than one step are named `_p<lo>_to_<hi>`. (PRs #116-#119, #123; tests/42-47; REDESIGN.md)
+- **`refine` copies instead of moving (correctness fix for the redesign above).** The first implementation
+  of `refine_step` was inadvertently a clone of the drain: it `DELETE`d rows out of the coarse source and
+  re-`INSERT`ed them into unattached children, contradicting the design's *copy, never delete*. That bloated
+  the source with dead tuples and reopened the `snapshot()` read gap that copy-then-swap exists to avoid --
+  a paced auto-refine **undercounted** the parent mid-refine. `refine_step` now **copies** each frozen
+  sub-range into a standalone born-validated child (budget-sized anti-join `INSERT`s resumed from the
+  child's high-water mark, progress tracked across ticks by a new `config.refine_cursor`) and **skips**
+  below-horizon sub-ranges without deleting (discarded with the source at the swap); the source stays whole
+  and **attached** until one atomic swap, so a read of the parent is never short. Three consequences follow
+  from the source staying attached: `snapshot()` no longer unions a refine's copy-children (their rows are
+  still in the monolith, so it would double-count); `restore_incoming_fks` no longer counts them as in-flight
+  drain children; and `maintain` no longer suspends an incoming FK for a refine. The multi-tick copy needs no
+  FK leash -- only the swap's `DETACH` does (Postgres refuses to detach a partition whose rows are still
+  referenced), so the swap transiently drops and re-adds the FK within its one atomic transaction (no visible
+  RI window, unlike the drain's). Log actions are `refine_copy` / `refine_aged` (were `refine_move` /
+  `refine_reclaim`). (PR #128; new tests/48, tests/47 rewritten, tests/07/45/46 updated)
 - **Docs rewritten for the monolith model; `DESIGN.md` retired.** The reference, guide, README, and runbook
   are rewritten from scratch against the current API; `REDESIGN.md` is now the canonical design note (the
   original `DESIGN.md`'s enduring supply/demand operating model is folded into it) and `DESIGN.md` is
