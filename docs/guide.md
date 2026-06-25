@@ -384,11 +384,11 @@ then closes), `maintain` suspends the FK before draining (`pgpm.suspend_incoming
 afterward. Referential actions, `DEFERRABLE`-ness, and self-referential FKs are all preserved across the
 cycle.
 
-> Note on auto-refine and preserve FKs: a cross-tick refine moves historical referenced rows the same way
-> the drain does, so the same leash should apply. If you run auto-refine on a table with a live
-> preserve-managed FK over the refined span, prefer refining by hand with the synchronous `refine()` (one
-> atomic transaction, no RI window), or keep the FK suspended (`pause`/`drain_all`-window) until the
-> refine completes.
+Auto-refine applies the same leash. A cross-tick refine moves historical referenced rows just as the
+drain does, so before it starts `maintain` suspends a live preserve-managed FK (RI off, surfaced by
+`status().fks_suspended`) and re-adds it once the refine has swapped in its fine children -- a referenced
+row is never left dangling mid-move. The synchronous `refine()` runs in one transaction and never opens an
+RI window at all.
 
 ## Secondary indexes
 
