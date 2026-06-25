@@ -24,8 +24,8 @@ select is(
   3, 'retention-aware refine materializes only the 3 within-horizon sub-ranges [30000, 60000)');
 
 select is(
-  (select count(*)::int from pgpm.log where parent_table = 'public.rt7'::regclass and action = 'refine_reclaim'),
-  3, 'the 3 below-horizon sub-ranges are reclaimed (logged refine_reclaim), never materialized');
+  (select count(distinct lo)::int from pgpm.log where parent_table = 'public.rt7'::regclass and action = 'refine_reclaim'),
+  3, 'the 3 below-horizon sub-ranges are reclaimed (logged refine_reclaim, microbatched), never materialized');
 
 select is(
   (select count(*)::int from public.rt7 where id < 30000),

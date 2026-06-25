@@ -110,6 +110,9 @@ alter table pgpm.config add column if not exists drain_ambient_baseline numeric;
 alter table pgpm.config add column if not exists drain_ambient_io_baseline numeric;
 alter table pgpm.config add column if not exists drain_io_read_time numeric;
 alter table pgpm.config add column if not exists drain_io_blks_read bigint;
+-- auto-refine (REDESIGN.md section 12): when set, maintenance feathers the oldest frozen coarse child
+-- toward this target step, one budget-sized microbatch per tick. null = off (refine is operator-driven).
+alter table pgpm.config add column if not exists refine_to text;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -608,41 +611,41 @@ $$;
 
 -- ============================== refine ==============================
 
--- refine(): split a FROZEN coarse child (the monolith, or a coarser child from a prior pass) into finer
--- children. It MOVES the rows into standalone children in budget-sized microbatches and swaps them in
--- for the coarse child in one transaction, then DROPs the now-empty source. The kept children only ever
--- receive inserts, so the product has no bloat; the source's delete churn is discarded with the DROP
--- (REDESIGN.md section 10). The costs are transient ~2x disk for the child being refined and the
--- one-time copy I/O. Preconditions, refused rather than improvised: the child is FROZEN (its whole range at/below
--- the current grid floor, so the copy is a consistent snapshot -- the monolith freezes once the frontier
--- crosses B), the target step SUBDIVIDES it, and the DEFAULT holds no rows inside its range (a stray there
--- is the assistant drain's job first). Returns the number of fine children created. Retention-aware: when
--- a retention policy is set, sub-ranges entirely below the horizon are NOT materialized (they would be
--- dropped by retain() the moment they appeared) -- they are skipped and reclaimed when the coarse source
--- is dropped, mirroring the drain's retain_reclaim (issue #91). p_target_step defaults to the configured
--- partition_step (the finest grid); the hierarchical monolith -> coarse -> fine path is just repeated
--- calls with chosen steps. The swap takes a brief ACCESS EXCLUSIVE on the parent (small N
--- children, all metadata-only attaches); a caller that must stay unnoticeable bounds it with a short
--- lock_timeout and retries. The move is budget-sized (drain_batch, capped by drain_max_blocks), so a wide
--- sub-range never becomes one giant statement. The whole call is one transaction here, so atomic and
--- gap-free; cross-tick adaptive PACING (true unnoticeable feathering) rides on the maintain-driven
--- auto-refine policy, REDESIGN.md section 12.
-create or replace function pgpm.refine(p_parent regclass, p_child name, p_target_step text default null)
-returns int language plpgsql as $$
+-- refine splits a FROZEN coarse child (the monolith, or a coarser child from a prior pass) into finer
+-- children, by MOVING the rows into standalone children in budget-sized microbatches and swapping them in
+-- for the coarse child, then DROPping the now-empty source. The kept children only ever receive inserts,
+-- so the product has no bloat; the source's delete churn is discarded with the DROP (REDESIGN.md sec 10).
+-- Retention-aware: a sub-range entirely below the retention horizon is reclaimed (deleted from the source,
+-- never materialized), mirroring the drain's retain_reclaim (issue #91).
+--
+-- The work is a series of resumable microbatches (refine_step): the state is the SHRINKING coarse child
+-- plus the accumulating not-yet-attached fine children, exactly like the drain's shrinking DEFAULT.
+-- refine() loops refine_step in ONE transaction (atomic, gap-free) -- the operator's "do it now".
+-- maintain() calls refine_step ONCE per tick when auto-refine is on (REDESIGN.md sec 12), feathering the
+-- move under the live workload across ticks, at the cost of a transient snapshot()-covered gap (the moved
+-- rows live in the not-yet-attached fine children mid-refine).
+
+-- one resumable microbatch of refine work on coarse child p_child toward target step p_target_step.
+-- Returns: 'moved:N' (moved N within-horizon rows into a fine child), 'reclaimed:N' (deleted N
+-- below-horizon rows from the source), 'swapped:K' (source emptied -> detached it, attached K fine
+-- children, dropped it: refine done), or a soft no-progress status ('active' = not frozen yet,
+-- 'default_dirty' = a stray sits in the range, 'nosubdiv' = the step does not subdivide, 'idle').
+create or replace function pgpm.refine_step(
+  p_parent regclass, p_child name, p_target_step text default null, p_batch int default null
+) returns text language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols text;
-  v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean;
-  v_sub_lo text; v_sub_hi text; v_sub_name name; v_made int := 0;
-  v_fine name[] := '{}'; v_fine_lo text[] := '{}'; v_fine_hi text[] := '{}'; i int;
-  v_retain_boundary text; v_reclaimed int := 0;
-  v_batch int; v_lo_lit text; v_hi_lit text; v_moved bigint; v_more boolean;
-  v_reltuples real; v_avg numeric;
+  cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols text; v_ncast text;
+  v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean; v_empty boolean;
+  v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
+  v_min_raw text; v_min text; v_sub_lo text; v_sub_hi text; v_sub_name name;
+  v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean := false; v_made int := 0; r record;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_step := coalesce(p_target_step, cfg.partition_step);
+  v_ncast := pgpm._native_type(cfg.control_kind);
+  v_step  := coalesce(p_target_step, cfg.partition_step);
 
   select lo, hi into v_lo, v_hi from pgpm.part
    where parent_table = p_parent and child_name = p_child and attached;
@@ -650,19 +653,25 @@ begin
     raise exception 'pg_partition_magician: % is not an attached managed partition of %', p_child, p_parent;
   end if;
   v_child := format('%I.%I', v_nsp, p_child)::regclass;
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
 
-  -- PRECONDITION 1: frozen. The whole range must be at/below the current grid floor, so no live write
-  -- still lands in it and the copy is a consistent snapshot.
+  -- frozen? (whole range at/below the current grid floor, so no live write still lands in it)
   v_frontier := pgpm._frontier_native(p_parent);
   v_floor    := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
-  if pgpm._native_gt(cfg.control_kind, v_hi, v_floor) then
-    raise exception 'pg_partition_magician: cannot refine % -- it is still active (upper bound % is above the current grid floor %); wait until the frontier passes its upper bound',
-      p_child, v_hi, v_floor;
+  if pgpm._native_gt(cfg.control_kind, v_hi, v_floor) then return 'active'; end if;
+  -- the target step must actually subdivide the child
+  if not pgpm._native_gt(cfg.control_kind, v_hi, pgpm._grid_next(cfg.control_kind, v_step, v_lo)) then
+    return 'nosubdiv';
   end if;
+  -- the DEFAULT must hold no rows inside the range (else a fine-child ATTACH at the swap would fail) --
+  -- a stray there is the assistant drain's job first
+  execute format('select exists (select 1 from %I.%I where %I >= %L and %I < %L)',
+                 v_nsp, cfg.default_table, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, v_hi)) into v_has;
+  if v_has then return 'default_dirty'; end if;
 
-  -- retention horizon (matches retain() and the drain's retain_reclaim, issue #91): a sub-range entirely
-  -- below it would be dropped by retain() the moment it materialized, so refine SKIPS it instead of
-  -- copying it into a doomed partition -- its rows are reclaimed when the coarse source is dropped.
+  -- retention horizon (matches retain() and the drain's retain_reclaim, issue #91)
   if cfg.retain is not null then
     if cfg.control_kind = 'id'
       then v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
@@ -672,120 +681,111 @@ begin
     end if;
   end if;
 
-  -- PRECONDITION 2: the target step must actually subdivide the child.
-  if not pgpm._native_gt(cfg.control_kind, v_hi, pgpm._grid_next(cfg.control_kind, v_step, v_lo)) then
-    raise exception 'pg_partition_magician: cannot refine % -- target step % does not subdivide [%, %)',
-      p_child, v_step, v_lo, v_hi;
-  end if;
-
-  -- PRECONDITION 3: the DEFAULT must hold no rows inside the child's range (else a sub-child ATTACH would
-  -- fail because the DEFAULT still owns rows there).
-  execute format('select exists (select 1 from %I.%I where %I >= %L and %I < %L)',
-                 v_nsp, cfg.default_table, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo),
-                 cfg.control_column, pgpm._encode(cfg.control_kind, v_hi)) into v_has;
-  if v_has then
-    raise exception 'pg_partition_magician: cannot refine % -- the DEFAULT holds rows inside its range; drain them first', p_child;
-  end if;
-
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
-    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
-
-  -- microbatch budget (rows per move), reusing the drain's row + block budget so a wide-row sub-range
-  -- can't become one giant statement (issue #93). drain_batch is the row cap; drain_max_blocks (if set)
-  -- caps heap+TOAST blocks, translated to a row limit via the coarse child's avg bytes/row (or a
-  -- pg_column_size sample when it has no stats), whichever is smaller.
-  v_batch := coalesce(cfg.drain_batch, 5000);
+  -- budget (rows per microbatch): drain_batch, capped by drain_max_blocks via the coarse child's stats
+  v_batch := coalesce(p_batch, cfg.drain_batch, 5000);
   if cfg.drain_max_blocks is not null then
     select c.reltuples into v_reltuples from pg_class c where c.oid = v_child;
-    if coalesce(v_reltuples, 0) > 0 then
-      v_avg := pg_table_size(v_child)::numeric / v_reltuples;
-    else
-      execute format('select avg(pg_column_size(t))::numeric from (select * from %s limit 1000) t', v_child::text)
-        into v_avg;
+    if coalesce(v_reltuples, 0) > 0 then v_avg := pg_table_size(v_child)::numeric / v_reltuples;
+    else execute format('select avg(pg_column_size(t))::numeric from (select * from %s limit 1000) t', v_child::text) into v_avg;
     end if;
     if coalesce(v_avg, 0) > 0 then
       v_batch := least(v_batch, greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int);
     end if;
   end if;
 
-  -- 1. build the fine sub-ranges as STANDALONE children, each born with its validated bound CHECK, and
-  -- MOVE the matching rows in, in budget-sized microbatches (feathered). The source's deleted rows are
-  -- churn on a table that is dropped at the swap; the kept children only ever receive inserts, so the
-  -- product has no bloat. (The whole call is one transaction here, hence atomic and gap-free; a
-  -- maintain-driven auto-refine -- REDESIGN.md section 12 -- would call these microbatches across ticks
-  -- for true unnoticeable pacing, at the cost of a transient snapshot()-covered gap.)
-  v_sub_lo := v_lo;
-  loop
-    exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_sub_lo);
+  -- one microbatch: process the source's current MIN sub-range, so the source shrinks toward empty (the
+  -- below-horizon ranges, lowest in control order, are reclaimed first; then within-horizon ranges move).
+  execute format('select t.%I::text from %s t order by t.%I asc limit 1',
+                 cfg.control_column, v_child::text, cfg.control_column) into v_min_raw;
+  if v_min_raw is not null then
+    v_min    := pgpm._decode(cfg.control_kind, v_min_raw);
+    v_sub_lo := pgpm._grid_floor(cfg.control_kind, v_step, cfg.partition_anchor, v_min);
+    if pgpm._native_gt(cfg.control_kind, v_lo, v_sub_lo) then v_sub_lo := v_lo; end if;   -- clamp to coarse lo
     v_sub_hi := pgpm._grid_next(cfg.control_kind, v_step, v_sub_lo);
-    if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;   -- clamp last
-    -- retention-aware: skip a sub-range entirely below the horizon (hi <= boundary). Don't materialize it
-    -- -- its rows are reclaimed when the coarse source is dropped at the swap (no copy, no doomed cell).
-    if v_retain_boundary is not null and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary) then
-      insert into pgpm.log (parent_table, action, lo, hi, method)
-        values (p_parent, 'refine_reclaim', v_sub_lo, v_sub_hi, 'copy_skip');
-      v_reclaimed := v_reclaimed + 1;
-      v_sub_lo := v_sub_hi;
-      continue;
-    end if;
-    v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
-    execute format('create table %I.%I (like %I.%I including defaults including storage including indexes including constraints excluding identity)',
-                   v_nsp, v_sub_name, v_nsp, v_rel);
-    execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
-                   v_nsp, v_sub_name, (v_sub_name || '_ck'),
-                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_lo),
-                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_hi));
-    insert into pgpm.part (parent_table, child_name, lo, hi, attached)
-      values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false) on conflict (parent_table, child_name) do nothing;
-    -- move the sub-range in budget-sized microbatches (delete-returning-insert, ORDER BY the control
-    -- column so each batch is an index scan of exactly v_batch rows, like drain_step).
+    if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;   -- clamp to coarse hi
     v_lo_lit := pgpm._encode(cfg.control_kind, v_sub_lo);
     v_hi_lit := pgpm._encode(cfg.control_kind, v_sub_hi);
-    loop
+    v_aged   := v_retain_boundary is not null and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary);
+
+    if v_aged then
+      -- reclaim: delete a microbatch of the below-horizon sub-range from the source (never materialized)
+      execute format('delete from %1$s where ctid in (select ctid from %1$s where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)',
+                     v_child::text, cfg.control_column, v_lo_lit, v_hi_lit, v_batch);
+      get diagnostics v_moved = row_count;
+      insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'refine_reclaim', v_sub_lo, v_sub_hi, v_moved);
+    else
+      -- ensure the fine child exists (standalone, born with its validated bound CHECK), move a microbatch in
+      v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
+      if to_regclass(format('%I.%I', v_nsp, v_sub_name)) is null then
+        execute format('create table %I.%I (like %I.%I including defaults including storage including indexes including constraints excluding identity)',
+                       v_nsp, v_sub_name, v_nsp, v_rel);
+        execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
+                       v_nsp, v_sub_name, (v_sub_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
+        insert into pgpm.part (parent_table, child_name, lo, hi, attached)
+          values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false) on conflict (parent_table, child_name) do nothing;
+      end if;
       execute format($f$
         with b as (
-          delete from %1$s where ctid in (select ctid from %1$s
-                           where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)
+          delete from %1$s where ctid in (select ctid from %1$s where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)
           returning %6$s
         )
         insert into %7$I.%8$I (%6$s) select %6$s from b
       $f$, v_child::text, cfg.control_column, v_lo_lit, v_hi_lit, v_batch, v_cols, v_nsp, v_sub_name);
       get diagnostics v_moved = row_count;
       insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'refine_move', v_sub_lo, v_sub_hi, v_moved);
-      execute format('select exists (select 1 from %s where %I >= %L and %I < %L)',
-                     v_child::text, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
-      exit when not v_more;
+    end if;
+  end if;
+
+  -- when the source is empty, swap: detach it, attach every not-yet-attached fine child within its range
+  -- (metadata-only via each child's validated CHECK), drop the source.
+  execute format('select not exists (select 1 from %s)', v_child::text) into v_empty;
+  if v_empty then
+    execute format('alter table %s detach partition %s', p_parent::text, v_child::text);
+    for r in execute format(
+      'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and not attached and lo::%s >= %L::%s and hi::%s <= %L::%s order by lo::%s',
+      p_parent::text, v_ncast, v_lo, v_ncast, v_ncast, v_hi, v_ncast, v_ncast)
+    loop
+      execute format('alter table %s attach partition %I.%I for values from (%L) to (%L)',
+                     p_parent::text, v_nsp, r.child_name,
+                     pgpm._encode(cfg.control_kind, r.lo), pgpm._encode(cfg.control_kind, r.hi));
+      execute format('alter table %I.%I drop constraint %I', v_nsp, r.child_name, (r.child_name || '_ck'));
+      update pgpm.part set attached = true where parent_table = p_parent and child_name = r.child_name;
+      insert into pgpm.log (parent_table, action, lo, hi, method) values (p_parent, 'refine_attach', r.lo, r.hi, 'check_skip');
+      v_made := v_made + 1;
     end loop;
-    v_fine    := array_append(v_fine, v_sub_name);
-    v_fine_lo := array_append(v_fine_lo, v_sub_lo);
-    v_fine_hi := array_append(v_fine_hi, v_sub_hi);
-    v_made    := v_made + 1;
-    v_sub_lo  := v_sub_hi;
-  end loop;
+    delete from pgpm.part where parent_table = p_parent and child_name = p_child;
+    execute format('drop table %s', v_child::text);
+    insert into pgpm.log (parent_table, action, lo, hi, rows, method) values (p_parent, 'refine', v_lo, v_hi, v_made, 'copy_swap_drop');
+    return 'swapped:' || v_made;
+  end if;
 
-  -- 2. the swap (atomic in this transaction): detach the coarse child, attach each fine child
-  -- (metadata-only -- the child's validated CHECK skips its scan, the empty DEFAULT scans trivially),
-  -- drop the now-redundant CHECK, flip it attached, and remove the coarse pgpm.part row.
-  execute format('alter table %s detach partition %s', p_parent::text, v_child::text);
-  for i in 1 .. v_made loop
-    execute format('alter table %s attach partition %I.%I for values from (%L) to (%L)',
-                   p_parent::text, v_nsp, v_fine[i],
-                   pgpm._encode(cfg.control_kind, v_fine_lo[i]), pgpm._encode(cfg.control_kind, v_fine_hi[i]));
-    execute format('alter table %I.%I drop constraint %I', v_nsp, v_fine[i], (v_fine[i] || '_ck'));
-    update pgpm.part set attached = true where parent_table = p_parent and child_name = v_fine[i];
-    insert into pgpm.log (parent_table, action, lo, hi, method)
-      values (p_parent, 'refine_attach', v_fine_lo[i], v_fine_hi[i], 'check_skip');
-  end loop;
-  delete from pgpm.part where parent_table = p_parent and child_name = p_child;
+  return case when v_min_raw is null then 'idle'
+              when v_aged then 'reclaimed:' || v_moved
+              else 'moved:' || v_moved end;
+end;
+$$;
 
-  -- 3. drop the now-vestigial coarse child -- COPY, not move, so just DROP (no DELETE, no dead tuples).
-  -- This also reclaims any below-horizon sub-ranges skipped above: their rows were never copied, so the
-  -- DROP is their retention reclaim (no materialize-then-drop churn).
-  execute format('drop table %s', v_child::text);
-  insert into pgpm.log (parent_table, action, lo, hi, rows, method)
-    values (p_parent, 'refine', v_lo, v_hi, v_made,
-            case when v_reclaimed > 0 then 'copy_swap_drop;reclaimed=' || v_reclaimed else 'copy_swap_drop' end);
-  return v_made;
+-- refine(): the synchronous "do it now" driver -- loops refine_step in ONE transaction (atomic, gap-free)
+-- until the coarse child is fully split, and returns the number of fine children created. Soft no-progress
+-- statuses become a hard error here (the operator gets a clear refusal); maintain() instead just skips.
+create or replace function pgpm.refine(p_parent regclass, p_child name, p_target_step text default null)
+returns int language plpgsql as $$
+declare v_status text; v_iter int := 0;
+begin
+  loop
+    v_status := pgpm.refine_step(p_parent, p_child, p_target_step, null);
+    if v_status like 'swapped:%' then return split_part(v_status, ':', 2)::int; end if;
+    if v_status in ('active', 'default_dirty', 'nosubdiv', 'idle') then
+      raise exception 'pg_partition_magician: cannot refine % -- %', p_child,
+        case v_status
+          when 'active' then 'it is still active (not frozen); wait until the frontier passes its upper bound'
+          when 'default_dirty' then 'the DEFAULT holds rows inside its range; drain them first'
+          when 'nosubdiv' then 'the target step does not subdivide its range'
+          else 'nothing to refine' end;
+    end if;
+    v_iter := v_iter + 1;
+    if v_iter > 10000000 then raise exception 'pg_partition_magician: refine safety limit'; end if;
+  end loop;
 end;
 $$;
 
@@ -1477,6 +1477,19 @@ begin
 end;
 $$;
 
+-- Operator switch for auto-refine (REDESIGN.md sec 12). p_target_step (an interval for time/uuidv7, a
+-- bigint step as text for id) turns it on: each maintenance tick feathers the oldest frozen coarse child
+-- one budget-sized microbatch toward that granularity. null turns it off (refine stays operator-driven via
+-- refine()/refine_history()). This only PACES refinement across ticks; refine_step enforces its own
+-- preconditions (frozen, default-clear), so enabling it is always safe.
+create or replace function pgpm.set_refine(p_parent regclass, p_target_step text default null)
+returns void language plpgsql as $$
+begin
+  update pgpm.config set refine_to = p_target_step where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+end;
+$$;
+
 -- pause/resume the scheduled lifecycle for one table. transmute registers a table paused by default
 -- (the deliberate two-step: convert, inspect, then go live), and maintenance is a no-op while paused.
 -- These are the first-class way to flip config.paused, so operators never hand-edit the catalog.
@@ -1507,6 +1520,7 @@ returns text language plpgsql as $$
 declare
   cfg pgpm.config;
   v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
+  v_refine text := 'skipped'; v_refine_child name;
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
   v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
@@ -1682,8 +1696,32 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
   end;
 
-  return format('obtained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s%s',
-                v_made, v_dropped, v_drain, v_suspended, v_restored, v_note);
+  -- Auto-refine (REDESIGN.md sec 12): when refine_to is set, feather the OLDEST frozen coarse child toward
+  -- that step, ONE budget-sized microbatch per tick, under the same adaptive budget (v_batch) as the drain.
+  -- Off by default (refine_to null). Isolated in its own subtransaction; a lock race or a soft status
+  -- ('active'/'default_dirty'/'nosubdiv') just retries next tick. The cross-tick move IS the unnoticeable
+  -- feathering -- it opens a transient snapshot()-covered gap while a coarse child is splitting.
+  if cfg.refine_to is not null then
+    begin
+      execute format(
+        'select child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached'
+        || ' and pgpm._native_gt(%L, p.hi, pgpm._grid_next(%L, %L, p.lo)) order by p.lo::%s asc limit 1',
+        p_parent::text, cfg.control_kind, cfg.control_kind, cfg.partition_step, pgpm._native_type(cfg.control_kind))
+        into v_refine_child;
+      if v_refine_child is null then
+        v_refine := 'none';
+      else
+        v_refine := pgpm.refine_step(p_parent, v_refine_child, cfg.refine_to, v_batch);
+      end if;
+    exception when others then
+      v_refine := 'deferred';
+      v_note := v_note || ' refine_deferred';
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'refine_skip', left(sqlerrm, 200));
+    end;
+  end if;
+
+  return format('obtained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s refine=%s%s',
+                v_made, v_dropped, v_drain, v_suspended, v_restored, v_refine, v_note);
 end;
 $$;
 
