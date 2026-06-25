@@ -4,7 +4,7 @@
 -- p_incoming_fks => 'preserve') records and DROPS the incoming FK so the drain can run (the drain
 -- moves rows through an unattached child, which a live NO ACTION FK would reject), then
 -- restore_incoming_fks() re-adds it verbatim against the new parent (NOT VALID + VALIDATE) once the
--- table is drained. The referencing table is never touched. See DESIGN.md section 8.
+-- table is drained. The referencing table is never touched. See REDESIGN.md.
 create extension if not exists pgtap;
 
 begin;

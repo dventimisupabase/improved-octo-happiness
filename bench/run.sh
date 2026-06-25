@@ -367,14 +367,14 @@ convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversio
 
 # 4. the single operator trigger: transmute() unpaused. pgpm takes it from here. No PK pre-build is
 # needed any more -- pgpm never rewrites the PK (the partition key leads the PK, so it is reused in
-# place), so the cutover is always metadata-only. See DESIGN.md section 8.
+# place), so the cutover is always metadata-only. See REDESIGN.md.
 echo "  firing pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', paused=>false)..."
 transmute_t0=$(q "select extract(epoch from clock_timestamp())")
 q "select pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_OBTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
 transmute_t1=$(q "select extract(epoch from clock_timestamp())")
 awk -v a="$transmute_t0" -v b="$transmute_t1" 'BEGIN{printf "  transmute() returned in %.1fs (metadata cutover)\n", b-a}'
 
-# 4b. adaptive feathering (DESIGN.md sec 8, mode 2): let the drain ride its budget against checkpoint
+# 4b. adaptive feathering (REDESIGN.md, mode 2): let the drain ride its budget against checkpoint
 #     pressure (AIMD) instead of the fixed drain_batch. BENCH_DRAIN_ADAPTIVE=0 keeps mode 1 (fixed).
 if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
   q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null

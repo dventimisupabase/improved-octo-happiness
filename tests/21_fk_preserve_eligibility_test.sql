@@ -1,7 +1,7 @@
 -- Incoming-FK preservation on the id happy path: since pgpm never rewrites the PK, the referenced
 -- unique key always survives, so several incoming FKs are all preserved and restored together. The
 -- companion case -- a table whose PK excludes the control column -- is refused before any FK handling
--- (pgpm does not partition it at all); we check that too. See DESIGN.md section 8.
+-- (pgpm does not partition it at all); we check that too. See REDESIGN.md.
 create extension if not exists pgtap;
 
 begin;

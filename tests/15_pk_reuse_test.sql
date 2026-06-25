@@ -1,7 +1,7 @@
 -- Covered-case PK reuse: partitioning a table on its own bigint id primary key must NOT
 -- drop and rebuild that primary key. The existing index already includes the partition key,
 -- so transmute reuses it in place (the one-time "setup" cost center collapses to zero). See
--- DESIGN.md section 8 ("reuse the existing PK when the partition key already covers it").
+-- REDESIGN.md ("reuse the existing PK when the partition key already covers it").
 create extension if not exists pgtap;
 
 begin;

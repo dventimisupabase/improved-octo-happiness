@@ -17,7 +17,7 @@ create table if not exists bench.events (
   kind       smallint not null,
   payload    text     not null,
   -- the partition key (created_at) is part of the PK, so pgpm reuses it in place at transmute (no PK
-  -- rewrite; see DESIGN.md section 8). A bare id PK would be refused for time partitioning now.
+  -- rewrite; see REDESIGN.md). A bare id PK would be refused for time partitioning now.
   primary key (created_at, id)
 );
 -- the lookup index real apps keep (per-user recent activity)

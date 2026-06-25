@@ -2,7 +2,7 @@
 -- rows into the DEFAULT for an interval that then closes) must not move referenced rows past the live
 -- FK. With a live ON DELETE CASCADE FK that would silently cascade-delete the referencing rows. So
 -- maintenance suspends the managed FK whenever the closed tail has work and restores it once drained:
--- a managed FK is live iff the closed tail is empty. See DESIGN.md section 8.
+-- a managed FK is live iff the closed tail is empty. See REDESIGN.md.
 create extension if not exists pgtap;
 
 begin;

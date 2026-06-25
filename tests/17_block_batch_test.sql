@@ -2,7 +2,7 @@
 -- BLOCKS, not a fixed ROW count, so wide rows (large jsonb/bytea) can't make one batch tens of GB. When
 -- config drain_max_blocks is set, drain_step caps the batch at ~that many heap+TOAST blocks (translated
 -- to a row limit via the table's avg bytes/row); when null it falls back to the row cap (drain_batch),
--- unchanged. Here the rows being drained are wide backdated STRAYS in the DEFAULT. See DESIGN.md sec 8.
+-- unchanged. Here the rows being drained are wide backdated STRAYS in the DEFAULT. See REDESIGN.md.
 create extension if not exists pgtap;
 
 begin;

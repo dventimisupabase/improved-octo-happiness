@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- **The bounded-child transmute redesign: the original table becomes a "monolith" partition, not the
+  `DEFAULT`; the history is split on demand by `refine`.** This supersedes the metadata-only-cutover and
+  `DEFAULT`-as-store framing of the entries below. `transmute` now renames the original aside and attaches
+  it, intact, as one bounded coarse **monolith** child covering `[grid_floor(min), B)`, under a fresh
+  **empty `DEFAULT`** safety net: still no row movement, but the cutover does one online, read-only
+  `VALIDATE` scan (under a non-blocking `SHARE UPDATE EXCLUSIVE` lock) before the brief metadata-only
+  rename/attach. The historical bulk no longer drains row-by-row; it stays in the monolith until
+  **`refine()`** splits it into proper partitions by **copying** (no dead tuples, no vacuum), atomically
+  (synchronous `refine` / `refine_history`) or paced across maintenance ticks (`set_refine` auto-refine,
+  budget-feathered like the drain). Refine is retention-aware (below-horizon sub-ranges are reclaimed, not
+  materialized) and optional (a coarse monolith is a correct, permanent state). The drain is demoted to the
+  **assistant**: it keeps the empty `DEFAULT` empty by evacuating strays, so `obtain` takes a cheap
+  scan-free attach. `status()` gains `coarse_partitions` and `history_unrefined` (the refinement backlog);
+  `untransmute`'s gate is now monolith/data-based (reversible until a row lands outside the monolith or
+  refinement begins); `maintain` suspends preserve-managed incoming FKs around a cross-tick refine, the
+  same leash it uses for the drain. Partitions wider than one step are named `_p<lo>_to_<hi>`.
+  (PRs #116-#119, #123; tests/42-47; REDESIGN.md)
+- **Docs rewritten for the monolith model; `DESIGN.md` retired.** The reference, guide, README, and runbook
+  are rewritten from scratch against the current API; `REDESIGN.md` is now the canonical design note (the
+  original `DESIGN.md`'s enduring supply/demand operating model is folded into it) and `DESIGN.md` is
+  removed.
+
 - **The `transmute` redesign: one function, metadata-only, never rewrites the primary key.** The three
   entry points (`transmute` / `transmute_by_id` / `transmute_by_uuidv7`) collapse into a single overloaded `transmute`:
   a `bigint` width selects the integer grid, an `interval` width the time grid, with `time` vs `uuidv7`

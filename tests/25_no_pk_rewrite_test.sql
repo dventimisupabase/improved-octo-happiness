@@ -1,4 +1,4 @@
--- pgpm never rewrites the primary key (DESIGN.md sec 8). transmute reuses the existing PK when the
+-- pgpm never rewrites the primary key (REDESIGN.md). transmute reuses the existing PK when the
 -- control column is a MEMBER of it (Postgres requires a partitioned PK only to INCLUDE the partition
 -- key, not lead it), refuses a table whose PK excludes the control column rather than widening it, and
 -- refuses a table with no primary key at all (issue #89: pgpm does not support no-PK tables).

@@ -2,7 +2,7 @@
 -- It is detected as an incoming FK (confrelid = the transmuted table), recorded, and dropped; after the
 -- drain it is re-added against the new parent. Because the referencing side is now partitioned,
 -- Postgres rejects a NOT VALID re-add, so restore_incoming_fks adds it validating in one step. The FK
--- ends up on the parent and is enforced across all partitions. See DESIGN.md section 8.
+-- ends up on the parent and is enforced across all partitions. See REDESIGN.md.
 create extension if not exists pgtap;
 
 begin;
