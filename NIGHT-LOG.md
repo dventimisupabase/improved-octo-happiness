@@ -1,6 +1,6 @@
 # Overnight implementation log (branch: feat/design-md-implementation)
 
-Experiment: implement the DESIGN.md §8 directions, test-first (pgtap), then validate up the
+Experiment: implement the REDESIGN.md §8 directions, test-first (pgtap), then validate up the
 size ladder (local Docker for small rungs, a fresh throwaway Supabase project for the at-scale
 rungs, torn down at the end). Climb a rung only on a clean pass; stop and fix on yellow/red.
 This file is my running journal; the final state is summarized at the bottom.
@@ -85,7 +85,7 @@ This file is my running journal; the final state is summarized at the bottom.
   - F3 check_time_monotonic (020dfe2) -- cross-version.
 - TDD throughout (RED->GREEN), branch-isolated, main untouched.
 - Outstanding: the Supabase at-scale ladder (deferred -- see above); adaptive feathering (deferred
-  by design); window estimator (skipped). DESIGN.md sec 8 should later be updated to mark F1/F2/F3
+  by design); window estimator (skipped). REDESIGN.md should later be updated to mark F1/F2/F3
   implemented (left as-is for now so this branch is pure feature+test).
 
 ### 2026-06-21: F2 "dup-key at 2M-wide" diagnosed -- NOT a drain bug; transmute-time guard added

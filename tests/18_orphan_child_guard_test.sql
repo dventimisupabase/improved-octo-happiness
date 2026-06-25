@@ -4,7 +4,7 @@
 -- the next run could reuse that orphan by name and INSERT colliding keys -> a cryptic later dup-key.
 -- transmute() must refuse UP FRONT when a standalone table matching the child-partition naming exists.
 -- The coarse monolith's _p<lo>_to_<hi> name must NOT be mistaken for an orphan (the guard regex matches
--- only the data-independent digit suffix). See DESIGN.md section 8 and REDESIGN.md section 6.
+-- only the data-independent digit suffix). See REDESIGN.md and REDESIGN.md section 6.
 create extension if not exists pgtap;
 
 begin;

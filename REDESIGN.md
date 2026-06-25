@@ -1,12 +1,12 @@
 # REDESIGN: bounded-child transmute with on-demand refinement
 
-> A proposal, not a commitment, and not yet built. It describes a successor to the current
-> transmute model in which the original table becomes a bounded **coarse child** instead of the
-> `DEFAULT` partition, no rows move at cutover, and the historical bulk is split into proper
-> partitions lazily ("refined") only when the operator asks. It builds directly on
-> [`DESIGN.md`](DESIGN.md), especially section 8, and reuses that note's vocabulary (frontier,
-> supply and demand, the block as the unit of account, the unnoticeable invariant, completion as a
-> derived outcome). Read DESIGN.md first; this note records only what changes and why.
+> The canonical design note for pg_partition_magician's **bounded-child transmute**: the original table
+> becomes a bounded **coarse child** (the "monolith") instead of the `DEFAULT` partition, no rows move at
+> cutover, and the historical bulk is split into proper partitions ("refined") on demand. This note
+> supersedes the original DESIGN.md, whose enduring operating model is folded into
+> [Foundational principles](#foundational-principles-the-operating-model) below. The model **shipped**
+> across PRs #116-#119 plus the auto-refine FK fix; the [build order](#build-order-shipped) maps each piece
+> to its PR.
 
 ## Why this exists
 
@@ -32,6 +32,56 @@ Create a fresh **empty `DEFAULT`** as a pure safety net. Going forward, `obtain`
 normal-sized partitions ahead, `retain` drops whole children, and the drain shrinks to the assistant
 that keeps the `DEFAULT` empty. The monolith can later be **refined** (coarse to fine, hierarchically)
 on demand. The `DEFAULT` keystone is kept; it just no longer stores the history.
+
+## Foundational principles (the operating model)
+
+These carry over from the project's original design note and underpin everything below.
+
+**The substrate is a variable.** PostgreSQL, and so pgpm, runs on whatever is underneath: EC2 on EBS, a
+container, a Pi. What every substrate shares is what matters: a finite **I/O budget** (some mix of
+throughput, IOPS, burst credits) and a **working-set-versus-RAM regime** (cache-resident or disk-bound).
+The model is the part that transfers; the specific hardware readings recorded in `bench/` are one instance
+of that shape, not the shape itself.
+
+**Supply and demand.** The substrate offers **supply**; pgpm imposes **demand**. Supply is the *leftover*
+headroom after the real workload has taken its share -- smaller than nameplate capacity and varying minute
+to minute. "Unnoticeable" means living within the leftover. Demand has two shapes: a one-time, conditional
+**setup** cost (a PK-widening `CONCURRENTLY` build, only when the partition key is not already in the PK,
+so zero in the common case) and the **steady** cost of moving rows (the bulk `refine`, plus the tiny
+obtain, assistant drain, and retain).
+
+**The block is the unit of account.** A row is not a unit of constant cost (a wide TOASTed row can cost
+megabytes), and wall-clock is hardware-variant. The 8 KB block is hardware-invariant and subsumes TOAST
+automatically, so budgets reason in blocks (`drain_max_blocks`), mirroring `pg_stat_io` and
+`EXPLAIN (BUFFERS)`.
+
+**The invariant: be unnoticeable.** Demand stays safely under supply, leaving the workload its headroom.
+Because the row movement is **infinitely divisible** (microbatches arbitrarily small and spaced), demand
+can always be feathered below any positive supply -- which is what makes the invariant achievable on any
+substrate. The price of feathering finer is time.
+
+**Completion is a derived outcome, not a guarantee.** Given a supply and a demand held under the
+invariant, the rate of convergence toward a fully fine-grained table is determined, not chosen: fast on
+generous hardware, slow on constrained, possibly **never** where leftover supply is near zero. You cannot
+have unnoticeable, fast, and tiny-hardware all at once.
+
+**The monolith is what makes non-completion safe.** From the cutover the table is correct, online, and
+partitioned in form; un-refined history simply lives in the coarse monolith, fully queryable. So
+"partitioned but not fully refined" is a correct, functioning state, not a failure mode, which is exactly
+why refinement is allowed to be optional, slow, or never.
+
+**The operator contract.** Good news: online, no row movement at cutover, no interference, nothing ever
+lost. Bad news: under tight supply the history may refine slowly, or never converge. The lever: acquire
+more supply (a bigger tier, a faster volume, more IOPS), or temporarily relax the unnoticeable constraint
+to converge faster. pgpm defaults to unnoticeable, and it does not leave: keeping live writes in real
+partitions means creating partitions ahead of the frontier forever, so pgpm stays on as a resident steward
+the way `pg_partman` would.
+
+**One dial, three settings.** Feathered movement read at different points on a single dial:
+**unnoticeable / online** (the default fixed gentle rate), **adaptive / online** (closed-loop: ride just
+under the sensed leftover supply, `set_drain_adaptive`), and **maintenance-window / offline** (a
+direction, not built: clear the workload so supply jumps to the full budget and converge inside a bounded
+window). One mechanism, not competing features.
 
 ## Settled decisions
 

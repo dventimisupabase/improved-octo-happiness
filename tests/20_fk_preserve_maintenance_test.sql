@@ -1,6 +1,6 @@
 -- Incoming-FK preservation in the monolith model. transmute moves no rows: the monolith holds every
 -- referenced row, attached, so there is no closed tail to wait for and restore_incoming_fks can re-add
--- the FK immediately. maintain() also restores it on its own (idempotent). See DESIGN.md section 8.
+-- the FK immediately. maintain() also restores it on its own (idempotent). See REDESIGN.md.
 create extension if not exists pgtap;
 
 begin;

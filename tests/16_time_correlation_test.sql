@@ -1,6 +1,6 @@
 -- pgpm.check_time_monotonic: how co-monotonic is an id column with a timestamp column? It samples
 -- rows, orders them by id, and reports the fraction of adjacent pairs whose time is non-decreasing.
--- This is the tier-2 safety check for the key->time retain bridge (DESIGN.md section 8): mapping
+-- This is the tier-2 safety check for the key->time retain bridge (REDESIGN.md): mapping
 -- "older than T" to an id boundary is only sound when id and time co-increase (~1.0). Backfills and
 -- out-of-order arrival drive the fraction down.
 create extension if not exists pgtap;

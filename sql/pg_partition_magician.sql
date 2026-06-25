@@ -47,9 +47,9 @@ create table if not exists pgpm.config (
   obtain_retry_after timestamptz,
   -- optional block budget for the drain: cap each microbatch at ~this many heap+TOAST blocks
   -- (translated to a row limit via the default's average bytes/row), so wide rows can't make a
-  -- single batch huge. null = cap by drain_batch rows only (default). See DESIGN.md section 8.
+  -- single batch huge. null = cap by drain_batch rows only (default). See REDESIGN.md.
   drain_max_blocks int,
-  -- adaptive closed-loop feathering (DESIGN.md section 8, mode 2). When on, maintenance senses
+  -- adaptive closed-loop feathering (REDESIGN.md, mode 2). When on, maintenance senses
   -- checkpoint pressure each tick and rides the per-tick drain budget just under supply via AIMD
   -- (additive-increase when calm, halve on a forced checkpoint), instead of the fixed drain_batch.
   -- off = mode 1 (today's fixed gentle rate). drain_budget is the controller's current row budget
@@ -83,7 +83,7 @@ create table if not exists pgpm.config (
   --     when track_io_timing is off (no read time accrues, so the latency is 0 and never surges).
   --   * ABSOLUTE cap (optional backstop): back off when more than drain_ambient_max_waiters backends are
   --     lock-blocked, regardless of baseline. 0 = disabled.
-  -- factor 0 + cap 0 = ambient signal fully off (pure WAL behaviour). See DESIGN.md section 8.
+  -- factor 0 + cap 0 = ambient signal fully off (pure WAL behaviour). See REDESIGN.md.
   drain_ambient_max_waiters int     not null default 0,
   drain_ambient_factor      numeric not null default 0,
   drain_ambient_alpha       numeric not null default 0.2,
@@ -426,7 +426,7 @@ begin
   v_def   := format('%I.%I', v_nsp, cfg.default_table);
   v_batch := coalesce(p_batch, cfg.drain_batch, 5000);
 
-  -- Block budget (DESIGN.md sec 8): bound the microbatch by heap+TOAST blocks, not just rows, so a
+  -- Block budget (REDESIGN.md): bound the microbatch by heap+TOAST blocks, not just rows, so a
   -- wide-row table (large jsonb/bytea) can't make one batch tens of GB. Translate the budget to a row
   -- cap via the default's average bytes/row and take the smaller of the two. When row stats exist that
   -- average is pg_table_size / reltuples. When they DON'T (a freshly transmuted / never-analyzed
@@ -855,7 +855,7 @@ begin
     raise exception 'pg_partition_magician: control_kind uuidv7 needs a uuid column (got %)', v_typname;
   end if;
 
-  -- Orphaned-child guard (DESIGN.md sec 8): a drain creates each child partition as a standalone
+  -- Orphaned-child guard (REDESIGN.md): a drain creates each child partition as a standalone
   -- table (CREATE TABLE ... LIKE) and only ATTACHes it at the END of that child's drain. An
   -- interrupted drain therefore leaves an un-attached child -- which DROP TABLE <parent> CASCADE
   -- does NOT remove (an un-attached table has no dependency on the parent). If the table is later
@@ -923,7 +923,7 @@ begin
     end loop;
   end if;
 
-  -- pgpm NEVER rewrites the primary key (DESIGN.md sec 8). Postgres only requires a partitioned
+  -- pgpm NEVER rewrites the primary key (REDESIGN.md). Postgres only requires a partitioned
   -- table's PK to INCLUDE the partition key (column order is irrelevant), so when the control column
   -- is already a member of the existing PK we reuse that PK verbatim -- the parent's PRIMARY KEY
   -- (step 8) reconciles the default's kept index in place, no drop, no O(rows) rebuild. Two cases are
@@ -1146,7 +1146,7 @@ begin
 end;
 $$;
 
--- One transmute, two type-safe overloads on the width parameter (DESIGN.md sec 8). The integer-grid and
+-- One transmute, two type-safe overloads on the width parameter (REDESIGN.md). The integer-grid and
 -- time-grid families used to be three functions (transmute / transmute_by_id / transmute_by_uuidv7); they collapse
 -- into a single `transmute` whose overload is chosen by the width type, with the kind read from the
 -- control column. The old by_ names are removed (hard replace).
@@ -1311,7 +1311,7 @@ $$;
 
 -- ============================== maintenance / observability ==============================
 
--- ===================== adaptive closed-loop feathering (DESIGN.md sec 8, mode 2) =====================
+-- ===================== adaptive closed-loop feathering (REDESIGN.md, mode 2) =====================
 
 -- The LEADING congestion signal: the WAL generation rate vs the rate the checkpointer can sustain.
 -- A forced checkpoint fires when WAL written since the last checkpoint reaches ~max_wal_size before
@@ -1460,7 +1460,7 @@ begin
 end;
 $$;
 
--- Operator switch for the self-calibrating ambient signal (DESIGN.md sec 8). p_factor > 0 turns it on:
+-- Operator switch for the self-calibrating ambient signal (REDESIGN.md). p_factor > 0 turns it on:
 -- the drain backs off when live waiters exceed p_factor times the learned baseline (relative surge),
 -- p_alpha is the baseline's EWMA smoothing, p_floor the minimum effective baseline (idle-box guard).
 -- p_factor = 0 turns it off. Resets the learned baseline so it re-learns cleanly from the next tick.
@@ -1574,7 +1574,7 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'retain_skip', left(sqlerrm, 200));
   end;
 
-  -- Adaptive feathering (mode 2, DESIGN.md sec 8): ride the per-tick drain budget just under the WAL
+  -- Adaptive feathering (mode 2, REDESIGN.md): ride the per-tick drain budget just under the WAL
   -- supply. Measure the WAL generation rate since the last tick and compare it to the sustainable rate
   -- (max_wal_size/checkpoint_timeout); if we are outrunning a fraction (drain_wal_high_water) of that, a
   -- forced checkpoint and its I/O storm are coming -- so back off NOW, before the storm (the LEADING
@@ -1834,7 +1834,7 @@ $$;
 -- rows at random, orders them by the id, and reports the fraction of adjacent pairs whose time is
 -- non-decreasing. ~1.0 means id and time co-increase; backfills and out-of-order arrival drive it
 -- down. This is the tier-2 safety check for retaining by time against an id partition
--- key (DESIGN.md section 8): mapping "older than T" to an id boundary is only sound when id and
+-- key (REDESIGN.md): mapping "older than T" to an id boundary is only sound when id and
 -- time co-increase. Heuristic, not a proof -- mirrors check_uuidv7's plausibility sampling.
 create or replace function pgpm.check_time_monotonic(
   p_table regclass, p_id name, p_time name, p_sample int default 1000
@@ -1991,7 +1991,7 @@ $$;
 -- conversion is quiescent: the closed tail is fully drained (no closed rows linger in the DEFAULT) and
 -- no in-flight, not-yet-attached child partition exists. The drain moves rows out of the DEFAULT through
 -- such a child, during which a referenced row is briefly outside the parent and a live NO ACTION FK
--- would reject the move (see DESIGN.md section 8), so the FK must stay dropped until the drain is idle.
+-- would reject the move (see REDESIGN.md), so the FK must stay dropped until the drain is idle.
 -- The re-add is split (issue #95): `ADD CONSTRAINT ... NOT VALID` (enforces every new write, always
 -- succeeds) committed separately from `VALIDATE` (scans existing rows, may fail on an orphan written
 -- during the suspend window). A failed VALIDATE leaves the FK NOT VALID -- enforcing new writes,

@@ -1,4 +1,4 @@
--- Adaptive closed-loop feathering (DESIGN.md section 8, mode 2). The drain row budget is no longer a
+-- Adaptive closed-loop feathering (REDESIGN.md, mode 2). The drain row budget is no longer a
 -- fixed constant: when drain_adaptive is on, maintenance rides the budget just under the WAL supply via
 -- AIMD. The LEADING signal is the WAL generation rate vs the sustainable rate (max_wal_size /
 -- checkpoint_timeout): outrun a fraction (drain_wal_high_water) of it and a forced checkpoint is coming,

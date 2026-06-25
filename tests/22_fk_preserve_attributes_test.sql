@@ -1,7 +1,7 @@
 -- Incoming-FK preservation carries the FK's attributes. Because 'preserve' records the FK's full
 -- definition (pg_get_constraintdef) and restore_incoming_fks re-adds it verbatim, the referential
 -- action (ON DELETE CASCADE / SET NULL / ...) and DEFERRABLE-ness ride along unchanged. See
--- DESIGN.md section 8.
+-- REDESIGN.md.
 create extension if not exists pgtap;
 
 begin;
