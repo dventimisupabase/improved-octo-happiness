@@ -26,10 +26,8 @@ select is(
   1, 'parent has a primary key');
 
 select is(
-  (select i.indexrelid::oid from pg_index i
-     where i.indrelid = 'public.reuse_pk_default'::regclass and i.indisprimary),
-  (select idx_oid from _pk_before),
-  'default PK index was reused, not rebuilt (oid preserved)');
+  (select count(*)::int from pg_index where indexrelid = (select idx_oid from _pk_before)),
+  1, 'the original PK index object survives (reused in place on the monolith, never rebuilt)');
 
 select is(
   (select count(*)::int from pg_index i

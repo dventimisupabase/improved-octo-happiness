@@ -1,8 +1,8 @@
--- Regression test for issue #94. The drain creates each child partition standalone and only attaches
--- it once the interval has fully moved. pgpm now records that child in pgpm.part the moment it is
--- created -- marked NOT attached -- and flips it to attached at the attach, so an in-flight (or stalled,
--- or interrupted) drain child is tracked in pgpm's catalog and surfaced by status(), instead of being
--- discoverable only by scanning pg_class.
+-- Regression test for issue #94, in the monolith model. The assistant drain creates each child
+-- standalone and only attaches it once the interval has fully moved. pgpm records that child in
+-- pgpm.part the moment it is created -- marked NOT attached -- and flips it to attached at the attach,
+-- so an in-flight (or stalled, or interrupted) drain child is tracked in pgpm's catalog and surfaced by
+-- status(), instead of being discoverable only by scanning pg_class.
 create extension if not exists pgtap;
 
 begin;
@@ -14,27 +14,25 @@ create table public.inflight_t (
   body       text,
   primary key (created_at, id)
 );
-insert into public.inflight_t (created_at, body)
-  select date_trunc('month', now()) - interval '40 days', 'x' from generate_series(1, 3) g;
-
+insert into public.inflight_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 3) g;  -- recent -> monolith
 select pgpm.transmute('public.inflight_t', 'created_at', interval '1 month',
                   p_drain_batch => 1, p_paused => false);
+-- three strays in one closed past interval land in the DEFAULT for the assistant to drain
+insert into public.inflight_t (created_at, body)
+  select date_trunc('month', now()) - interval '2 months' + interval '10 days', 'stray' from generate_series(1, 3) g;
 
--- one microbatch: moves 1 of 3 rows into a new standalone child, leaves it UNATTACHED (more remain)
+-- one microbatch: moves 1 of 3 strays into a new standalone child, leaves it UNATTACHED (more remain)
 select is(pgpm.drain_step('public.inflight_t'), 'moved:1',
-  'setup: a single microbatch leaves an in-flight, not-yet-attached child');
+  'setup: a single assistant-drain microbatch leaves an in-flight, not-yet-attached child');
 
--- the in-flight child is now tracked in pgpm.part, marked NOT attached
 select is(
   (select count(*)::int from pgpm.part where parent_table = 'public.inflight_t'::regclass and not attached),
   1, 'the in-flight child is tracked in pgpm.part, marked not attached');
 
--- and status() surfaces it (the operator signal a prior version lacked)
 select cmp_ok(
   (select inflight_partitions from pgpm.status() where parent = 'public.inflight_t'::regclass),
   '>', 0::bigint, 'status() surfaces the in-flight (unattached) partition count');
 
--- finish the drain; the child is now attached and no longer in-flight
 select pgpm.drain_all('public.inflight_t', p_include_open => true);
 select is(
   (select count(*)::int from pgpm.part where parent_table = 'public.inflight_t'::regclass and not attached),

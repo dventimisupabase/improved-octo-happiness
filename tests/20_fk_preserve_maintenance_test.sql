@@ -1,6 +1,6 @@
--- Incoming-FK preservation, scheduled path: maintain() restores the preserved FK on its own once
--- the closed tail has drained. restore_incoming_fks self-gates on quiescence, so it is a no-op while
--- closed rows remain and fires only when the drain is idle. See DESIGN.md section 8.
+-- Incoming-FK preservation in the monolith model. transmute moves no rows: the monolith holds every
+-- referenced row, attached, so there is no closed tail to wait for and restore_incoming_fks can re-add
+-- the FK immediately. maintain() also restores it on its own (idempotent). See DESIGN.md section 8.
 create extension if not exists pgtap;
 
 begin;
@@ -24,17 +24,18 @@ select is(
   (select count(*)::int from pgpm.dropped_fk where parent_table = 'public.m'::regclass),
   1, 'the FK was recorded for restoration');
 
--- gate: while the closed tail is still in the DEFAULT, restore is a no-op
+-- the monolith holds every referenced row (attached), so there is no closed tail blocking it: restore
+-- fires immediately.
 select is(
   (select pgpm.restore_incoming_fks('public.m')),
-  0, 'restore is a no-op while closed rows remain in the DEFAULT');
+  1, 'restore fires immediately: the monolith holds all referenced rows, so no closed tail blocks it');
 
--- drive the scheduled path: a handful of maintenance ticks drain the closed tail and then auto-restore
+-- the scheduled path is idempotent: a handful of maintenance ticks leave the FK live, default empty
 do $$ begin for i in 1..12 loop perform pgpm.maintain('public.m'); end loop; end $$;
 
 select is(
   (select closed_rows from pgpm.check_default('public.m')),
-  0::bigint, 'maintenance drained the closed tail');
+  0::bigint, 'the DEFAULT stays empty (the monolith never put a closed tail there)');
 select is(
   (select count(*)::int from pg_constraint
      where conrelid = 'public.ref'::regclass and contype = 'f' and confrelid = 'public.m'::regclass),

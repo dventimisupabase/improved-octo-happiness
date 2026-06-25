@@ -1,8 +1,7 @@
--- Regression test for issue #91. Retention bounds storage even when the drain lags. An interval
--- entirely below the retention horizon is DELETEd straight out of the DEFAULT by the (paced) drain,
--- instead of being materialized into a partition that retain() would immediately drop. So aged rows
--- that never made it out of the DEFAULT are still reclaimed, the within-horizon rows are untouched,
--- and no doomed partition is created for the aged tail (the materialize-then-drop churn is gone).
+-- Regression test for issue #91, carried into the monolith model. Retention bounds storage even when
+-- strays land in the DEFAULT below the horizon: the assistant drain DELETEs an interval entirely below
+-- the retention horizon straight out of the DEFAULT (retain_reclaim) instead of materializing a doomed
+-- partition that retain() would immediately drop. Within-horizon strays are materialized as normal.
 create extension if not exists pgtap;
 
 begin;
@@ -14,45 +13,40 @@ create table public.ret_t (
   body       text,
   primary key (created_at, id)
 );
--- ten rows in each of the last six months (placed mid-month so each lands squarely in its interval);
--- nothing is drained yet, so it all lives in the DEFAULT. With retain '2 months' the boundary is
--- date_trunc('month', now()) - 2 months: months 0/1/2 are within the horizon (month 0 is the open
--- interval), months 3/4/5 are below it.
-insert into public.ret_t (created_at, body)
-  select date_trunc('month', now()) - make_interval(months => m) + interval '10 days', 'm' || m
-  from generate_series(0, 5) m, generate_series(1, 10) g;
-
+insert into public.ret_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 10) g;  -- recent -> monolith
 select pgpm.transmute('public.ret_t', 'created_at', interval '1 month',
                   p_retain => interval '2 months', p_paused => false);
-select pgpm.obtain('public.ret_t');
 
-select ok(
-  (select count(*) from public.ret_t
-     where created_at < date_trunc('month', now()) - interval '2 months') > 0,
-  'setup: aged rows are present in the DEFAULT before draining');
+-- strays in the DEFAULT: 30 aged (months 3,4,5 ago, BELOW the 2-month horizon) and 10 within-horizon
+-- (month 1 ago). The recent rows live in the monolith, not the DEFAULT.
+insert into public.ret_t (created_at, body)
+  select date_trunc('month', now()) - make_interval(months => m) + interval '10 days', 'm' || m
+  from generate_series(3, 5) m, generate_series(1, 10) g;
+insert into public.ret_t (created_at, body)
+  select date_trunc('month', now()) - interval '1 month' + interval '10 days', 'within'
+  from generate_series(1, 10) g;
 
--- one full pass over the closed intervals: below-horizon intervals are reclaimed, within-horizon ones
--- are materialized; the open (current) interval stays in the DEFAULT.
+select is(
+  (select count(*)::int from public.ret_t_default
+     where created_at < date_trunc('month', now()) - interval '2 months'),
+  30, 'setup: 30 aged strays (below the horizon) sit in the DEFAULT');
+
 select pgpm.drain_all('public.ret_t');
 
--- the aged tail is reclaimed even though it was only ever in the DEFAULT (complete read via snapshot)
 select is(
   (select count(*)::int from pgpm.snapshot(null::public.ret_t)
      where created_at < date_trunc('month', now()) - interval '2 months'),
-  0, 'retention reclaimed the aged tail straight out of the un-drained DEFAULT');
+  0, 'retention reclaimed the aged strays straight out of the DEFAULT (never materialized)');
 
--- the within-horizon rows (months 0, 1, 2 = 30 rows) are untouched
-select is(
-  (select count(*)::int from pgpm.snapshot(null::public.ret_t)
-     where created_at >= date_trunc('month', now()) - interval '2 months'),
-  30, 'within-horizon rows survive the reclaim');
-
--- the aged tail was reclaimed by a direct DELETE, not materialize-then-drop: the drain logged
--- retain_reclaim (and no drain_attach) for those intervals
 select cmp_ok(
   (select count(*)::int from pgpm.log
      where parent_table = 'public.ret_t'::regclass and action = 'retain_reclaim'),
-  '>', 0, 'the aged tail was reclaimed via direct DELETE (retain_reclaim), avoiding churn');
+  '>', 0, 'the aged strays were reclaimed via direct DELETE (retain_reclaim), avoiding churn');
+
+select is(
+  (select count(*)::int from public.ret_t
+     where created_at >= date_trunc('month', now()) - interval '2 months'),
+  20, 'within-horizon rows survive (10 recent in the monolith + 10 within-horizon stray)');
 
 select * from finish();
 rollback;

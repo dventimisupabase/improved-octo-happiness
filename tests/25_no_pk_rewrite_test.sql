@@ -22,10 +22,8 @@ select is(
   (select relkind::text from pg_class where oid = 'public.multi'::regclass),
   'p', 'multi became a partitioned table');
 select is(
-  (select i.indexrelid::oid from pg_index i
-     where i.indrelid = 'public.multi_default'::regclass and i.indisprimary),
-  (select idx from _pk_before),
-  'the existing PK index was reused in place (oid preserved, never rebuilt)');
+  (select count(*)::int from pg_index where indexrelid = (select idx from _pk_before)),
+  1, 'the existing PK index object survives (reused in place on the monolith, never rebuilt)');
 
 -- (B) no-PK table: refused up front (issue #89) -- pgpm requires the control column to be part of
 --     the primary key, and there is none here to anchor on.
