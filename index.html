@@ -538,7 +538,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">6</span> Reshaping the history &middot; <code>refine</code></span>
             <h3>The coarse history splits into fine partitions, by copying.</h3>
-            <p>The history starts as one coarse monolith. <code>refine</code> splits it by <em>copying</em>: it reads a range into a fresh, born-validated partition, swaps it in, and drops the source, online and a chunk at a time. Because it copies instead of deleting, there are no dead tuples and no vacuum. It is optional, a coarse monolith is a correct, permanent state, and refine is what restores partition pruning and fine-grained retention. (The leading-edge <code>DEFAULT</code> stays empty; the assistant <code>drain</code> clears the rare stray that lands there.) One honest cost: a paced cross-tick refine moves rows through an unattached child, so a mid-move read of the parent undercounts the range in flight. <code>pgpm.snapshot</code> reads the complete set, and the synchronous <code>refine()</code> never opens the gap.</p>
+            <p>The history starts as one coarse monolith. <code>refine</code> splits it by <em>copying</em>: it reads a range into a fresh, born-validated partition, swaps it in, and drops the source, online and a chunk at a time. Because it copies instead of deleting, there are no dead tuples and no vacuum. It is optional, a coarse monolith is a correct, permanent state, and refine is what restores partition pruning and fine-grained retention. (The leading-edge <code>DEFAULT</code> stays empty; the assistant <code>drain</code> clears the rare stray that lands there.) Because the monolith stays whole and attached until one atomic swap, refine never undercounts the parent the way the assistant <code>drain</code> can. The one honest cost is transient disk, about 2x the span while the copies and the source briefly coexist.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-drain">
@@ -630,7 +630,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="M13 13l4 4"/></svg></div>
-          <div><h3>One gap, in the open</h3><p>While a paced move runs (the assistant drain, or a cross-tick refine), its rows live in a not-yet-attached child, so a mid-move read of the parent undercounts it, and a write to a moved row no-ops. <code>pgpm.snapshot</code> reads the complete set, the synchronous <code>refine()</code> and <code>drain_all()</code> never open the gap, and nothing is lost.</p></div>
+          <div><h3>One gap, in the open</h3><p>While the paced assistant <code>drain</code> runs, its rows briefly live in a not-yet-attached child, so a mid-move read of the parent undercounts it and a write to a moved row no-ops. <code>refine</code> never opens this gap (it copies, leaving every row in the monolith until an atomic swap). <code>pgpm.snapshot</code> reads the complete set, <code>drain_all()</code> is gap-free too, and nothing is lost.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
