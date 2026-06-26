@@ -39,11 +39,12 @@ atomic swap), and the synchronous `drain_all()` is gap-free too; `pgpm.snapshot`
 while the paced drain is mid-move.
 The [guide](docs/guide.md#read-consistency-during-a-move) explains it in full.
 
-**Incoming foreign keys** are handled, not ignored. `transmute` never rewrites the primary key, so the
+**Incoming foreign keys** are handled, not ignored. `transmute` never rewrites your key, so the
 referenced unique key always survives partitioning: with `p_incoming_fks => 'preserve'` it records and
 drops each incoming FK for the conversion, then re-adds it against the new parent once the move is idle (no
-composite-FK story, ever). A table whose primary key excludes the control column is refused: partition on
-a key that is already part of your PK. See the [guide](docs/guide.md#incoming-foreign-keys).
+composite-FK story, ever). A table whose key excludes the control column is refused: partition on a key
+(primary key or unique constraint) that already includes the control column. See the
+[guide](docs/guide.md#incoming-foreign-keys).
 
 Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
 
@@ -93,9 +94,9 @@ select pgpm.set_refine('public.events', '1 month');
 That is it. The conversion is a deliberate two-step: `transmute` registers the table paused so you can
 inspect it, and maintenance does nothing until you `resume`. Once live, it keeps real partitions ahead of
 the frontier and the `DEFAULT` empty; the historical bulk stays in the monolith until you choose to
-`refine` it (by hand or via auto-refine). `transmute` never rewrites the primary key, so it just requires
-the control column to already be part of the table's primary key (else it refuses). See the
-[transmute walkthrough](docs/guide.md#transmute-a-table).
+`refine` it (by hand or via auto-refine). `transmute` never rewrites your key, so it just requires the
+control column to already be part of a primary key or a unique constraint, which it reuses in place (else
+it refuses). See the [transmute walkthrough](docs/guide.md#transmute-a-table).
 
 ## Documentation
 

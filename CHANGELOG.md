@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **`transmute` reuses a unique constraint, not just a primary key.** The key contract is relaxed: the
+  control column must be part of a **primary key OR a unique constraint** (Postgres requires a partitioned
+  table's key only to *include* the partition key). `transmute` reuses whichever exists in place, with no
+  rebuild: the parent adopts the monolith's existing constraint index (`ADD PRIMARY KEY` adopts a child PK
+  index, `ADD UNIQUE` adopts a child unique-constraint index; both metadata-only, verified on PG 15-18).
+  This is faithful -- no primary key is synthesized when the source had only a unique constraint -- and it
+  unblocks tables (e.g. time-series with a `UNIQUE (device_id, ts)` and no PK) that previously could not be
+  partitioned at all. The control column it covers is required to be `NOT NULL` (a primary key guarantees
+  this; for a unique constraint it is checked, never scanned). A *bare* unique index (not a constraint) is
+  refused with guidance to promote it metadata-only via `ADD CONSTRAINT ... UNIQUE USING INDEX` (`ADD
+  UNIQUE` would otherwise rebuild it); a table with no primary key and no usable unique constraint is still
+  refused. Incoming-FK preservation now accepts an FK that references the reused unique constraint, not
+  only the primary key. (tests/49-51; tests/32 updated for the relaxed contract)
 - **The bounded-child transmute redesign: the original table becomes a "monolith" partition, not the
   `DEFAULT`; the history is split on demand by `refine`.** This supersedes the metadata-only-cutover and
   `DEFAULT`-as-store framing of the entries below. `transmute` now renames the original aside and attaches

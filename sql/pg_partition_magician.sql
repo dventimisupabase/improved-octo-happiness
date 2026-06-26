@@ -865,6 +865,8 @@ declare
   v_nsp name; v_rel name; v_default name; v_defreg regclass; v_parent regclass;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
+  v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
+  v_uq_cols text[]; v_bare_uq text;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
   v_uchk_n bigint; v_uchk_frac numeric;
   v_idmax bigint[]; v_m bigint; v_i int;
@@ -969,24 +971,66 @@ begin
     end loop;
   end if;
 
-  -- pgpm NEVER rewrites the primary key (REDESIGN.md). Postgres only requires a partitioned
-  -- table's PK to INCLUDE the partition key (column order is irrelevant), so when the control column
-  -- is already a member of the existing PK we reuse that PK verbatim -- the parent's PRIMARY KEY
-  -- (step 8) reconciles the default's kept index in place, no drop, no O(rows) rebuild. Two cases are
-  -- refused up front (before the rename, so the table is left untouched) rather than partitioned on a
-  -- weak key: a PK that does NOT include the control column (the classic id-PK table that wants time
-  -- partitioning -- widening it is the operator's deliberate job, not something transmute does behind
-  -- their back), and NO primary key at all. pgpm does not support no-PK tables: the control column
-  -- must already be part of the table's primary key, which also guarantees it is NOT NULL, so the
-  -- per-column SET NOT NULL below is always a metadata no-op and never an O(rows) blocking scan.
-  if v_oldpk is null then
-    raise exception 'pg_partition_magician: cannot transmute % -- it has no primary key, and pgpm requires the control column (%) to be part of the table''s primary key (a partitioned table''s primary key must include the partition key). Add a primary key that includes % first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID).',
-      p_parent, p_control, p_control;
-  elsif not (p_control::text = any(v_oldpk)) then
-    raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite primary keys, and the primary key (%) does not include %. Make % part of the primary key first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen the PK to include % via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
-      p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control, p_control;
+  -- pgpm NEVER rewrites the key (REDESIGN.md): it REUSES an existing CONSTRAINT-backed unique key whose
+  -- columns include the control column, so the parent (step 8) adopts the monolith's kept index in place,
+  -- no drop, no O(rows) rebuild. Postgres only requires a partitioned table's PK/unique key to INCLUDE
+  -- the partition key (column order is irrelevant). Preference: the PRIMARY KEY when it includes the
+  -- control column (ADD PRIMARY KEY adopts the child PK index), else a UNIQUE CONSTRAINT that includes it
+  -- (ADD UNIQUE adopts the child unique-constraint index). A *bare* unique index is deliberately NOT
+  -- usable -- ADD UNIQUE would REBUILD it rather than adopt it -- so it is refused with the one metadata-
+  -- only promotion the operator runs first. The reused key makes the control column NOT NULL (a PK
+  -- guarantees it; for a unique constraint we require it, checked not scanned), so the per-column SET NOT
+  -- NULL below stays a metadata no-op. Several shapes are refused up front (before the rename, table left
+  -- untouched) rather than partitioned on a weak key.
+  select a.attnum into v_ctl_attnum
+    from pg_attribute a where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
+
+  if v_oldpk is not null and (p_control::text = any(v_oldpk)) then
+    v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
+    v_add_pk := true;
+  else
+    -- no usable PK: look for a UNIQUE CONSTRAINT whose key includes the control column and is neither
+    -- partial nor on an expression (the same shape pgpm can enforce on a partitioned table).
+    select con.conname, con.conindid, array_agg(a.attname::text order by k.ord)
+      into v_reuse_conname, v_reuse_idx, v_uq_cols
+      from pg_constraint con
+      join pg_index i on i.indexrelid = con.conindid
+      cross join lateral unnest(con.conkey) with ordinality as k(attnum, ord)
+      join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+     where con.conrelid = p_parent and con.contype = 'u'
+       and i.indpred is null and i.indexprs is null and v_ctl_attnum = any(con.conkey)
+     group by con.conname, con.conindid
+     order by con.conname limit 1;
+
+    if v_reuse_conname is not null then
+      if not (select a.attnotnull from pg_attribute a
+                where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) then
+        raise exception 'pg_partition_magician: cannot transmute % on % -- the unique constraint % includes the control column, but % is nullable and a partition key must be NOT NULL. Run ALTER TABLE % ALTER COLUMN % SET NOT NULL first, then re-run transmute.',
+          p_parent, p_control, v_reuse_conname, p_control, p_parent::text, p_control;
+      end if;
+      v_pkcols := v_uq_cols;   -- reuse the unique constraint (drives FK eligibility and the parent ADD UNIQUE)
+      v_add_uniq := true;
+    else
+      -- nothing reusable: give the operator a specific reason and the prep step that unblocks it.
+      select c.relname into v_bare_uq
+        from pg_index i join pg_class c on c.oid = i.indexrelid
+       where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary
+         and i.indpred is null and i.indexprs is null
+         and v_ctl_attnum = any((string_to_array(i.indkey::text, ' ')::int2[])[1:i.indnkeyatts])
+         and not exists (select 1 from pg_constraint con where con.conindid = i.indexrelid)
+       limit 1;
+      if v_bare_uq is not null then
+        raise exception 'pg_partition_magician: cannot transmute % on % -- the unique index % includes the control column but is a bare index, not a constraint, so pgpm cannot adopt it without an O(rows) rebuild. Promote it to a constraint first: ALTER TABLE % ADD CONSTRAINT %_key UNIQUE USING INDEX %; then re-run transmute. (pgpm reuses a primary key or a unique constraint, never a bare index, to keep the conversion metadata-only.)',
+          p_parent, p_control, v_bare_uq, p_parent::text, v_bare_uq, v_bare_uq;
+      elsif v_oldpk is not null then
+        raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite keys, and the primary key (%) does not include %, nor does any unique constraint. Make % part of the primary key or add a unique constraint that includes it, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen it via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
+          p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control;
+      else
+        raise exception 'pg_partition_magician: cannot transmute % -- it has no primary key, and no unique constraint includes the control column (%). pgpm requires the control column to be part of a primary key or a unique constraint (a partitioned table''s key must include the partition key, which also makes the control column NOT NULL). Add one that includes % first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID).',
+          p_parent, p_control, p_control;
+      end if;
+    end if;
   end if;
-  v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
 
   -- Secondary indexes to carry onto the parent (step 9b recreates them as partitioned, attaching the
   -- default's). NON-unique secondaries always carry. A non-PK UNIQUE secondary can only become a
@@ -996,11 +1040,12 @@ begin
   -- #90). indkey casts via its text form (int2vector is 0-based; string_to_array gives a 1-based array),
   -- sliced to indnkeyatts so INCLUDE columns don't count; partial / expression unique indexes can't be
   -- carried either, so they fall to the refusal.
-  select a.attnum into v_ctl_attnum
-    from pg_attribute a where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
+  -- (v_ctl_attnum was resolved with the key selection above). Exclude the reused unique-constraint index
+  -- (v_reuse_idx): step 8 produces it via ADD UNIQUE, so it must not also be carried as a secondary.
   select array_agg(c.relname::text), array_agg(pg_get_indexdef(i.indexrelid)) into v_idx_names, v_idx_defs
     from pg_index i join pg_class c on c.oid = i.indexrelid
    where i.indrelid = p_parent and i.indislive and not i.indisprimary
+     and i.indexrelid <> coalesce(v_reuse_idx, 0::oid)
      and (not i.indisunique
           or (i.indpred is null and i.indexprs is null
               and v_ctl_attnum = any((string_to_array(i.indkey::text, ' ')::int2[])[1:i.indnkeyatts])));
@@ -1036,14 +1081,15 @@ begin
           from pg_constraint c where c.confrelid = p_parent and c.contype = 'f'
       loop
         -- Preservable iff the parent keeps a unique key on EXACTLY this FK's referenced columns.
-        -- Since the PK is reused verbatim, that means the FK must reference the primary key. The only
-        -- way it can't is an FK referencing a non-PK unique key that cannot survive partitioning (a
-        -- unique secondary not including the partition key) -- refuse with guidance.
+        -- pgpm reuses the existing key verbatim (the PK, or a unique constraint when there is no usable
+        -- PK), so the FK must reference that reused key -- both a PK and a unique constraint are valid FK
+        -- targets. The only way it can't is an FK referencing a different unique key that cannot survive
+        -- partitioning (one not including the partition key) -- refuse with guidance.
         v_fk_eligible := v_pkcols is not null
           and (select array_agg(x order by x) from unnest(v_fk.rcols) x)
             = (select array_agg(x order by x) from unnest(v_pkcols) x);
         if not v_fk_eligible then
-          raise exception 'pg_partition_magician: cannot preserve incoming FK % on % -- it references (%), but the parent''s primary key is (%). An incoming FK must reference the primary key to be preserved.',
+          raise exception 'pg_partition_magician: cannot preserve incoming FK % on % -- it references (%), but the parent''s reused key is (%). An incoming FK must reference the reused primary key or unique constraint to be preserved.',
             v_fk.conname, v_fk.reltbl, array_to_string(v_fk.rcols, ', '), array_to_string(coalesce(v_pkcols, '{}'), ', ');
         end if;
         v_dropped := v_dropped || jsonb_build_object(
@@ -1099,7 +1145,9 @@ begin
     end loop;
   end if;
   execute format('alter table %s alter column %I set not null', v_monreg::text, p_control);
-  if v_pkcols is not null then
+  -- only a reused PRIMARY KEY makes its other columns NOT NULL; a reused UNIQUE constraint legitimately
+  -- permits nullable non-control columns, so leave those as they are (and never scan them).
+  if v_add_pk and v_pkcols is not null then
     foreach v_col in array v_pkcols loop
       execute format('alter table %s alter column %I set not null', v_monreg::text, v_col);
     end loop;
@@ -1124,9 +1172,13 @@ begin
                  pgpm._encode(p_control_kind, v_lo_native), pgpm._encode(p_control_kind, v_hi_native));
   execute format('alter table %s drop constraint pgpm_monolith_bound', v_monreg::text);
 
-  -- 8. parent PRIMARY KEY -- reuses the monolith's promoted PK index (no rebuild)
-  if v_pkcols is not null then
+  -- 8. parent key -- adopts the monolith's kept constraint index (metadata-only, no rebuild): a PRIMARY
+  -- KEY when the reused key was the PK, a UNIQUE constraint when it was a unique constraint.
+  if v_add_pk then
     execute format('alter table %s add primary key (%s)', v_parent::text,
+                   (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+  elsif v_add_uniq then
+    execute format('alter table %s add unique (%s)', v_parent::text,
                    (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
   end if;
 

@@ -153,13 +153,24 @@ the only `O(rows)` work is a single non-blocking read -- no index rebuild, no ro
 (Contrast the old model, which paid no scan up front but then rewrote every historical row through a
 perpetual drain.)
 
-The one requirement is that the control column already be part of the primary key. Postgres only requires
-a partitioned PK to *include* the partition key, not lead it, so a single-column PK on the control column
-qualifies, and so does a composite PK that contains it (e.g. `(tenant_id, id)` partitioned by `id`). A
-table with no primary key, or a PK that *excludes* the control column (the classic `events(id PRIMARY
-KEY, created_at)` wanting time partitioning), is refused with a clear error: make the control column part
-of the PK first (give it a single-column time-ordered key, or widen the PK with `CREATE UNIQUE INDEX
-CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`), then re-transmute.
+The one requirement is that the control column already be part of a reusable key: a **primary key** or a
+**unique constraint**. Postgres only requires a partitioned key to *include* the partition key, not lead
+it, so a single-column key on the control column qualifies, and so does a composite one that contains it
+(e.g. `(tenant_id, id)` partitioned by `id`, or `UNIQUE (device_id, ts)` partitioned by `ts`). `transmute`
+reuses that key in place (the parent adopts the monolith's existing index, no rebuild), and the control
+column it covers is required to be `NOT NULL` (a primary key guarantees this; for a unique constraint it
+is checked, never scanned). A few shapes are refused with a clear error rather than partitioned on a weak
+key:
+
+- **No primary key and no unique constraint** on the control column: add one that includes it first (the
+  simplest modern data model is a single-column time-ordered key, bigint/Snowflake/UUIDv7/ULID).
+- **A key that *excludes* the control column** (the classic `events(id PRIMARY KEY, created_at)` wanting
+  time partitioning): make the control column part of the key first, or widen it with `CREATE UNIQUE INDEX
+  CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`.
+- **Only a *bare* unique index** (not a constraint) covers the control column: `ADD UNIQUE` would rebuild
+  it, so promote it metadata-only first with `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX`.
+
+Then re-transmute.
 
 `transmute` is reversible until you commit to it: while the monolith is intact and holds the whole table,
 [`untransmute`](reference.md#untransmute) cleanly restores the original. It becomes a one-way door once a
@@ -540,7 +551,8 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **The empty `DEFAULT` is the safety net** (`keep_default`); `check_default()` flags any stray.
 - **Retain uses plain `DROP`** (a brief lock); retention over coarse history waits on refine.
 - **Unique secondary indexes** are carried when their key includes the partition key; otherwise refused.
-- **The primary key is never rewritten;** the control column must already be part of it.
+- **The key is never rewritten;** the control column must already be part of a primary key or unique
+  constraint, which `transmute` reuses in place.
 - **Incoming foreign keys** are refused by default, or preserved (dropped for the conversion, re-added
   against the new parent) with `p_incoming_fks => 'preserve'`.
 - **Mid-move reads undercount on the paced paths; writes to moved rows no-op.** Inherent to an online
