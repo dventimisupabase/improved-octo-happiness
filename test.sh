@@ -120,8 +120,14 @@ run_timescale() {
   $DC --profile "$prof" down -v 2>/dev/null || true
   $DC --profile "$prof" build $BUILD_PROGRESS
   $DC --profile "$prof" up -d
-  for _ in $(seq 1 60); do
-    $DC --profile "$prof" exec -T "$svc" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1
+  # Wait for the REAL server. The official postgres entrypoint runs a temporary init server on the unix
+  # socket only (no TCP listener); probing over TCP therefore succeeds ONLY once the real server is up,
+  # avoiding the "database system is shutting down" race where a socket probe catches the temp init
+  # server right before it restarts (TimescaleDB's heavier init widens that window).
+  for _ in $(seq 1 90); do
+    $DC --profile "$prof" exec -T -e PGPASSWORD=postgres "$svc" \
+      psql -h 127.0.0.1 -U postgres -tAc 'select 1' >/dev/null 2>&1 && break
+    sleep 1
   done
 
   for f in tests/timescale/db/*.sql; do
