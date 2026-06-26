@@ -64,46 +64,35 @@ begin
   end if;
 end $$;
 
--- from_hypertable: the migration driver. Online chunk-by-chunk COPY into a plain destination, then a
--- brief-lock cutover (append-only catch-up, drop the hypertable, rename the copy into its place), then
--- transmute. A procedure because the copy commits per chunk (bounded WAL/txn on a large table). When the
--- caller leaves p_retain null, the source's drop_chunks policy interval is carried into pgpm's retain.
-create or replace procedure pgpm.from_hypertable(
-  p_hypertable regclass, p_control name, p_interval interval,
-  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true
-) language plpgsql as $$
-declare
-  v_nsp name; v_rel name; v_dest name; v_cols text; v_retain interval;
-  v_watermark timestamptz; v_orig regclass; r record; k record;
-begin
-  -- 1. refuse up front (leaves the hypertable untouched)
-  perform pgpm.from_hypertable_preflight(p_hypertable, p_control);
+-- from_hypertable runs in two phases, exposed as separate procedures so writes can keep arriving between
+-- them: from_hypertable_copy does the online bulk copy to a watermark, then from_hypertable_cutover catches
+-- up the rows that arrived after it, swaps the copy into place, and hands off to transmute. from_hypertable
+-- runs both back to back for the one-shot case. All are procedures because the copy commits per chunk
+-- (bounded WAL/txn on a large table) and the cutover commits the swap.
 
+-- Phase 1: build the plain destination and bulk-copy the existing chunks into it, online. The source keeps
+-- serving traffic (new appends are caught up by the cutover). Leaves <rel>_pgpm_dest populated; the copy
+-- watermark is implicitly max(control) in the destination.
+create or replace procedure pgpm.from_hypertable_copy(p_hypertable regclass, p_control name)
+language plpgsql as $$
+declare v_nsp name; v_rel name; v_dest name; v_cols text; r record;
+begin
+  perform pgpm.from_hypertable_preflight(p_hypertable, p_control);
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
   v_dest := v_rel || '_pgpm_dest';
-
-  -- retention translation: default from the source's drop_chunks policy when the caller did not set one
-  v_retain := p_retain;
-  if v_retain is null then
-    select (config->>'drop_after')::interval into v_retain from timescaledb_information.jobs
-     where proc_name = 'policy_retention' and hypertable_schema = v_nsp and hypertable_name = v_rel limit 1;
-  end if;
-
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped;
 
-  -- 2. destination skeleton: structure but no indexes/key, so the bulk load maintains no per-row index.
+  -- destination skeleton: structure but no indexes/key, so the bulk load maintains no per-row index.
   execute format('drop table if exists %I.%I', v_nsp, v_dest);
   execute format('create table %I.%I (like %I.%I including defaults including constraints including generated including comments)',
                  v_nsp, v_dest, v_nsp, v_rel);
   commit;
 
-  -- 3. online chunk-bounded copy: one chunk-range per transaction (the time predicate drives chunk
-  -- exclusion to a single-chunk read; ORDER BY the control column clusters the destination for cheap
-  -- transmute/refine later). The source keeps serving traffic throughout.
+  -- online chunk-bounded copy: one chunk-range per transaction (the time predicate drives chunk exclusion
+  -- to a single-chunk read; ORDER BY the control column clusters the destination for cheap transmute/refine
+  -- later). The source keeps serving traffic throughout.
   for r in select range_start, range_end from timescaledb_information.chunks
             where hypertable_schema = v_nsp and hypertable_name = v_rel order by range_start loop
     execute format('insert into %I.%I (%s) select %s from %I.%I where %I >= %L and %I < %L order by %I',
@@ -111,11 +100,42 @@ begin
                    p_control, r.range_start, p_control, r.range_end, p_control);
     commit;
   end loop;
+end $$;
 
-  -- 4. cutover (the one non-online window): brief ACCESS EXCLUSIVE on the source, append-only catch-up of
-  -- rows that arrived after the copy watermark, drop the hypertable (Timescale's event trigger clears its
-  -- chunks and catalog), rename the copy into place, and rebuild the key + secondary indexes with their
-  -- original names (free now that the source is gone). One transaction: it commits whole or rolls back whole.
+-- Phase 2: the cutover (the one non-online window). Brief ACCESS EXCLUSIVE on the source; an append-only
+-- catch-up of rows that arrived after the copy watermark (control > max copied); drop the hypertable
+-- (Timescale's event trigger clears its chunks and catalog); rename the copy into place; rebuild the key,
+-- secondary indexes, and identity columns (CREATE TABLE LIKE carries none of those) with their original
+-- names; then hand off to transmute. The swap + rebuild is one transaction (commits whole or rolls back
+-- whole). When the caller leaves p_retain null, the source's drop_chunks policy interval is carried into
+-- pgpm's retain. Requires from_hypertable_copy to have run (the destination must exist).
+create or replace procedure pgpm.from_hypertable_cutover(
+  p_hypertable regclass, p_control name, p_interval interval,
+  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_paused boolean default true
+) language plpgsql as $$
+declare
+  v_nsp name; v_rel name; v_dest name; v_cols text; v_retain interval;
+  v_watermark timestamptz; v_orig regclass; k record;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
+  v_dest := v_rel || '_pgpm_dest';
+  if to_regclass(format('%I.%I', v_nsp, v_dest)) is null then
+    raise exception 'pg_partition_magician: from_hypertable_cutover(%) found no copy to cut over -- run from_hypertable_copy first',
+      p_hypertable;
+  end if;
+
+  -- retention translation: default from the source's drop_chunks policy when the caller did not set one
+  v_retain := p_retain;
+  if v_retain is null then
+    select (config->>'drop_after')::interval into v_retain from timescaledb_information.jobs
+     where proc_name = 'policy_retention' and hypertable_schema = v_nsp and hypertable_name = v_rel limit 1;
+  end if;
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+    from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped;
+
   execute format('lock table %I.%I in access exclusive mode', v_nsp, v_rel);
   execute format('select max(%I) from %I.%I', p_control, v_nsp, v_dest) into v_watermark;
   if v_watermark is not null then
@@ -151,9 +171,23 @@ begin
   end loop;
   commit;
 
-  -- 5. handoff: an ordinary plain table under the original name is exactly transmute's input.
+  -- handoff: an ordinary plain table under the original name is exactly transmute's input.
   v_orig := format('%I.%I', v_nsp, v_rel)::regclass;
   perform pgpm.transmute(v_orig, p_control, p_interval, p_obtain, v_retain,
                          p_keep_default, p_drain_batch, p_anchor, p_paused);
   commit;
+end $$;
+
+-- The one-shot driver: copy then cut over, back to back. Use the two phases directly instead when writes
+-- must keep arriving during the migration (copy, let the workload run, then cutover catches up the appends).
+create or replace procedure pgpm.from_hypertable(
+  p_hypertable regclass, p_control name, p_interval interval,
+  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_paused boolean default true
+) language plpgsql as $$
+begin
+  call pgpm.from_hypertable_copy(p_hypertable, p_control);
+  call pgpm.from_hypertable_cutover(p_hypertable, p_control, p_interval, p_obtain, p_retain,
+                                    p_keep_default, p_drain_batch, p_anchor, p_paused);
 end $$;

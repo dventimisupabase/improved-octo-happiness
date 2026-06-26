@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` exposes its phases, with an online append-only catch-up.** The migration is split
+  into `from_hypertable_copy` (build the destination and bulk-copy the existing chunks to a watermark,
+  source stays live) and `from_hypertable_cutover` (catch up rows that arrived after the watermark, swap
+  the copy in, hand off to transmute); `from_hypertable` runs both back to back. Driving them separately
+  lets writes keep arriving during the migration: appends written between copy and cutover (control > the
+  copy watermark) are caught up at cutover, so no row is lost. (tests/timescale/db/05)
 - **`from_hypertable` preserves identity columns.** A hypertable with an identity/sequence column (e.g. a
   composite `(id, ts)` PK with `id GENERATED ... AS IDENTITY`) kept losing it on migration: `CREATE TABLE
   (LIKE ...)` does not carry identity, so the destination's column became a plain column and inserts that
