@@ -42,8 +42,11 @@ until you `resume` it and maintenance runs.
 
 Parameters:
 
-- `p_control` -- the partition-key column. It **must already be a member of the table's primary key**
-  (Postgres requires a partitioned table's PK to include the partition key; `pgpm` never rewrites the PK).
+- `p_control` -- the partition-key column. It **must already be a member of a reusable key: a primary key
+  or a unique constraint** (Postgres requires a partitioned table's key to include the partition key;
+  `pgpm` reuses the existing key in place and never rewrites it). The column must be `NOT NULL` (a primary
+  key guarantees this; for a unique constraint it is checked). A bare unique index (not a constraint) is
+  refused with guidance to promote it first; a table with no usable key at all is refused.
 - `p_interval` -- the grid width (`interval '1 day'`, `'1 month'`, `'1 year'`, ...). Cast a bare literal:
   `interval '1 month'` (it disambiguates from the `bigint` overload).
 - `p_obtain` -- how many partitions to keep ahead of the frontier.
