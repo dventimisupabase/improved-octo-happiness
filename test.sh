@@ -6,22 +6,28 @@
 # a clean uninstall.
 #
 #   ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all]
+#   ./test.sh timescale                  # the from_hypertable track (TimescaleDB 2.16.1 / PG15)
 #
 # Channels:
 #   psql    sql/pg_partition_magician.sql via psql -f         (the source)
 #   bundle  scripts/build_install_bundle.sh output            (dashboard SQL editor)
 #   dbdev   scripts/build_dbdev_package.sh output (minified)  (dbdev / TLE / CREATE EXTENSION)
+#
+# The `timescale` track is separate: it needs TimescaleDB (its own image), is PG15-only, and is NOT part
+# of the default matrix. It exercises pgpm.from_hypertable against real hypertables (tests/timescale/).
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 VERSION="all"
 CHANNEL="all"
+TRACK="matrix"
 for arg in "$@"; do
   case "$arg" in
     --channel=*) CHANNEL="${arg#--channel=}" ;;
     15|16|17|18|all) VERSION="$arg" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all]"; exit 1 ;;
+    timescale) TRACK="timescale" ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale"; exit 1 ;;
   esac
 done
 
@@ -101,6 +107,56 @@ run_version() {  # <pg_version>
   $DC --profile "$p" down -v
   echo "PostgreSQL $v: PASS"
 }
+
+# The from_hypertable track. TimescaleDB-only, PG15. Each tests/timescale/db/*.sql runs against a fresh
+# throwaway database (disposable-db) because from_hypertable is a procedure that COMMITs (per chunk and
+# at cutover) and so cannot be wrapped in a rolled-back transaction. We drive psql directly and scan the
+# TAP output for failures (the Alpine image carries pgTAP but not pg_prove).
+run_timescale() {
+  local prof="timescale" svc="timescale" fail=0 f db out
+  echo; echo "========================================="
+  echo "TimescaleDB track (2.16.1-pg15) -- from_hypertable"
+  echo "========================================="
+  $DC --profile "$prof" down -v 2>/dev/null || true
+  $DC --profile "$prof" build $BUILD_PROGRESS
+  $DC --profile "$prof" up -d
+  for _ in $(seq 1 60); do
+    $DC --profile "$prof" exec -T "$svc" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1
+  done
+
+  for f in tests/timescale/db/*.sql; do
+    db="t_$(basename "$f" .sql | tr -cd 'a-z0-9_')"
+    echo "--- ${f##*/} (db: $db) ---"
+    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
+      -c "drop database if exists $db" -c "create database $db" \
+      -c "alter database $db set client_min_messages = warning" >/dev/null
+    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+      -c "create extension if not exists timescaledb; create extension if not exists pgtap;" >/dev/null
+    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+      --single-transaction -f /repo/sql/pg_partition_magician.sql >/dev/null
+    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+      -f /repo/sql/from_hypertable.sql >/dev/null
+    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+      -f /repo/tests/timescale/fixtures.sql >/dev/null
+    # -tA gives clean TAP (no table chrome); no ON_ERROR_STOP so every assertion reports.
+    out=$($DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -tAq -f "/repo/$f" 2>&1)
+    echo "$out" | grep -E '^(ok|not ok|1\.\.|# )' || true
+    if echo "$out" | grep -qE '^not ok|^# Looks like you failed|ERROR:'; then
+      echo "FAIL: $f"; fail=1
+    fi
+    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d postgres -q -c "drop database if exists $db" >/dev/null
+  done
+
+  $DC --profile "$prof" down -v
+  if [ "$fail" -ne 0 ]; then echo "TimescaleDB track: FAIL"; return 1; fi
+  echo "TimescaleDB track: PASS"
+}
+
+if [ "$TRACK" = "timescale" ]; then
+  run_timescale
+  echo; echo "All requested tests passed."
+  exit 0
+fi
 
 if [ "$VERSION" = "all" ]; then
   for v in 15 16 17 18; do run_version "$v"; done

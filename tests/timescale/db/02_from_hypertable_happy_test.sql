@@ -4,6 +4,7 @@
 select plan(6);
 
 select mk_keyed_hypertable('hp_mig', 240, '1 day', '10 days');
+drop table if exists hp_mig_snap;
 create table hp_mig_snap as select * from hp_mig;     -- fidelity baseline
 
 call pgpm.from_hypertable('hp_mig', 'ts', interval '1 month', p_paused => false);
@@ -31,6 +32,4 @@ select is(
   0, 'no _timescaledb hypertable catalog row remains for the old name');
 
 select * from finish();
-
-drop table if exists hp_mig cascade;
-drop table if exists hp_mig_snap cascade;
+-- no teardown: the harness runs each db/ test in a throwaway database (disposable-db).

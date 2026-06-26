@@ -32,10 +32,4 @@ select throws_like(
   'preflight refuses a multi-dimension (space-partitioned) hypertable');
 
 select * from finish();
-
--- Timescale forbids dropping a hypertable alongside other objects, so drop each on its own.
-drop table if exists ph_ok cascade;
-drop table if exists ph_keyless cascade;
-drop table if exists ph_space cascade;
-drop materialized view if exists ph_cagg_cagg cascade;
-drop table if exists ph_cagg cascade;
+-- no teardown: the harness runs each db/ test in a throwaway database (disposable-db).
