@@ -18,6 +18,8 @@ psql, or other tooling needed on the host.
 ./test.sh 15        # PG 15: build a pg_cron+pgtap image, install each channel,
                     # load fixtures, run the pgTAP suite, verify uninstall
 ./test.sh           # the full matrix: PG 15, 16, 17, 18
+./test.sh timescale # the from_hypertable track: TimescaleDB 2.16.1 / PG15 only,
+                    # its own image, NOT part of the default matrix
 ```
 
 `test.sh` exercises all three install channels (`psql`, bundle, dbdev) against a
@@ -38,12 +40,14 @@ docker compose --profile pg15 down -v
 | Path | What it is |
 |---|---|
 | `sql/pg_partition_magician.sql` | **The product.** The entire tool: schema `pgpm`, tables, functions, views. Pure SQL, idempotent. **Single source of truth.** |
+| `sql/from_hypertable.sql` | Optional TimescaleDB-only add-on: migrate a hypertable to a pgpm-managed partition set. Loaded on top of the core, only where `timescaledb` exists |
 | `sql/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
 | `extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
 | `scripts/build_install_bundle.sh` / `build_dbdev_package.sh` | Build the bundle / minified dbdev channel artifacts from the source |
 | `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap), Docker-only |
 | `fixtures/demo.sql` | Builds + transmutes the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
+| `tests/timescale/` | The `from_hypertable` track: its own `Dockerfile` (TimescaleDB + pgTAP), `fixtures.sql`, and `db/*.sql` tests, run by `./test.sh timescale` (disposable-db per file) |
 | `README.md` | Overview, quickstart, and links into the docs |
 | `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |

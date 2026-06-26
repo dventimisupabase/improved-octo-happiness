@@ -1,0 +1,35 @@
+name: TimescaleDB track
+
+# The from_hypertable migration track. Separate from the main matrix: it needs a TimescaleDB image
+# (its own Dockerfile), is PG15-only, and is pinned to the Supabase fleet version (TimescaleDB 2.16.1).
+# Path-filtered so it runs only when the migration code, its tests, or the harness change.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'sql/from_hypertable.sql'
+      - 'sql/pg_partition_magician.sql'
+      - 'tests/timescale/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - '.github/workflows/timescale.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'sql/from_hypertable.sql'
+      - 'sql/pg_partition_magician.sql'
+      - 'tests/timescale/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - '.github/workflows/timescale.yml'
+  workflow_dispatch:
+
+jobs:
+  timescale:
+    name: from_hypertable on TimescaleDB 2.16.1 / PG15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Run the from_hypertable track
+        run: ./test.sh timescale
