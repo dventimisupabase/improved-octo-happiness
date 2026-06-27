@@ -98,6 +98,31 @@ the frontier and the `DEFAULT` empty; the historical bulk stays in the monolith 
 unique constraint that includes the control column, or partitions the table keyless if it has neither. The
 one requirement is a `NOT NULL` control column. See the [transmute walkthrough](docs/guide.md#transmute-a-table).
 
+## Migrating from TimescaleDB
+
+Coming from a **TimescaleDB hypertable** (Apache edition)? `from_hypertable` migrates one to a pgpm-managed
+native partition set: it copies the hypertable into a plain table online (the source keeps serving traffic),
+then hands off to `transmute`. The copy preserves your keys, secondary indexes, identity columns (with their
+exact sequence position), generated columns, CHECK constraints, defaults, and NOT NULL, and a `drop_chunks`
+retention policy is carried into pgpm `retain`. Only the brief cutover takes a lock. Keyed and keyless
+hypertables are both supported. Append workloads catch up automatically; for workloads that update or delete
+rows during the copy, pass `p_track_changes => true` to capture those changes.
+
+```sql
+-- one shot: copy online, then cut over and hand off to transmute
+call pgpm.from_hypertable('public.metrics', 'ts', interval '1 day');
+```
+
+It is an optional add-on, loaded only where the `timescaledb` extension exists, so pgpm's core stays
+dependency-free:
+
+```bash
+psql "$DATABASE_URL" -f sql/from_hypertable.sql
+```
+
+See the [reference](docs/reference.md#migrating-from-timescaledb-from_hypertable) for the phases,
+`p_track_changes`, and the disk estimate.
+
 ## Documentation
 
 - **[User guide](docs/guide.md)**: concepts, install, transmuting a table, scheduling, refine, monitoring,
