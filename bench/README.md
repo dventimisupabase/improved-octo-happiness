@@ -213,6 +213,14 @@ conversion window (`pgfr_analyze.incident_timeline`). pgfr needs `pg_cron` + `pg
 preloaded (both true on Supabase). With `BENCH_PGFR=0` you get client-side latency + the pgpm
 conversion summary, but no system-metric time-series; set `BENCH_PGFR=1` for the full picture.
 
+When pgfr is present, the optional `pgpm_observe` add-on (`pgpm_observe/install.sql`) reads that same
+telemetry from pgpm's side, which is handy for reading a `BENCH_PGFR=1` run:
+`pgpm.impact_report('bench.events')` summarizes what the conversion did to the workload over the window
+pgpm was active (forced checkpoints, WAL, top waits, query latency), and
+`pgpm.feathering_validation('bench.events')` cross-checks each adaptive backoff against the pressure pgfr
+sampled. The module has its own test track (`./test.sh observe`); see the
+[reference](../docs/reference.md#observability-with-pg_flight_recorder-observe).
+
 ## Interpreting the results
 
 - **convert** is the window that matters: pgpm is obtaining + draining the default while
