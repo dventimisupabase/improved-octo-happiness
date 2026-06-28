@@ -172,7 +172,18 @@ run_timescale() {
 run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + correlation (PGFR present)
   local prof="pg15" svc="postgres15" fail=0 out
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
-  local pgfr="/repo/bench/vendor/pg_flight_recorder"
+  local pgfr="/repo/bench/vendor/pg_flight_recorder"          # container path (repo mounted at /repo)
+  local pgfr_host="bench/vendor/pg_flight_recorder"           # host path (bench/vendor is gitignored)
+  local pgfr_repo="https://github.com/dventimisupabase/pg_flight_recorder"
+  local pgfr_sha="34517280f70b67ae8c8f99d18515550b629c9cd2"   # pin for reproducible CI
+  # Clone-on-demand: PGFR is a vendored external repo (bench/vendor is gitignored), so it is absent on a
+  # fresh checkout / in CI. Pull it at the pinned SHA when missing; a full clone so the SHA is reachable.
+  if [ ! -f "$pgfr_host/pgfr_record/install.sql" ]; then
+    echo ">>> cloning pg_flight_recorder@${pgfr_sha:0:7} into $pgfr_host"
+    rm -rf "$pgfr_host"; mkdir -p "$(dirname "$pgfr_host")"
+    git clone --quiet "$pgfr_repo" "$pgfr_host"
+    git -C "$pgfr_host" checkout --quiet "$pgfr_sha"
+  fi
   echo; echo "========================================="
   echo "pg_flight_recorder observability track (pg15)"
   echo "========================================="
