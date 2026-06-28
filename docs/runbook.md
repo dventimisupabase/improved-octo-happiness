@@ -249,7 +249,10 @@ insurance you are glad to hold and alarmed to ever use.
 holds nothing. A non-zero `closed_rows` means a stray landed there (obtain fell behind the frontier, a
 backdated row, or a gap) and the **assistant drain** has not yet evacuated it into a proper partition. A
 falling `closed_rows` with `drain_skips ~ 0` is merely slow; a stuck `closed_rows` with a stale
-`last_drained` and a climbing `drain_skips` is a **wedged** drain.
+`last_drained` and a climbing `drain_skips` is a **wedged** drain. Since the monolith+refine redesign a
+true wedge is rare: the bulk move is `refine`, which copies and cannot strand a duplicate; the drain only
+relocates strays; and upserts to historical keys hit the attached monolith rather than an invisible child.
+So **merely slow** is the common case and **wedged** is a corner -- but both are worth recognizing.
 
 **Steps.**
 
@@ -276,9 +279,11 @@ falling `closed_rows` with `drain_skips ~ 0` is merely slow; a stuck `closed_row
 
    A recurring duplicate-key error is the upsert-into-a-moved-row wedge (see the guide's
    [read consistency](guide.md#read-consistency-during-a-move)): an `INSERT ... ON CONFLICT` targeted a
-   row already moved into an unattached child and wrote a duplicate into the `DEFAULT`, which the next
-   batch then collides on. Remove the duplicate from the `DEFAULT` (keep the already-moved copy), then let
-   the drain continue.
+   stray already moved into an unattached drain child and wrote a duplicate into the `DEFAULT`, which the
+   next batch then collides on. Post-redesign this is the narrow residual case -- it needs a concurrent
+   upsert to a *stray* mid-move, since historical keys live in the attached monolith and `refine` never
+   moves through an invisible child. Remove the duplicate from the `DEFAULT` (keep the already-moved copy),
+   then let the drain continue.
 
 **Verify.**
 
