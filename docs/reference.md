@@ -139,6 +139,8 @@ Scope and caveats:
   its lock. The cutover's `ACCESS EXCLUSIVE` window is therefore **brief and metadata-bound** -- it catches up
   the delta, swaps the table in, and *adopts* the pre-built indexes (`USING INDEX`); it does not rebuild them
   under the lock, so the blocking window does not grow with table size the way an under-lock rebuild would.
+  With `p_track_changes`, the captured backlog is also reconciled **online, in micro-batches, before the
+  lock** (`from_hypertable_drain_delta`), so the window does not grow with the accumulated change lag either.
 - The copy writes a **full second table**, so the migration transiently needs roughly the source's current
   size in extra disk until cutover drops the old hypertable. `from_hypertable_preflight` raises a `NOTICE`
   with the estimate; `from_hypertable_disk_estimate` returns it for sizing a volume ahead of time.
@@ -154,16 +156,16 @@ pgpm.from_hypertable(
   p_hypertable regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true, p_track_changes boolean default false
+  p_paused boolean default true, p_track_changes boolean default false, p_predrain boolean default true
 )
 ```
 
 The one-shot driver: runs `from_hypertable_copy` then `from_hypertable_cutover` back to back. Use it when the
 migration does not need to interleave application writes between the phases. `p_interval` and the
 `p_obtain`/`p_retain`/`p_keep_default`/`p_drain_batch`/`p_anchor`/`p_paused` parameters pass straight through
-to `transmute` (see there); `p_control` is the time column; `p_track_changes` is described under
-`from_hypertable_copy`. When `p_retain` is left `null`, the source's `drop_chunks` policy interval (if any) is
-carried in.
+to `transmute` (see there); `p_control` is the time column; `p_track_changes` and `p_predrain` are described
+under `from_hypertable_copy` and `from_hypertable_cutover`. When `p_retain` is left `null`, the source's
+`drop_chunks` policy interval (if any) is carried in.
 
 ```sql
 call pgpm.from_hypertable('public.metrics', 'ts', interval '1 day', p_paused => false);
@@ -183,11 +185,44 @@ the workload continue, then run `from_hypertable_cutover` when ready.
   default), the cutover catches up **append-only** (rows whose control column is past the copy watermark),
   which is correct for append-only workloads but **silently loses updates and deletes** to already-copied
   rows. When `true`, the copy installs an `AFTER INSERT/UPDATE/DELETE` row trigger on the source that logs the
-  touched key values to a `<rel>_pgpm_delta` table, and the cutover reconciles every touched key against the
-  live source (delete the copied row, re-insert the current source row). Reconciliation is by the key
-  `transmute` reuses (a primary key or unique constraint), so `p_track_changes => true` is **refused on a
-  keyless table** (no key to reconcile by). Set it for any workload that updates or deletes rows during the
-  migration window.
+  touched key values (plus a monotonic `pgpm_seq` ordering column) to a `<rel>_pgpm_delta` table. That
+  backlog is reconciled **online, in micro-batches, before the cutover** (`from_hypertable_drain_delta`, run
+  automatically by the cutover), and the cutover applies only the residual under the lock. Reconciliation is
+  by the key `transmute` reuses (a primary key or unique constraint), so `p_track_changes => true` is
+  **refused on a keyless table** (no key to reconcile by) and on a key with a **nullable (non-control)
+  column** (a `NULL` key component can never be reconciled, so the change would be lost). Set it for any
+  workload that updates or deletes rows during the migration window.
+
+### `from_hypertable_drain_delta` / `from_hypertable_drain_delta_step`
+
+```sql
+pgpm.from_hypertable_drain_delta(
+  p_hypertable regclass, p_control name, p_batch int default 5000,
+  p_threshold bigint default 0, p_max_iter int default 1000000, p_best_effort boolean default false
+)
+pgpm.from_hypertable_drain_delta_step(p_hypertable regclass, p_control name, p_batch int default 5000)
+  returns bigint
+```
+
+Reconcile the `p_track_changes` delta **online, while the source stays live**, so the cutover's lock applies
+only a tiny residual instead of the whole online-copy backlog (issue #170). The cutover runs this
+automatically (`p_predrain`), but you can also drive it directly during a long two-phase window: after
+`from_hypertable_copy`, call it repeatedly while the application keeps writing, then `from_hypertable_cutover`.
+
+The reconcile is idempotent and order-independent per key (delete the key's copied row from the destination,
+re-insert its current source row), which is what makes incremental draining safe. Each batch
+**delete-RETURNS** its rows from the delta as the authority and reconciles exactly those keys against the live
+source, so a change is never deleted-without-applying; the source read is bounded per batch to the touched
+control range for chunk exclusion. The driver mirrors `drain`'s `_step` + loop shape and **commits per batch**
+(so WAL recycles); `_step` does one batch (no commit, returns the keys it cleared). It builds a throwaway key
+index on the private destination so the per-batch delete is index-assisted; the cutover drops it.
+
+- `p_batch` -- micro-batch size (delta rows processed per batch, bounded by a `pgpm_seq` watermark).
+- `p_threshold` -- stop once the residual is at/below this many delta rows (`0` = drain to empty). Under
+  sustained write load, stop a little short and let the under-lock cutover pass finish the rest.
+- `p_max_iter` -- convergence budget. If the workload dirties keys faster than the drain clears them, the
+  driver raises a loud, actionable error -- unless `p_best_effort`, in which case it returns so the caller
+  (the cutover) can take the lock and finish the residual under it.
 
 ### `from_hypertable_cutover`
 
@@ -196,12 +231,15 @@ pgpm.from_hypertable_cutover(
   p_hypertable regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true
+  p_paused boolean default true, p_predrain boolean default true
 )
 ```
 
-Phase 2: the cutover. First it **pre-builds the destination's primary key and secondary indexes online** (on
-the private copy, before any lock -- this is the O(rows) work, deliberately kept out of the blocking window).
+Phase 2: the cutover. When change-tracking is on and `p_predrain` is `true` (the default), it first
+**pre-drains the delta online** (`from_hypertable_drain_delta`, best-effort, using `p_drain_batch` as the
+batch size and residual threshold) so only a tiny residual is left for the lock. Then it **pre-builds the
+destination's primary key and secondary indexes online** (on the private copy, before any lock -- this is the
+O(rows) work, deliberately kept out of the blocking window).
 Then it takes a **brief, metadata-only `ACCESS EXCLUSIVE` window**: catch up the writes that arrived during
 the copy (append-only, or a full delta replay when `from_hypertable_copy` ran with `p_track_changes => true`
 -- auto-detected via the delta table, so the two phases cannot disagree), drop the hypertable, rename the copy

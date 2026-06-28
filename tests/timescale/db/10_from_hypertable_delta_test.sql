@@ -3,12 +3,21 @@
 -- arrive during the online window are reconciled at cutover, not just late appends. Reconciliation is by the
 -- reused key (PK or unique constraint), so it needs a key: a keyless table refuses tracking up front.
 -- Autocommit, disposable-db.
-select plan(8);
+select plan(9);
 
 select mk_keyed_hypertable('hp_d2', 240, '1 day', '10 days');   -- UNIQUE (device_id, ts), device_id = g
 
 -- PHASE 1: online bulk copy WITH change tracking. The source stays live.
 call pgpm.from_hypertable_copy('hp_d2', 'ts', p_track_changes => true);
+
+-- Regression for #170: the delta now carries a pgpm_seq ordering column, but a direct cutover WITHOUT any
+-- online drain must still reconcile the whole (undrained) delta under the lock -- the under-lock pass is the
+-- correctness backstop. (The cutover's default-on pre-drain finds the residual already below its threshold
+-- here, so it does no online work; the assertions below confirm the under-lock reconcile is unaffected.)
+select ok(
+  exists(select 1 from information_schema.columns
+          where table_name = 'hp_d2_pgpm_delta' and column_name = 'pgpm_seq'),
+  'the delta carries the pgpm_seq ordering column (and the undrained cutover still reconciles correctly)');
 
 -- writes that arrive DURING the online window, against ALREADY-COPIED rows. random()*100 is in [0,100), so
 -- temp = -1 uniquely marks the updated rows; an append-only catch-up would miss all three change kinds.
