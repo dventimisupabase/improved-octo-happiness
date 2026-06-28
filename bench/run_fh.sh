@@ -44,6 +44,13 @@ BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-2 seconds}"
 BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-10}"
 BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-1800}"   # cap on the refine observation window
 
+# #170 cutover-lock-window arm: BENCH_PREDRAIN toggles the cutover's online pre-drain (1 = drained,
+# p_predrain=>true; 0 = undrained, p_predrain=>false). Run a rung twice (1 vs 0) on FRESH instances and
+# compare the "cutover lock window" report section. BENCH_LOCKPROBE arms a background pg_locks session that
+# times the TRUE ACCESS EXCLUSIVE window (vs the whole cutover call) and reads the at-lock delta residual.
+BENCH_PREDRAIN="${BENCH_PREDRAIN:-1}"
+BENCH_LOCKPROBE="${BENCH_LOCKPROBE:-1}"
+
 BENCH_PGFR="${BENCH_PGFR:-0}"
 BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"
@@ -221,12 +228,71 @@ DEST_ROWS=$(q "select count(*) from bench.events_pgpm_dest")
 DELTA_PENDING=$(q "select coalesce((select count(*) from bench.events_pgpm_delta),0)")
 echo "  copy complete in ${copy_secs}s (dest holds $DEST_ROWS rows; $DELTA_PENDING in-flight delta keys to reconcile at cutover)"
 
-# 4c. PHASE 2 (cutover): brief lock, catch up + reconcile, drop hypertable, hand off to transmute
-echo "  firing from_hypertable_cutover('bench.events','created_at', interval '$BENCH_FH_INTERVAL', p_paused => false)..."
+# 4c. PHASE 2 (cutover): brief lock, catch up + reconcile, drop hypertable, hand off to transmute.
+# #170: optionally pre-drain the delta ONLINE before the lock (p_predrain), and time the TRUE ACCESS
+# EXCLUSIVE window with a background pg_locks probe (the whole cutover call also includes the online
+# pre-drain + the O(rows) index pre-build, so cut_secs overstates the blocking window).
+PREDRAIN=$([ "$BENCH_PREDRAIN" = "1" ] && echo true || echo false)
+LOCK_WINDOW_S="n/a"; probe_pid=""
+# the at-lock residual the under-lock reconcile applies: the whole captured backlog when undrained, or
+# threshold-bounded when the pre-drain ran. (Not probed -- a probe reading the delta would lock it and
+# block the cutover's drop; see the probe note above.)
+if [ "$BENCH_PREDRAIN" = "1" ]; then AT_LOCK_RESIDUAL="<= $BENCH_DRAIN_BATCH (pre-drain threshold)"; else AT_LOCK_RESIDUAL="$DELTA_PENDING (whole backlog; no pre-drain)"; fi
+if [ "$BENCH_LOCKPROBE" = "1" ]; then
+  # Server-side probe: ONE session brackets the source's AccessExclusiveLock (pg_locks is a live, non-MVCC
+  # view, so re-querying within the one txn sees the lock appear/vanish). It reads ONLY pg_locks -- never the
+  # source OR the delta -- so it takes no relation lock that the cutover needs: reading the delta here would
+  # hold AccessShare on it for the whole probe txn and DEADLOCK the cutover's drop of the delta. The at-lock
+  # residual is reported separately (DELTA_PENDING for undrained; threshold-bounded for drained), not probed.
+  cat > "$RESULTS/lockprobe.sql" <<'SQL'
+set statement_timeout=0; set lock_timeout=0; set client_min_messages=notice;
+do $probe$
+declare
+  v_src oid := ('bench.events'::regclass)::oid;
+  v_held boolean; v_acq timestamptz; v_rel timestamptz;
+  v_deadline timestamptz := clock_timestamp() + interval '2 hours';   -- backstop; the harness stops the probe right after the cutover
+begin
+  loop   -- wait for the cutover to take ACCESS EXCLUSIVE on the source
+    select exists(select 1 from pg_locks where relation=v_src and mode='AccessExclusiveLock' and granted) into v_held;
+    exit when v_held;
+    if clock_timestamp() > v_deadline then raise notice 'LOCKPROBE status=timeout-no-acquire'; return; end if;
+    perform pg_sleep(0.02);
+  end loop;
+  v_acq := clock_timestamp();
+  loop   -- wait for release (the swap committed -> lock gone / relation dropped)
+    select exists(select 1 from pg_locks where relation=v_src and mode='AccessExclusiveLock' and granted) into v_held;
+    exit when not v_held;
+    perform pg_sleep(0.01);
+  end loop;
+  v_rel := clock_timestamp();
+  raise notice 'LOCKPROBE status=ok window_s=%', round(extract(epoch from (v_rel - v_acq))::numeric, 3);
+end
+$probe$;
+SQL
+  if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=0 -f "$RESULTS/lockprobe.sql" > "$RESULTS/lockprobe.log" 2>&1 &
+  else "$PSQL" -v ON_ERROR_STOP=0 -f "$RESULTS/lockprobe.sql" > "$RESULTS/lockprobe.log" 2>&1 & fi
+  probe_pid=$!; BG_PIDS+=("$probe_pid")
+  sleep 0.5   # let the probe start polling before the cutover takes its lock
+fi
+echo "  firing from_hypertable_cutover('bench.events','created_at', interval '$BENCH_FH_INTERVAL', p_predrain => $PREDRAIN, p_paused => false)..."
 cut_t0=$(q "select extract(epoch from clock_timestamp())")
-q "call pgpm.from_hypertable_cutover('bench.events','created_at', interval '$BENCH_FH_INTERVAL', p_obtain => $BENCH_OBTAIN, p_drain_batch => $BENCH_DRAIN_BATCH, p_paused => false)" >/dev/null
+q "call pgpm.from_hypertable_cutover('bench.events','created_at', interval '$BENCH_FH_INTERVAL', p_obtain => $BENCH_OBTAIN, p_drain_batch => $BENCH_DRAIN_BATCH, p_paused => false, p_predrain => $PREDRAIN)" >/dev/null
 cut_secs=$(awk -v a="$cut_t0" -v b="$(q "select extract(epoch from clock_timestamp())")" 'BEGIN{printf "%.1f", b-a}')
 echo "  cutover complete in ${cut_secs}s -- bench.events is now relkind '$(q "select relkind from pg_class where oid='bench.events'::regclass")' (p=partitioned)"
+if [ -n "$probe_pid" ]; then
+  # The lock is released by the time the cutover call returns, so a probe that caught it has already exited;
+  # give it a moment to flush its NOTICE, then stop it (a sub-resolution window it MISSED would otherwise
+  # spin on its acquire-wait until the backstop, so never wait unbounded).
+  for _ in $(seq 1 15); do kill -0 "$probe_pid" 2>/dev/null || break; sleep 0.2; done
+  kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true
+  probe_line=$(grep 'LOCKPROBE' "$RESULTS/lockprobe.log" 2>/dev/null | tail -1)
+  if printf '%s' "$probe_line" | grep -q 'status=ok'; then
+    LOCK_WINDOW_S=$(printf '%s' "$probe_line" | grep -oE 'window_s=[0-9.]+' | cut -d= -f2)
+  else
+    LOCK_WINDOW_S="n/a"; echo "  (lock probe: ${probe_line:-no output; the window may have been below the probe poll resolution})"
+  fi
+  echo "  cutover ACCESS EXCLUSIVE window: ${LOCK_WINDOW_S}s  (at-lock residual: ${AT_LOCK_RESIDUAL}; whole cutover call ${cut_secs}s)"
+fi
 
 # 4d. conservation: the immutable cohort must be unchanged through the online migration
 ANCHOR1=$(q "select count(*) from bench.events where user_id >= $ANCHOR_USER_LO")
@@ -357,11 +423,23 @@ say "report"
   echo "- model: **from_hypertable** -- online per-chunk copy (source live) with p_track_changes, then a brief-lock cutover (catch-up + delta reconcile + drop hypertable + transmute handoff), then refine the time-monolith."
   echo "- conversion window: \`$convert_start\` -> \`$convert_end\`"
   echo "- copy: ${copy_secs}s online, copied $DEST_ROWS rows; $DELTA_PENDING in-flight changes (insert/update/delete) captured by the trigger and reconciled at cutover; progress in \`copy.progress.csv\`"
-  echo "- cutover: ${cut_secs}s (the only non-online window: brief ACCESS EXCLUSIVE)"
+  echo "- cutover: ${cut_secs}s total call (online pre-drain + index pre-build + the brief ACCESS EXCLUSIVE window; see 'cutover lock window' below for the blocking window alone)"
   echo "- **conservation** (immutable cohort users >= $ANCHOR_USER_LO): before=$ANCHOR0 after=$ANCHOR1 -> $([ "$CONS" = ok ] && echo 'CONSERVED ✅' || echo 'MISMATCH ❌')"
   echo "- hypertable catalog rows remaining: $HT_LEFT (0 = torn down)"
   if [ "$BENCH_REFINE" = "1" ]; then
     echo "- refine: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='refine_copy'") copy microbatches, coarse children remaining: \`$REFINE_COARSE_FINAL\` (0 = monolith fully split into '$BENCH_FH_INTERVAL' partitions); trace in \`refine.progress.csv\`"
+  fi
+  echo
+  echo "## cutover lock window (#170)"
+  echo
+  echo "- mode: $([ "$BENCH_PREDRAIN" = "1" ] && echo '**drained** (p_predrain=>true)' || echo '**undrained** (p_predrain=>false)')"
+  echo "- backlog at cutover entry: $DELTA_PENDING delta rows"
+  echo "- at-lock residual (delta the under-lock reconcile applied): $AT_LOCK_RESIDUAL"
+  echo "- **ACCESS EXCLUSIVE window: ${LOCK_WINDOW_S}s** (whole cutover call: ${cut_secs}s; ± one probe poll)"
+  echo "- context: copy ${copy_secs}s, $(q "select count(*) from bench.events") rows / $(q "select pg_size_pretty(coalesce((select sum(pg_total_relation_size(inhrelid)) from pg_inherits where inhparent='bench.events'::regclass), pg_total_relation_size('bench.events'::regclass)))") on disk, drain_batch $BENCH_DRAIN_BATCH"
+  echo "- compare with the other arm (run the rung twice, BENCH_PREDRAIN=1 vs 0, on fresh instances): undrained's residual == the whole backlog and its window grows with the copy; drained's residual is bounded by ~drain_batch and its window stays flat."
+  if [ "$have_pgfr" = "1" ]; then
+    echo "- pgfr corroboration (qualitative, **60s cadence -- cannot resolve the window**, esp. the drained arm): in \`lock_samples\` over \`$convert_start\`..\`$convert_end\`, a sample landing inside a long undrained window shows the workload backends blocked by the cutover's backend on a relation lock -- confirming the timed stall is the ACCESS EXCLUSIVE, not a checkpoint/IO stall."
   fi
   echo
   if [ "$have_pgfr" = "1" ]; then echo "## system metrics (pg_flight_recorder)"; echo; echo "Slice pgfr's series to \`$convert_start\` -> \`$convert_end\`. Narrative: \`pgfr_report.md\`."; fi
