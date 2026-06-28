@@ -206,9 +206,17 @@ empty.
    ```
 
    - **Leading-edge lag** -- the keys sit at/near the frontier: `obtain` fell behind the writers. The
-     urgent case, since it recurs and grows into a write-availability risk. Keep more partitions ahead
+     urgent case, since it recurs and grows into a write-availability risk. Confirm it is `obtain`
+     deferring (not just slow cadence): `pgpm.log` shows repeated `obtain_skip` rows, the maintain note
+     carries `obtain_backoff`, `config.obtain_retry_after` is set in the future, and no new future
+     partitions appear in `pgpm.partitions`. The cause is lock contention -- obtaining a future partition
+     briefly needs `ACCESS EXCLUSIVE` on the populated `DEFAULT`, so under sustained writes `obtain` keeps
+     losing that race and maintenance backs it off (it waits out `obtain_retry_after` rather than retrying
+     every tick). Keep more partitions ahead
      (`update pgpm.config set obtain = <n> where parent_table = 'public.events'::regclass;`) and/or run the
-     cron more often; catch up now with `select pgpm.drain_all('public.events');`.
+     cron more often; force one now in a brief write lull with `select pgpm.obtain('public.events');`, and
+     catch up the backlog with `select pgpm.drain_all('public.events');`. On a perpetually-hot table,
+     schedule the conversion/obtain during a quieter window.
    - **Backdated / late-arriving** -- the keys sit well below the frontier: a producer is emitting old
      timestamps/ids (clock skew, a replay or backfill), or your `retain` window is narrower than the real
      late-arrival tail. Fix the producer, or widen retention. The drain homes these into a partition (or
