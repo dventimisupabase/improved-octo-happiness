@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` drains the change-capture delta online, before the cutover lock.** With
+  `p_track_changes`, the cutover reconciled the *entire* delta under the `ACCESS EXCLUSIVE` lock -- and the
+  delta is every key touched for the whole online-copy duration, so the locked window grew with the table it
+  is meant to migrate quickly. New `from_hypertable_drain_delta` (a `_step` + driver pair, mirroring
+  `drain`) reconciles the delta **online, in bounded micro-batches, while the source stays live**, chasing
+  the backlog down so the lock applies only a tiny residual. The reconcile is idempotent and
+  order-independent per key, which makes incremental draining safe; it delete-RETURNS each batch from the
+  delta as the authority and reconciles exactly those keys against the live source (so a change is never
+  deleted-without-applying), bounded per batch to the touched control range for chunk exclusion. The cutover
+  now runs this pre-drain automatically (best-effort, new `p_predrain` default `true`); under sustained write
+  load it stops at a residual threshold and the under-lock pass -- still the correctness backstop -- finishes
+  the rest, or a convergence budget fails loudly. The delta gains a monotonic `pgpm_seq` ordering column for
+  the batch watermark. Also closes a pre-existing silent-loss hole: tracking is now refused on a key with a
+  nullable (non-control) column, since a `NULL` key component can never be reconciled. (issue #170,
+  supersedes #165; tests/timescale/db/14)
 - **`transmute` and `untransmute` preserve an identity sequence's exact position.** Both reseeded the
   identity sequence to `max(id) + 1`, which is correct only when the sequence sits at its max. A sequence
   **ahead** of `max(id)` -- from rolled-back inserts, sequence caching, or deleted high rows -- would then

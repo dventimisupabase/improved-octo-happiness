@@ -190,6 +190,18 @@ begin
       join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
      where i.indexrelid = v_keyidx;
 
+    -- Reconciliation matches keys with a row-constructor IN, which never matches a NULL component -- so a
+    -- key row with a NULL in any non-control key column could never be reconciled and its change would be
+    -- silently lost (both online and under the lock). PK columns are NOT NULL, but a reused UNIQUE key may
+    -- have nullable columns; refuse tracking up front rather than lose changes.
+    if exists (select 1 from pg_index i
+                 cross join lateral unnest(i.indkey) as k(attnum)
+                 join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+                where i.indexrelid = v_keyidx and not a.attnotnull and a.attname <> p_control) then
+      raise exception 'pg_partition_magician: from_hypertable_copy(%, p_track_changes => true) cannot track by a key with a nullable column -- a NULL key component can never be reconciled (the change would be lost). Add NOT NULL to the key column(s), or drop p_track_changes to migrate append-only.',
+        p_hypertable;
+    end if;
+
     v_delta := v_rel || '_pgpm_delta';
     v_trgfn := v_rel || '_pgpm_delta_fn';
     v_trg   := v_rel || '_pgpm_delta_trg';
@@ -197,6 +209,14 @@ begin
     -- delta holds just the key columns (their types come from the source via WITH NO DATA)
     execute format('create table %I.%I as select %s from %I.%I with no data',
                    v_nsp, v_delta, v_keycols, v_nsp, v_rel);
+    -- Append a monotonic ordering column (highest attnum) so the online delta-drain (from_hypertable_drain_delta,
+    -- issue #170) can batch by a pgpm_seq watermark: a batch processes+deletes rows with pgpm_seq <= watermark,
+    -- and any change that arrives mid-batch lands at a higher seq for the next pass. The cutover's key
+    -- introspection EXCLUDES pgpm_seq by name so it is not mistaken for a key column; the trigger inserts only
+    -- the key columns (by an explicit list), so identity auto-populates pgpm_seq. Indexed so the watermark
+    -- offset/limit and the range delete are index-assisted at scale.
+    execute format('alter table %I.%I add column pgpm_seq bigint generated always as identity', v_nsp, v_delta);
+    execute format('create index on %I.%I (pgpm_seq)', v_nsp, v_delta);
     -- the trigger body is dollar-quoted with a pgpm tag; the format template is single-quoted (inner quotes
     -- doubled) to avoid nesting another dollar-quoted string inside this procedure body.
     execute format('create or replace function %I.%I() returns trigger language plpgsql as $pgpm$
@@ -244,6 +264,145 @@ begin
   commit;
 end $$;
 
+-- Online delta drain (issue #170): reconcile the change-capture delta in bounded micro-batches WHILE the
+-- source stays live, BEFORE the cutover takes its lock, so the locked window applies only a tiny residual
+-- instead of the whole online-copy backlog. The reconcile is idempotent and order-independent per key (drop
+-- the key's copied row from the dest, reinsert its current source row -- a deleted key stays absent, an
+-- updated key gets its current value, an inserted key appears), which is exactly what makes incremental
+-- draining safe: partial progress is always consistent, and any key can be reconciled more than once with no
+-- effect. New writes keep appending to the delta during the drain; we chase the backlog down. The final
+-- (tiny) residual is applied by the cutover under the brief lock, which is the correctness backstop.
+
+-- from_hypertable_drain_delta_step does ONE micro-batch (no commit; the driver commits per batch). It
+-- delete-RETURNS the batch's distinct keys from the delta as the authority and reconciles EXACTLY those keys
+-- against the live source: a key the batch does not see (e.g. a write still in flight) is simply left in the
+-- delta for the next batch or the under-lock final reconcile, so a change is never deleted-without-applying
+-- (the read-then-delete race a two-snapshot approach would have). The batch is bounded by a pgpm_seq
+-- watermark; the source read is bounded to the batch's control [min,max] as literal constants so TimescaleDB
+-- excludes untouched chunks -- per-batch, even tighter than the one-shot reconcile (#166). Returns the number
+-- of distinct keys reconciled this batch (0 = the delta is empty).
+create or replace function pgpm.from_hypertable_drain_delta_step(
+  p_hypertable regclass, p_control name, p_batch int default 5000
+) returns bigint language plpgsql as $$
+declare
+  v_nsp name; v_rel name; v_dest name; v_delta name; v_drainkey name;
+  v_keycols text; v_dkey text; v_skey text; v_cols text;
+  v_ctl_type text; v_min_ctl text; v_max_ctl text; v_watermark bigint; v_keys bigint;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
+  v_dest := v_rel || '_pgpm_dest';
+  v_delta := v_rel || '_pgpm_delta';
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then
+    raise exception 'pg_partition_magician: from_hypertable_drain_delta_step(%) found no delta -- change tracking was not enabled by from_hypertable_copy', p_hypertable;
+  end if;
+
+  -- key columns = every delta column EXCEPT the pgpm_seq ordering column, in attnum order (the same order
+  -- the cutover uses, so the row constructors line up). d./s. variants for the dest delete + source insert.
+  select string_agg(quote_ident(attname), ', ' order by attnum),
+         '(' || string_agg('d.' || quote_ident(attname), ', ' order by attnum) || ')',
+         '(' || string_agg('s.' || quote_ident(attname), ', ' order by attnum) || ')'
+    into v_keycols, v_dkey, v_skey
+    from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
+      and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';
+  -- the source/dest column list for the reinsert (generated columns omitted: they recompute on insert)
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+    from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped and attgenerated = '';
+
+  -- the dest has no indexes after the bulk copy; without a key index every batch's dest delete seqscans the
+  -- whole dest. Build it once (if-not-exists; the driver normally builds it before the loop).
+  v_drainkey := left(v_rel || '_pgpm_drainkey', 63);
+  if to_regclass(format('%I.%I', v_nsp, v_drainkey)) is null then
+    execute format('create index %I on %I.%I (%s)', v_drainkey, v_nsp, v_dest, v_keycols);
+  end if;
+
+  -- batch boundary: the pgpm_seq of the p_batch-th oldest delta row (or max when fewer remain)
+  execute format('select coalesce((select pgpm_seq from %I.%I order by pgpm_seq offset %s limit 1), (select max(pgpm_seq) from %I.%I))',
+                 v_nsp, v_delta, greatest(p_batch - 1, 0), v_nsp, v_delta) into v_watermark;
+  if v_watermark is null then return 0; end if;   -- delta empty
+
+  -- materialize this batch's distinct keys authoritatively by DELETING them: delete-returning is the source
+  -- of truth, so we reconcile exactly what we removed (no delete-without-apply race). on commit drop: the
+  -- driver commits after each batch (dropping it), a standalone call drops it at autocommit; the drop-if-
+  -- exists first guards the rare same-transaction re-call.
+  execute 'drop table if exists pgpm_dbatch';
+  execute format('create temp table pgpm_dbatch on commit drop as
+                  with d as (delete from %I.%I where pgpm_seq <= %s returning %s)
+                  select distinct %s from d',
+                 v_nsp, v_delta, v_watermark, v_keycols, v_keycols);
+  get diagnostics v_keys = row_count;
+
+  -- bound the source read to the batch's touched control range, as literal constants, for chunk exclusion
+  select format_type(atttypid, atttypmod) into v_ctl_type
+    from pg_attribute where attrelid = p_hypertable and attname = p_control and not attisdropped;
+  execute format('select min(%I)::text, max(%I)::text from pgpm_dbatch', p_control, p_control)
+    into v_min_ctl, v_max_ctl;
+
+  -- reconcile: drop the batch's keys from the dest, then reinsert their current source rows
+  execute format('delete from %I.%I d where %s in (select %s from pgpm_dbatch)', v_nsp, v_dest, v_dkey, v_keycols);
+  if v_min_ctl is not null then
+    execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from pgpm_dbatch) and %I >= %L::%s and %I <= %L::%s',
+                   v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_keycols,
+                   p_control, v_min_ctl, v_ctl_type, p_control, v_max_ctl, v_ctl_type);
+  else
+    execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from pgpm_dbatch)',
+                   v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_keycols);
+  end if;
+  return v_keys;
+end $$;
+
+-- from_hypertable_drain_delta loops the step with a per-batch COMMIT (so WAL recycles -- the same reason
+-- from_hypertable_copy commits per chunk), mirroring drain_all's _step + _all shape. It chases the backlog
+-- down until the residual is at/below p_threshold (0 = drain to empty), tested cheaply with an EXISTS at
+-- offset (like drain_step's EXISTS-not-count). Under sustained write load the residual may never reach the
+-- threshold; p_max_iter bounds the loop -- it raises a loud, actionable error UNLESS p_best_effort, in which
+-- case it returns so the caller (the cutover) can take the lock and finish the now-smaller residual under it.
+-- The first batch with work builds the dest's drain key index (in its own transaction, skipped when there is
+-- nothing to drain) and leaves it for the cutover to drop, so repeated operator calls reuse it.
+create or replace procedure pgpm.from_hypertable_drain_delta(
+  p_hypertable regclass, p_control name, p_batch int default 5000,
+  p_threshold bigint default 0, p_max_iter int default 1000000, p_best_effort boolean default false
+) language plpgsql as $$
+declare
+  v_nsp name; v_rel name; v_dest name; v_delta name; v_drainkey name; v_keycols text;
+  v_iter int := 0; v_more boolean;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
+  v_dest := v_rel || '_pgpm_dest';
+  v_delta := v_rel || '_pgpm_delta';
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then
+    raise exception 'pg_partition_magician: from_hypertable_drain_delta(%) found no delta -- change tracking was not enabled by from_hypertable_copy', p_hypertable;
+  end if;
+
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_keycols
+    from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
+      and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';
+  v_drainkey := left(v_rel || '_pgpm_drainkey', 63);
+
+  loop
+    -- residual <= threshold? EXISTS at offset stops at the first row past the threshold (count > threshold)
+    execute format('select exists(select 1 from %I.%I order by pgpm_seq offset %s limit 1)',
+                   v_nsp, v_delta, p_threshold) into v_more;
+    exit when not v_more;
+    -- there is work to drain: build the dest's drain key index once, in its own transaction (without it the
+    -- per-batch dest delete seqscans the whole dest), keeping the O(rows) build out of the first batch and
+    -- skipping it entirely when there is nothing to drain.
+    if to_regclass(format('%I.%I', v_nsp, v_drainkey)) is null then
+      execute format('create index %I on %I.%I (%s)', v_drainkey, v_nsp, v_dest, v_keycols);
+      commit;
+    end if;
+    perform pgpm.from_hypertable_drain_delta_step(p_hypertable, p_control, p_batch);
+    commit;
+    v_iter := v_iter + 1;
+    if v_iter > p_max_iter then
+      if p_best_effort then return; end if;
+      raise exception 'pg_partition_magician: from_hypertable_drain_delta(%) did not converge within % iterations -- the workload is dirtying keys faster than the drain clears them. Raise p_batch, raise p_threshold to accept a larger final cutover batch, or pause writes before cutting over.',
+        p_hypertable, p_max_iter;
+    end if;
+  end loop;
+end $$;
+
 -- Phase 2: the cutover (the one non-online window). Brief ACCESS EXCLUSIVE on the source; an append-only
 -- catch-up of rows that arrived after the copy watermark (control > max copied); drop the hypertable
 -- (Timescale's event trigger clears its chunks and catalog); rename the copy into place; rebuild the key,
@@ -251,11 +410,12 @@ end $$;
 -- names; then hand off to transmute. The swap + rebuild is one transaction (commits whole or rolls back
 -- whole). When the caller leaves p_retain null, the source's drop_chunks policy interval is carried into
 -- pgpm's retain. Requires from_hypertable_copy to have run (the destination must exist).
+drop procedure if exists pgpm.from_hypertable_cutover(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean);
 create or replace procedure pgpm.from_hypertable_cutover(
   p_hypertable regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true
+  p_paused boolean default true, p_predrain boolean default true
 ) language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_dest name; v_cols text; v_retain interval;
@@ -288,6 +448,20 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped
       and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
+
+  -- Pre-drain (#170): when change-tracking is on, reconcile the delta ONLINE in micro-batches before taking
+  -- the lock, so the locked final reconcile below applies only a tiny residual instead of the whole
+  -- online-copy backlog. Best-effort: if the workload outruns the drain it returns and the under-lock
+  -- reconcile finishes whatever is left -- correctness never depends on the pre-drain. p_drain_batch sizes
+  -- both the micro-batch and the residual threshold (stop online once the residual is within one batch).
+  -- (Commits per batch; the swap transaction below starts fresh after it.)
+  if v_track and p_predrain then
+    call pgpm.from_hypertable_drain_delta(p_hypertable, p_control, p_drain_batch, p_drain_batch,
+                                          1000000, p_best_effort => true);
+  end if;
+  -- the pre-drain (or an operator's from_hypertable_drain_delta) builds a throwaway key index on the dest;
+  -- drop it so it never survives the rename onto the final table (the real key index is built + adopted below).
+  execute format('drop index if exists %I.%I', v_nsp, left(v_rel || '_pgpm_drainkey', 63));
 
   -- Pre-build the destination's indexes BEFORE taking the exclusive lock, while the destination is still a
   -- private table and the source keeps serving traffic. This is the O(rows) work; doing it OUTSIDE the lock
@@ -329,7 +503,7 @@ begin
            string_agg(quote_ident(attname), ', ' order by attnum)
       into v_dkey, v_skey, v_keycols
       from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
-        and attnum > 0 and not attisdropped;
+        and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';   -- exclude the ordering column (#170)
     v_subsel := format('select distinct %s from %I.%I', v_keycols, v_nsp, v_delta);
     -- The delta was just populated by the trigger, so it has no stats; ANALYZE it so the planner sizes
     -- the semi-joins correctly (the dest was already ANALYZEd at the end of the copy). Shared helper (#164).
@@ -437,14 +611,15 @@ end $$;
 
 -- The one-shot driver: copy then cut over, back to back. Use the two phases directly instead when writes
 -- must keep arriving during the migration (copy, let the workload run, then cutover catches up the appends).
+drop procedure if exists pgpm.from_hypertable(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, boolean);
 create or replace procedure pgpm.from_hypertable(
   p_hypertable regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true, p_track_changes boolean default false
+  p_paused boolean default true, p_track_changes boolean default false, p_predrain boolean default true
 ) language plpgsql as $$
 begin
   call pgpm.from_hypertable_copy(p_hypertable, p_control, p_track_changes);
   call pgpm.from_hypertable_cutover(p_hypertable, p_control, p_interval, p_obtain, p_retain,
-                                    p_keep_default, p_drain_batch, p_anchor, p_paused);
+                                    p_keep_default, p_drain_batch, p_anchor, p_paused, p_predrain);
 end $$;
