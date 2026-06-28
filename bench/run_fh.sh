@@ -268,13 +268,35 @@ if [ "$BENCH_REFINE" = "1" ]; then
   # Drive refine DIRECTLY in a now()-shadowed session (NOT via cron: pg_cron's maintain runs with the real
   # now() and would see the monolith as the active current partition, so it never refines it). pgpm functions
   # do not pin search_path, so a shadow.now() ahead of pg_catalog overrides now() inside refine_step's freeze
-  # check. One refine_history call splits the whole monolith to BENCH_FH_INTERVAL.
+  # check. We drive refine_STEP per batch with COMMIT between batches -- NOT refine()/refine_history(), which
+  # are FUNCTIONS that loop to completion in ONE transaction (at scale that single txn accumulates
+  # uncheckpointable WAL and a giant lock, and shows no progress until it commits). Per-batch commit is
+  # pgpm's own incremental model (what its cron maintain does), so WAL recycles, the disk stays bounded on
+  # the big rungs, and refine progress is visible as it goes.
   cat > "$RESULTS/refine_skewed.sql" <<SQL
 set statement_timeout=0;
 create schema if not exists pgpm_bench_shadow;
 create or replace function pgpm_bench_shadow.now() returns timestamptz language sql as \$fn\$ select timestamptz '$SKEW_TS' \$fn\$;
 set search_path = pgpm_bench_shadow, pg_catalog, public, pgpm;
-select pgpm.refine_history('bench.events', '$BENCH_FH_INTERVAL');
+do \$drv\$
+declare v_mon name; v_status text; v_ncast text; v_steps int := 0;
+begin
+  select pgpm._native_type(control_kind) into v_ncast from pgpm.config where parent_table='bench.events'::regclass;
+  execute format('select child_name from pgpm.part where parent_table=%L::regclass and attached order by lo::%s asc limit 1','bench.events',v_ncast) into v_mon;
+  if v_mon is null then raise exception 'refine driver: no attached monolith to refine'; end if;
+  loop
+    v_status := pgpm.refine_step('bench.events', v_mon, '$BENCH_FH_INTERVAL', null);
+    commit;
+    v_steps := v_steps + 1;
+    exit when v_status like 'swapped:%';
+    if v_status in ('active','default_dirty','nosubdiv','nokey','idle') then
+      raise exception 'refine driver: refine_step returned % -- the now()-shadow did not take', v_status;
+    end if;
+    if v_steps > 10000000 then raise exception 'refine driver: safety limit'; end if;
+  end loop;
+  raise notice 'refine driver: % steps, final=%', v_steps, v_status;
+end
+\$drv\$;
 SQL
   ( if [ -n "$BENCH_DSN" ]; then "$PSQL" "$BENCH_DSN" -v ON_ERROR_STOP=1 -f "$RESULTS/refine_skewed.sql"; else "$PSQL" -v ON_ERROR_STOP=1 -f "$RESULTS/refine_skewed.sql"; fi ) > "$RESULTS/refine.log" 2>&1 &
   refine_pid=$!; BG_PIDS+=("$refine_pid")
