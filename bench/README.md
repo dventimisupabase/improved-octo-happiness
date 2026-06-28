@@ -311,8 +311,9 @@ calendar advances.
 ### Running it
 
 ```bash
-# local smoke (supabase/postgres:15 -- PG15 + Apache timescaledb + pg_cron + pgtap)
-BENCH_DSN='postgres://postgres:postgres@localhost:5516/postgres' \
+# local smoke (supabase/postgres:15 -- PG15 + Apache timescaledb + pg_cron + pgtap; the `timescale`
+# compose service, `docker compose --profile timescale up -d`, maps host port 5519)
+BENCH_DSN='postgres://postgres:postgres@localhost:5519/postgres' \
   BENCH_ROWS=20000 BENCH_MONTHS=3 BENCH_CHUNK_INTERVAL='1 week' BENCH_FH_INTERVAL='1 month' \
   BENCH_PHASE_SECS=8 BENCH_CLIENTS=4 BENCH_OPS=5 \
   bench/run_fh.sh
@@ -338,16 +339,37 @@ conservation, and pgfr/pgss latency), not client tps.
 | `BENCH_TRACK_CHANGES` | `1` | install the delta trigger so in-flight update/delete are reconciled at cutover (needs a key; refused on a keyless table) |
 | `BENCH_REFINE` | `1` | after cutover, refine the time-monolith via the now()-shadow instrument; `0` = stop after cutover |
 | `BENCH_OBTAIN` | `4` | forward partitions obtained at cutover |
-| `BENCH_DRAIN_BATCH` | `50000` | rows per refine microbatch |
+| `BENCH_DRAIN_BATCH` | `50000` | rows per refine microbatch; also the cutover pre-drain's micro-batch size and residual threshold |
 | `BENCH_DRAIN_MAX_SECS` | `1800` | safety cap on the refine observation window |
+| `BENCH_PREDRAIN` | `1` | `1` = the cutover pre-drains the delta online before the lock (`p_predrain=>true`); `0` = undrained (the #170 A/B) |
+| `BENCH_LOCKPROBE` | `1` | arm a background `pg_locks` session that times the cutover's true `ACCESS EXCLUSIVE` window and reads the at-lock delta residual |
 
 `BENCH_ROWS`, `BENCH_MONTHS`, `BENCH_GEN_JOBS`, `BENCH_CLIENTS`/`BENCH_JOBS`, `BENCH_OPS`,
 `BENCH_PHASE_SECS`, `BENCH_PGFR`/`BENCH_PGFR_DIR`, and `BENCH_SKIP_GENERATE` behave as in
 `run.sh`.
 
+### Measuring the cutover lock window (#170)
+
+With change tracking on, the cutover reconciles the captured delta. The online pre-drain
+(`p_predrain`, default on) chases that backlog down **before** taking the lock, so the
+`ACCESS EXCLUSIVE` window applies only a tiny residual instead of the whole online-copy
+backlog. To quantify it, run the **same rung twice on fresh instances** (the
+fresh-instance-per-run rule) and compare the report's `## cutover lock window` section:
+
+```bash
+BENCH_PREDRAIN=1 bench/run_rung_fh.sh R3   # drained: residual ~ drain_batch, window flat
+BENCH_PREDRAIN=0 bench/run_rung_fh.sh R3   # undrained: residual == whole backlog, window grows with the copy
+```
+
+The window is timed by a background `pg_locks` probe (the whole cutover `call` also includes
+the pre-drain + the O(rows) index pre-build, so `cut_secs` overstates the blocking window).
+Climbing rungs with `BENCH_PREDRAIN=0` shows the undrained window tracking copy duration;
+with `=1` it stays bounded. pgfr's `lock_samples` corroborate qualitatively only (its 60 s
+cadence cannot resolve the window, especially the drained arm).
+
 ### Output
 
 The same `bench/results/` layout (`report.md`, per-phase `*.pgbench.txt`/`*.pctiles.txt`/
 `*.pgss.csv`, and pgfr when enabled), plus `copy.progress.csv` (the online copy: dest rows
-and pending delta keys over time) and `refine.progress.csv` (coarse children counting down
-to 0).
+and pending delta keys over time), `refine.progress.csv` (coarse children counting down
+to 0), and `lockprobe.log` (the cutover lock-window probe's `LOCKPROBE …` line).

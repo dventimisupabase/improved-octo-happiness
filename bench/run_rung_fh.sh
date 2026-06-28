@@ -34,6 +34,8 @@ export BENCH_FH_INTERVAL="${BENCH_FH_INTERVAL:-1 month}"   # pgpm partition widt
 export BENCH_TRACK_CHANGES="${BENCH_TRACK_CHANGES:-1}"     # full-online: reconcile in-flight upd/del at cutover
 export BENCH_REFINE="${BENCH_REFINE:-1}"
 export BENCH_OBTAIN="${BENCH_OBTAIN:-4}"
+export BENCH_PREDRAIN="${BENCH_PREDRAIN:-1}"               # #170 A/B: 1 = online pre-drain (drained), 0 = undrained
+export BENCH_LOCKPROBE="${BENCH_LOCKPROBE:-1}"             # time the cutover's true ACCESS EXCLUSIVE window
 export BENCH_PGFR="${BENCH_PGFR:-1}"
 export BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$DIR/vendor/pg_flight_recorder}"
 
