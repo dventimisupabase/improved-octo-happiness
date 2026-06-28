@@ -203,10 +203,11 @@ run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + 
   #    disable() unschedules PGFR's cron so the synthetic snapshots in the test stay deterministic.
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
     -c "create extension if not exists pg_cron; create extension if not exists pgtap;" >/dev/null
-  # No ON_ERROR_STOP for the vendored PGFR install: it tolerates a missing pg_stat_statements (the test
-  # image does not preload it), continuing past that to finish the schema. We assert it landed below.
-  $DC "${px[@]}" -d postgres -q -f "$pgfr/pgfr_record/install.sql"  >/dev/null 2>&1
-  $DC "${px[@]}" -d postgres -q -f "$pgfr/pgfr_analyze/install.sql" >/dev/null 2>&1
+  # The vendored PGFR install is best-effort (|| true): without pg_stat_statements preloaded (the test image
+  # does not) its statement collector errors, and psql then exits non-zero even though the schema is fully
+  # built -- which would otherwise trip `set -e`. We verify the schema actually landed with the guard below.
+  $DC "${px[@]}" -d postgres -q -f "$pgfr/pgfr_record/install.sql"  >/dev/null 2>&1 || true
+  $DC "${px[@]}" -d postgres -q -f "$pgfr/pgfr_analyze/install.sql" >/dev/null 2>&1 || true
   if [ "$($DC "${px[@]}" -d postgres -tAc "select count(*) from pg_namespace where nspname='pgfr_analyze'" | tr -d '[:space:]')" != "1" ]; then
     echo "FAIL: pg_flight_recorder (pgfr_analyze) did not install"; $DC --profile "$prof" down -v; return 1
   fi
