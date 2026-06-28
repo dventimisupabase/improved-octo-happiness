@@ -314,6 +314,13 @@ timestamp column rises with the id:
 select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
 ```
 
+If [`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) is installed, the optional
+`pgpm_observe` add-on (`psql -f pgpm_observe/install.sql`) correlates pgpm's operation log against the
+database telemetry PGFR sampled. `pgpm.impact_report('public.events')` reports what a conversion did to the
+workload (forced checkpoints, WAL, top waits, query latency) over the window pgpm was active, and
+`pgpm.feathering_validation('public.events')` cross-checks whether each adaptive backoff matched real
+pressure. PGFR is never a dependency; see the [reference](reference.md#observability-with-pg_flight_recorder-observe).
+
 ## Retain
 
 Set a policy at transmute time (`p_retain`) or later via `config.retain`, and maintenance drops partitions

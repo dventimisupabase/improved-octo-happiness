@@ -551,6 +551,54 @@ Samples rows and reports the fraction of adjacent pairs (ordered by the id) whos
 `~1.0` means an id column and a timestamp column co-increase; backfills and out-of-order arrival drive it
 down. Use it before retaining an id-partitioned table by a time horizon.
 
+### Observability with pg_flight_recorder (`observe`)
+
+An **optional add-on** (`pgpm_observe/install.sql`) that correlates `pgpm.log` against
+[`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) (PGFR) telemetry. `pgpm.log`
+records exactly when pgpm ran each operation, but pgpm keeps no history of what the rest of the database was
+doing; PGFR samples that history continuously but does not know which spikes were pgpm's. These functions
+bridge the two over a `pgpm.log` time window. It is **read-only and one-directional** (pgpm never writes into
+PGFR, and PGFR needs no changes), and PGFR is **never a dependency**: the module installs anywhere, and the
+PGFR-backed functions raise a `pgpm`-prefixed error when PGFR is absent.
+
+```sql
+pgpm.observe_window(p_parent regclass, p_since interval default '7 days') returns table (
+  parent_table regclass, window_start timestamptz, window_end timestamptz, duration interval,
+  log_rows bigint, rows_moved bigint, drains bigint, refines bigint, retains bigint,
+  adaptive_ticks bigint, backoffs bigint, wal_backoffs bigint, lock_backoffs bigint, io_backoffs bigint
+)
+```
+
+The span pgpm was active on a table within `p_since`, plus a summary of what it did. **Pure `pgpm.log`** with
+no PGFR dependency, so it works (and is useful) standalone. `backoffs` counts adaptive ticks where some
+congestion signal fired (`method <> 'probe'`); the per-signal columns break that down.
+
+```sql
+pgpm.impact_report(p_parent regclass, p_since interval default '7 days') returns text
+```
+
+"What did the conversion do to the workload?" Derives the window with `observe_window`, then asks
+`pgfr_analyze` what the database experienced during it: forced checkpoints, WAL generated, temp spilled, top
+wait events, and top queries by execution-time delta. Sections degrade independently (a window with fewer
+than two PGFR snapshots, or a `pg_stat_statements` that is absent or was reset, is reported, not fatal).
+Requires PGFR.
+
+```sql
+pgpm.feathering_validation(p_parent regclass, p_since interval default '7 days',
+                           p_lead interval default '2 minutes') returns table (
+  tick_at timestamptz, reason text, wal_signal_confirmed boolean,
+  lock_signal_confirmed boolean, io_signal_confirmed boolean, note text
+)
+```
+
+Ground truth for the adaptive feathering: for each backoff tick (a `drain_budget` row whose reason is not
+`probe`), it asks PGFR whether real pressure was present in the `p_lead` lead-up window, so you can tell
+whether the feathering fires for real reasons or phantoms. `wal` is corroborated by a forced checkpoint in
+the lead-up, `lock` by a sampled `Lock` wait with waiters, `io` by non-zero client read time (null where
+`pg_stat_io` is unavailable, e.g. PG15). The lock dimension uses PGFR's activity ring buffer (~2h retention),
+so lock corroboration is meaningful only for recent ticks; `wal`/`io` come from the 30-day snapshot tier.
+Requires PGFR.
+
 ## Incoming foreign keys
 
 These manage the `preserve` lifecycle: an incoming FK dropped at `transmute` is re-added against the new
