@@ -33,12 +33,12 @@ Refuse the migration, with a clear message, if any of these hold:
 
 - **Continuous aggregates exist** on the hypertable (`timescaledb_information.continuous_aggregates`). There is no native-partition equivalent and silently dropping them is data-destructive from the user's point of view.
 - **More than one dimension** is configured (space partitioning via `add_dimension`). pgpm is single-key RANGE; a space-partitioned hypertable is out of scope.
-- **The control column is not in the table's primary key.** A well-formed hypertable already satisfies this, since Timescale requires the partitioning column in any unique constraint, so this is a sanity check rather than a likely failure.
-- **Insufficient free disk.** Require free space of at least the logical size of the table plus its indexes. For Apache (uncompressed) this is the size you can read directly from the standard size functions.
+- **The control column does not exist** on the table. This is the only column requirement the pre-flight enforces; the key/`NOT NULL` contract is left to `transmute`, the single source of truth (it reuses a primary key or unique constraint that includes the control column, else partitions the table **keyless** -- the common hypertable shape, since `create_hypertable` makes the time column `NOT NULL` but adds no key). So a keyless hypertable migrates; a key that *excludes* the control column, a nullable control column, or a bare unique index are refused later by `transmute`. (Change tracking, `p_track_changes`, additionally needs a key to reconcile by, so it is refused on a keyless table and on a key with a nullable non-control column -- see §5.)
 
-Detect, and warn but proceed, if:
+Warn but proceed (informational `NOTICE`s, never refusals), reporting:
 
-- The newest chunk's upper bound does not fall on the grid the user wants going forward. This is the single frontier seam; it is handled at transmute/obtain time by making the first new partition a one-off irregular partition that begins where history ends, then snapping to the grid after it.
+- **The transient disk and the estimated copy time.** The copy writes a full second table, so it needs roughly the source's current on-disk size in extra space until cutover drops the hypertable; `from_hypertable_disk_estimate` / `from_hypertable_time_estimate` report these (and are callable on their own for sizing ahead of time). Informational, so the operator decides -- not a hard refusal.
+- **The newest chunk's upper bound not falling on the grid** the user wants going forward. This is the single frontier seam; it is handled at transmute/obtain time by making the first new partition a one-off irregular partition that begins where history ends, then snapping to the grid after it.
 
 ### 2. Build the destination plain table
 
