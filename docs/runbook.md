@@ -23,6 +23,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 - [Disk is filling during a refine](#disk-is-filling-during-a-refine)
 - [Storage is not dropping despite a retention policy](#storage-is-not-dropping-despite-a-retention-policy)
 - [Re-transmute fails with an orphan-table error](#re-transmute-fails-with-an-orphan-table-error)
+- [A `from_hypertable` cutover is slow or its pre-drain will not converge](#a-from_hypertable-cutover-is-slow-or-its-pre-drain-will-not-converge)
 
 ## Referential-integrity violations after a `preserve` drain
 
@@ -448,3 +449,74 @@ select * from pgpm.status() where parent = 'public.events'::regclass;   -- trans
 **Prevent.** Do not `DROP`/recreate a parent mid-conversion. Let an interrupted drain finish (it attaches
 the child, so it becomes a real partition rather than an orphan), or `untransmute` while the conversion is
 still reversible, rather than dropping the parent out from under its in-flight children.
+
+## A `from_hypertable` cutover is slow or its pre-drain will not converge
+
+**Symptom.** Migrating a TimescaleDB hypertable with `from_hypertable`, either: `from_hypertable_cutover`
+sits for a long time before (or during) its brief lock; or a hand-driven `from_hypertable_drain_delta` /
+`from_hypertable_drain_appends` raises `pg_partition_magician: from_hypertable_drain_delta(...) did not
+converge within N iterations` (or the cutover's best-effort pre-drain returns having left a large residual
+that is then applied under the lock).
+
+**What it means.** When `p_track_changes` is on, the cutover catch-up is the change **delta** captured
+during the online copy; otherwise it is the rows appended past the copy watermark. Either backlog is drained
+online, in bounded micro-batches, *before* the lock (`p_predrain`, default true), so the lock applies only a
+tiny residual. Non-convergence means the workload is dirtying keys / appending faster than the micro-batch
+drain clears them, so the residual never falls to the threshold within the iteration budget (`p_max_iter`).
+The drain is best-effort and the under-lock pass is the correctness backstop, so the migration stays
+**correct** either way -- the symptom is a *long lock* (the under-lock pass applies a big residual), not data
+loss. (At-scale figures and the structural note that the append-only backlog stays small are in
+`bench/result-fh-cutover-lockwindow.md`.)
+
+**Steps.**
+
+1. See how big the backlog is (run during the online window, before cutover). For tracking, count the delta;
+   for append-only, count rows past the destination watermark:
+
+   ```sql
+   -- tracking (p_track_changes => true):
+   select count(*) from public.events_pgpm_delta;
+   -- append-only (no tracking):
+   select count(*) from public.events where created_at > (select max(created_at) from public.events_pgpm_dest);
+   ```
+
+2. Drain it down by hand, with a bigger batch, before cutting over (this is the two-phase flow -- it lets
+   the backlog shrink while the source stays live):
+
+   ```sql
+   -- tracking:
+   call pgpm.from_hypertable_drain_delta('public.events', 'created_at', p_batch => 200000);
+   -- append-only:
+   call pgpm.from_hypertable_drain_appends('public.events', 'created_at', p_batch => 200000);
+   ```
+
+3. If the workload genuinely outruns the drain, accept a larger final batch instead of chasing zero -- raise
+   the threshold so the drain stops sooner and the (still bounded) remainder is applied under the lock:
+
+   ```sql
+   call pgpm.from_hypertable_drain_delta('public.events', 'created_at', p_batch => 200000, p_threshold => 100000);
+   ```
+
+   Or pause / throttle the write workload briefly, then cut over. As a last resort, raise `p_max_iter`.
+
+4. Cut over. The cutover re-runs a best-effort pre-drain and then applies whatever residual remains under the
+   lock:
+
+   ```sql
+   call pgpm.from_hypertable_cutover('public.events', 'created_at', interval '1 day', p_drain_batch => 200000, p_paused => false);
+   ```
+
+   To skip the cutover's own pre-drain (e.g. you already drained by hand and want the lock taken
+   immediately), pass `p_predrain => false`.
+
+**Verify.**
+
+```sql
+select relkind from pg_class where oid = 'public.events'::regclass;   -- 'p' = migrated to a partitioned table
+select * from pgpm.status() where parent = 'public.events'::regclass; -- registered and managed
+```
+
+**Prevent.** For update/delete-heavy workloads, drive the drain in the two-phase flow (copy, let it drain,
+then cutover) rather than relying on the one-shot, and size `p_drain_batch` to the write rate. Append-only
+migrations rarely hit this (the backlog is structurally small -- the copy reads the current chunk last, so
+it captures appends as it goes). Migrate during a quieter write window when possible.

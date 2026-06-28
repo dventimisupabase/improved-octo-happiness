@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` builds the cutover key index once.** With `p_track_changes`, the destination's
+  reused-key index was built twice off the lock: once as a throwaway for the online delta drain's per-batch
+  key lookups, then again as the real `PRIMARY KEY`/`UNIQUE` index the cutover adopts. Now `from_hypertable_copy`
+  pre-builds the reused-key index once -- with the same temp name and definition the cutover adopts -- so the
+  delta drain uses it and the cutover's index pre-build loop, now re-entrant, **adopts** it (`USING INDEX`,
+  metadata-only) instead of rebuilding. One key-index build instead of two, all still off the lock, so no
+  change to the brief `ACCESS EXCLUSIVE` window (it removes redundant `O(rows*log rows)` work from total
+  migration time, which matters at large scale). Append-only / non-tracking and keyless paths are unaffected.
+  (issue #175; tests/timescale/db/14)
 - **`from_hypertable` pre-drains the append-only catch-up online too (default, non-tracking path).** Without
   `p_track_changes`, the cutover caught up every row appended past the copy watermark in one `insert ...
   where control > watermark` *under the lock*, so that window grew with the copy -- the same wound #170

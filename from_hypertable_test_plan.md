@@ -63,14 +63,25 @@ Supabase ships TimescaleDB **Apache 2 Edition** (no compression, no continuous a
 
 - **C1 retention translation.** `mk_hypertable_with_retention(90 days)`, assert the resulting pgpm config has `retain = 90 days`.
 - **C2 reads through compression.** `mk_hypertable_compressed`, run `from_hypertable`, assert B1/B2 still hold. Validates the design claim that the copy reads decompressed through Timescale's SELECT path and therefore does not need a compression-specific branch.
-- **C3 identity continuity.** `mk_hypertable_composite_pk`, capture the sequence high-water mark, migrate, then insert a new row and assert it receives the next value with no collision and no gap that breaks uniqueness.
+- **C3 identity continuity.** `mk_hypertable_composite_pk`, capture the sequence high-water mark, migrate, then insert a new row and assert it receives the next value with no collision and no gap that breaks uniqueness. (tests/timescale/db/04, db/11)
+- **C4 change-tracking apparatus refusals.** `p_track_changes => true` is refused on a keyless table (no key to reconcile by) and on a key with a nullable non-control column (a NULL key component can never be reconciled). (tests/timescale/db/10, db/14)
+- **C5 delta ordering column.** With tracking on, `<rel>_pgpm_delta` carries the monotonic `pgpm_seq` column (so the drain can batch by a watermark) and the cutover excludes it from the reconcile key set. (tests/timescale/db/14)
+- **C6 apparatus cleanup.** After cutover, the `<rel>_pgpm_delta` table is gone, no `_pgpm_drainkey`/temp `_pgpm_new` index survives, and the final table carries no `pgpm_seq` column. (tests/timescale/db/10, db/14)
 
-### D. Online and delta behavior (disposable-db; phased API required)
+### D. Online and delta behavior (disposable-db)
 
-These require simulating writes that arrive during the migration. To make that testable without true concurrency, `from_hypertable` should expose its phase boundaries (bulk-copy-to-watermark, then catch-up-and-cutover) rather than being a single opaque call. This is a testability requirement that feeds back into the implementation.
+`from_hypertable` exposes its phase boundaries as separate procedures (`from_hypertable_copy` then
+`from_hypertable_cutover`), so writes can be injected between them without true concurrency, and the online
+pre-drain (`from_hypertable_drain_delta` / `from_hypertable_drain_appends`) can be driven and observed on
+its own.
 
-- **D1 append-only catch-up.** Bulk-copy to watermark T0, then `INSERT` rows with `control > T0` into the still-live hypertable, then run catch-up-and-cutover. Assert the late rows are present in the result. Covers the common append-only path.
-- **D2 cutover isolation (stretch).** A `pg_isolation_regress` spec asserting that reads and writes against the hypertable succeed throughout the bulk-copy phase and only block briefly during the cutover transaction. Mirrors the style of Timescale's own `detach_chunk` isolation test. Lives in its own isolation harness, not pgTAP.
+- **D1 append-only catch-up.** Copy, then `INSERT` rows past the watermark into the still-live hypertable, then cutover. Assert the late rows are present. Covers the common append-only path. (tests/timescale/db/05)
+- **D2 tracking reconcile.** Copy with `p_track_changes`, then UPDATE/DELETE/INSERT already-copied rows (including a key-changing UPDATE), then cutover. Assert the reconcile applied all three change kinds by key. (tests/timescale/db/10, db/14)
+- **D3 online delta pre-drain.** With tracking, drain the delta **online (source still a live hypertable)** and assert the destination already reflects the changes *before* any cutover; a single `_step` reconciles a bounded batch; post-drain changes are still caught at cutover. (tests/timescale/db/14)
+- **D4 online append pre-drain.** Without tracking, drain the appended tail **online** and assert the destination gained the appends before cutover; one `_step` copies a bounded batch; works on a keyless hypertable. (tests/timescale/db/15)
+- **D5 threshold + convergence.** Draining with a threshold leaves a residual the cutover then finishes (correct final counts); the driver's iteration budget (`p_max_iter`) bounds non-convergence loudly rather than spinning. (tests/timescale/db/14, db/15)
+- **D6 auto pre-drain via `p_predrain`.** The cutover (default `p_predrain => true`) drains a backlog above the threshold online before the lock, then finishes the residual under it — exercising the nested cutover -> drain -> per-batch-commit path. (tests/timescale/db/14)
+- **D7 cutover isolation (stretch).** A `pg_isolation_regress` spec asserting reads/writes against the hypertable succeed throughout the copy and only block briefly during the cutover transaction. Lives in its own isolation harness, not pgTAP. (not yet implemented)
 
 ### E. Failure and rollback (disposable-db)
 
@@ -83,16 +94,16 @@ Run B1-B6 and C1-C3 against each pinned TimescaleDB version on PG15 (and PG14). 
 
 - **F1 catalog cleanup on old builds.** Confirm `DROP TABLE <hypertable>` removes chunks and catalog rows cleanly, since the teardown relies on Timescale's event trigger and we are betting it behaves identically on old builds.
 - **F2 chunk exclusion on old builds.** Confirm the time-predicate batched copy drives single-chunk reads (via `EXPLAIN` on the copy query), so the loop stays one-chunk-per-batch rather than degrading to full scans per batch.
+- **F3 drain + ordering column on old builds.** Confirm the online drain (delete-returning reconcile / append copy) and the `pgpm_seq GENERATED ALWAYS AS IDENTITY` column behave identically on the oldest pinned TimescaleDB version (both use standard PG15 features, so this is a confirmation, not an expected risk). Currently the default CI leg pins one version (2.16.1); the 2.9.x leg is run by manual dispatch.
 
 ## Open dependencies on implementation
 
-Two items in this plan require `from_hypertable` to be built with testability in mind:
+Both items below were testability requirements when this plan was written; both are now satisfied by the
+shipped design, so they are recorded as resolved rather than open:
 
-1. Phase boundaries must be callable separately (group D), not buried inside one monolithic procedure.
-2. The disk/size estimator must be a separately callable function (A4), not an inline check, so it can be asserted in isolation.
-
-Both are reasonable to expose anyway for operational dry-run purposes, so they are not test-only concessions.
+1. **Phase boundaries callable separately** (group D) — `from_hypertable_copy`, `from_hypertable_cutover`, and the `from_hypertable_drain_delta`/`_appends` drivers are all separate, hand-drivable entry points.
+2. **Disk/size estimator separately callable** (A4) — `from_hypertable_disk_estimate` / `from_hypertable_time_estimate` are standalone functions.
 
 ## Minimum bar to ship
 
-Groups A, B, C, E on at least one pinned TimescaleDB version on PG15, plus F1 and F2 on the oldest pinned version. Group D's append-only catch-up (D1) is required if `from_hypertable` claims an online mode; the isolation spec (D2) and the PG14 leg can follow.
+Groups A, B, C, E on at least one pinned TimescaleDB version on PG15, plus F1-F2 on the oldest pinned version. Group D is now core, not optional: the online pre-drain is the cutover's main behavior, so D1-D6 are required (D2-D6 cover the tracking reconcile and the online delta/append pre-drain that keep the cutover lock brief). The isolation spec (D7) and the PG14 leg can follow.
