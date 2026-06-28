@@ -235,6 +235,12 @@ begin
                    p_control, r.range_start, p_control, r.range_end, p_control);
     commit;
   end loop;
+  -- The destination was just CREATE TABLE LIKE'd and bulk-loaded, so it has no planner stats (reltuples=0).
+  -- ANALYZE it now -- while it is still private and unlocked -- so the cutover's delta reconcile plans
+  -- against the real row count. Without this the planner thinks the dest is empty and seqscans the whole
+  -- table for the reconcile, making the (locked) cutover O(rows) instead of O(delta).
+  execute format('analyze %I.%I', v_nsp, v_dest);
+  commit;
 end $$;
 
 -- Phase 2: the cutover (the one non-online window). Brief ACCESS EXCLUSIVE on the source; an append-only
@@ -254,6 +260,7 @@ declare
   v_nsp name; v_rel name; v_dest name; v_cols text; v_retain interval;
   v_watermark timestamptz; v_orig regclass; k record;
   v_delta name; v_trgfn name; v_track boolean; v_keycols text; v_dkey text; v_skey text; v_subsel text;
+  v_ctl_type text; v_min_ctl text; v_max_ctl text;
   v_ident_cols name[]; v_ident_next bigint[]; v_srcseq text; v_srcnext bigint; v_col name;
   v_pseq text; v_curnext bigint; v_i int;
   v_tmp text; v_key_names text[]; v_key_types text[]; v_key_tmps text[]; v_idx_orig text[]; v_idx_tmps text[];
@@ -323,9 +330,29 @@ begin
       from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
         and attnum > 0 and not attisdropped;
     v_subsel := format('select distinct %s from %I.%I', v_keycols, v_nsp, v_delta);
+    -- The delta was just populated by the trigger, so it has no stats; ANALYZE it so the planner sizes
+    -- the semi-joins correctly (the dest was already ANALYZEd at the end of the copy).
+    execute format('analyze %I.%I', v_nsp, v_delta);
+    -- Bound the source read to the delta's touched control-column range, as LITERAL constants, so
+    -- TimescaleDB excludes untouched chunks at plan time -- the reconcile then reads only the chunks that
+    -- actually changed, not the whole hypertable. (A min()/max() subquery is a runtime value and does NOT
+    -- prune; only constants do.) This is what keeps the locked cutover O(delta), not O(rows): in-flight
+    -- changes are time-clustered (an OLTP workload mostly touches recent rows), so the range is a handful of
+    -- chunks. SAFE in general: every delta key's control value lies within [min,max] by construction, so no
+    -- needed source row can be excluded -- the worst case (changes spanning all history) just prunes nothing.
+    select format_type(atttypid, atttypmod) into v_ctl_type
+      from pg_attribute where attrelid = p_hypertable and attname = p_control and not attisdropped;
+    execute format('select min(%I)::text, max(%I)::text from %I.%I', p_control, p_control, v_nsp, v_delta)
+      into v_min_ctl, v_max_ctl;
     execute format('delete from %I.%I d where %s in (%s)', v_nsp, v_dest, v_dkey, v_subsel);
-    execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (%s)',
-                   v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_subsel);
+    if v_min_ctl is not null then
+      execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (%s) and %I >= %L::%s and %I <= %L::%s',
+                     v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_subsel,
+                     p_control, v_min_ctl, v_ctl_type, p_control, v_max_ctl, v_ctl_type);
+    else
+      execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (%s)',
+                     v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_subsel);
+    end if;
   else
     -- append-only catch-up: rows whose control column is past the copy watermark
     execute format('select max(%I) from %I.%I', p_control, v_nsp, v_dest) into v_watermark;
