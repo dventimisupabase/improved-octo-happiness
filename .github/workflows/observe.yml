@@ -1,0 +1,40 @@
+name: Observe track
+
+# The optional pg_flight_recorder observability module (pgpm_observe). Separate from the main matrix: it
+# installs PGFR (vendored under bench/vendor/) alongside pgpm and exercises the correlation functions.
+# PG15 only and PGFR needs only pg_cron, so it runs on the stock pgpm_test:15 image (built by compose).
+# Path-filtered so it runs only when the module, its tests, the harness, or the vendored PGFR change.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pgpm_observe/install.sql'
+      - 'pgpm_core/install.sql'
+      - 'tests/observe/**'
+      - 'bench/vendor/pg_flight_recorder/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/observe.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'pgpm_observe/install.sql'
+      - 'pgpm_core/install.sql'
+      - 'tests/observe/**'
+      - 'bench/vendor/pg_flight_recorder/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/observe.yml'
+  workflow_dispatch:
+
+jobs:
+  observe:
+    name: pgpm_observe with pg_flight_recorder / PG15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Run the observe track
+        run: ./test.sh observe

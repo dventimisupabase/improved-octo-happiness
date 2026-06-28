@@ -123,6 +123,31 @@ psql "$DATABASE_URL" -f pgpm_hypertable/install.sql
 See the [reference](docs/reference.md#migrating-from-timescaledb-from_hypertable) for the phases,
 `p_track_changes`, and the disk estimate.
 
+## Observability with pg_flight_recorder (optional)
+
+pgpm records every operation in `pgpm.log`, but keeps no history of what the database as a whole was doing
+during a migration. If [`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) (PGFR)
+is installed, the optional `pgpm_observe` add-on correlates the two: it derives the window pgpm was active on
+a table and reports what the workload experienced (forced checkpoints, WAL, top wait events, query latency),
+and cross-checks each adaptive-feathering backoff against PGFR's independent sampling.
+
+```sql
+-- what did the conversion do to the workload?
+select pgpm.impact_report('public.events');
+-- did the feathering back off for real reasons? (per backoff tick)
+select * from pgpm.feathering_validation('public.events');
+```
+
+It is read-only and one-directional (pgpm never writes into PGFR), and PGFR is **never a dependency**: the
+module installs anywhere, and the PGFR-backed functions raise a clear error if PGFR is absent. The pgpm-only
+`pgpm.observe_window()` works regardless. Load it on top of the core:
+
+```bash
+psql "$DATABASE_URL" -f pgpm_observe/install.sql
+```
+
+See the [reference](docs/reference.md#observability-with-pg_flight_recorder-observe) for the function details.
+
 ## Documentation
 
 - **[User guide](docs/guide.md)**: concepts, install, transmuting a table, scheduling, refine, monitoring,

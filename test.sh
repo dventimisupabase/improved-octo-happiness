@@ -7,6 +7,7 @@
 #
 #   ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all]
 #   ./test.sh timescale                  # the from_hypertable track (TimescaleDB 2.16.1 / PG15)
+#   ./test.sh observe                    # the pg_flight_recorder observability track (PG15)
 #
 # Channels:
 #   psql    pgpm_core/install.sql via psql -f         (the source)
@@ -15,6 +16,11 @@
 #
 # The `timescale` track is separate: it needs TimescaleDB (its own image), is PG15-only, and is NOT part
 # of the default matrix. It exercises pgpm.from_hypertable against real hypertables (tests/timescale/).
+#
+# The `observe` track is also separate: it installs the OPTIONAL pgpm_observe module on top of the core,
+# both with and without pg_flight_recorder present, and asserts the gate + the impact_report /
+# feathering_validation correlation against PGFR telemetry (tests/observe/). PGFR is vendored under
+# bench/vendor/ and needs only pg_cron, so the track runs on the stock pgpm_test:15 image.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -27,7 +33,8 @@ for arg in "$@"; do
     --channel=*) CHANNEL="${arg#--channel=}" ;;
     15|16|17|18|all) VERSION="$arg" ;;
     timescale) TRACK="timescale" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale"; exit 1 ;;
+    observe) TRACK="observe" ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe"; exit 1 ;;
   esac
 done
 
@@ -162,8 +169,77 @@ run_timescale() {
   echo "TimescaleDB track: PASS"
 }
 
+run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + correlation (PGFR present)
+  local prof="pg15" svc="postgres15" fail=0 out
+  local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
+  local pgfr="/repo/bench/vendor/pg_flight_recorder"          # container path (repo mounted at /repo)
+  local pgfr_host="bench/vendor/pg_flight_recorder"           # host path (bench/vendor is gitignored)
+  local pgfr_repo="https://github.com/dventimisupabase/pg_flight_recorder"
+  local pgfr_sha="34517280f70b67ae8c8f99d18515550b629c9cd2"   # pin for reproducible CI
+  # Clone-on-demand: PGFR is a vendored external repo (bench/vendor is gitignored), so it is absent on a
+  # fresh checkout / in CI. Pull it at the pinned SHA when missing; a full clone so the SHA is reachable.
+  if [ ! -f "$pgfr_host/pgfr_record/install.sql" ]; then
+    echo ">>> cloning pg_flight_recorder@${pgfr_sha:0:7} into $pgfr_host"
+    rm -rf "$pgfr_host"; mkdir -p "$(dirname "$pgfr_host")"
+    git clone --quiet "$pgfr_repo" "$pgfr_host"
+    git -C "$pgfr_host" checkout --quiet "$pgfr_sha"
+  fi
+  echo; echo "========================================="
+  echo "pg_flight_recorder observability track (pg15)"
+  echo "========================================="
+  $DC --profile "$prof" down -v 2>/dev/null || true   # fresh container: the with-PGFR phase installs into postgres
+  $DC --profile "$prof" up -d
+  for _ in $(seq 1 90); do $DC "${px[@]}" -d postgres -tAc 'select 1' >/dev/null 2>&1 && break; sleep 1; done
+
+  run_observe_file() {  # <db> <test-file> -- run one pgTAP file, collect TAP, flag failures
+    local db="$1" f="$2"
+    echo "--- ${f##*/} (db: $db) ---"
+    out=$($DC "${px[@]}" -d "$db" -tAq -f "$f" 2>&1)
+    echo "$out" | grep -E '^(ok|not ok|1\.\.|# )' || true
+    if echo "$out" | grep -qE '^not ok|^# Looks like you failed|ERROR:'; then echo "FAIL: $f"; fail=1; fi
+  }
+
+  # 1) PGFR ABSENT: the optional module installs and gates without pg_flight_recorder. pgpm core needs no
+  #    pg_cron to install, and pg_cron can only be created in cron.database_name -- so this fresh db omits it.
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
+    -c "drop database if exists t_obs_nopgfr" -c "create database t_obs_nopgfr" >/dev/null
+  $DC "${px[@]}" -d t_obs_nopgfr -v ON_ERROR_STOP=1 -q -c "create extension if not exists pgtap;" >/dev/null
+  $DC "${px[@]}" -d t_obs_nopgfr -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
+  $DC "${px[@]}" -d t_obs_nopgfr -v ON_ERROR_STOP=1 -q -f /repo/pgpm_observe/install.sql >/dev/null
+  run_observe_file t_obs_nopgfr /repo/tests/observe/db/01_no_pgfr_test.sql
+  $DC "${px[@]}" -d postgres -q -c "drop database if exists t_obs_nopgfr" >/dev/null
+
+  # 2) PGFR PRESENT: pg_flight_recorder requires pg_cron, which lives only in cron.database_name (postgres),
+  #    so this runs in the postgres db. The test wraps itself in BEGIN/ROLLBACK, so it leaves no state.
+  #    disable() unschedules PGFR's cron so the synthetic snapshots in the test stay deterministic.
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
+    -c "create extension if not exists pg_cron; create extension if not exists pgtap;" >/dev/null
+  # The vendored PGFR install is best-effort (|| true): without pg_stat_statements preloaded (the test image
+  # does not) its statement collector errors, and psql then exits non-zero even though the schema is fully
+  # built -- which would otherwise trip `set -e`. We verify the schema actually landed with the guard below.
+  $DC "${px[@]}" -d postgres -q -f "$pgfr/pgfr_record/install.sql"  >/dev/null 2>&1 || true
+  $DC "${px[@]}" -d postgres -q -f "$pgfr/pgfr_analyze/install.sql" >/dev/null 2>&1 || true
+  if [ "$($DC "${px[@]}" -d postgres -tAc "select count(*) from pg_namespace where nspname='pgfr_analyze'" | tr -d '[:space:]')" != "1" ]; then
+    echo "FAIL: pg_flight_recorder (pgfr_analyze) did not install"; $DC --profile "$prof" down -v; return 1
+  fi
+  $DC "${px[@]}" -d postgres -q -c "select pgfr_record.disable()" >/dev/null 2>&1 || true
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/pgpm_observe/install.sql >/dev/null
+  run_observe_file postgres /repo/tests/observe/db/02_with_pgfr_test.sql
+
+  $DC --profile "$prof" down -v
+  if [ "$fail" -ne 0 ]; then echo "observe track: FAIL"; return 1; fi
+  echo "observe track: PASS"
+}
+
 if [ "$TRACK" = "timescale" ]; then
   run_timescale
+  echo; echo "All requested tests passed."
+  exit 0
+fi
+
+if [ "$TRACK" = "observe" ]; then
+  run_observe
   echo; echo "All requested tests passed."
   exit 0
 fi
