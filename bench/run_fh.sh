@@ -222,11 +222,19 @@ done
 echo
 if ! wait "$copy_pid"; then echo "  ERROR: from_hypertable_copy failed:"; tail -5 "$RESULTS/copy.log"; exit 1; fi
 copy_secs=$(awk -v a="$copy_t0" -v b="$(q "select extract(epoch from clock_timestamp())")" 'BEGIN{printf "%.1f", b-a}')
-# capture the dest size + pending in-flight delta BEFORE cutover (cutover drops the delta table, so reading
-# it afterward always reports 0 -- a stale-read trap).
+# capture the dest size + the catch-up backlog BEFORE cutover (cutover drops/consumes it, so reading after
+# always reports 0 -- a stale-read trap). The backlog is path-dependent: with change tracking it is the
+# delta row count; on the append-only path there is NO delta table, so it is the count of source rows past
+# the copy watermark (control > max(dest)). (The earlier unconditional delta read errored on the
+# append-only path, where bench.events_pgpm_delta does not exist.)
 DEST_ROWS=$(q "select count(*) from bench.events_pgpm_dest")
-DELTA_PENDING=$(q "select coalesce((select count(*) from bench.events_pgpm_delta),0)")
-echo "  copy complete in ${copy_secs}s (dest holds $DEST_ROWS rows; $DELTA_PENDING in-flight delta keys to reconcile at cutover)"
+if [ "$(q "select (to_regclass('bench.events_pgpm_delta') is not null)::text")" = "t" ]; then
+  DELTA_PENDING=$(q "select count(*) from bench.events_pgpm_delta")
+  echo "  copy complete in ${copy_secs}s (dest holds $DEST_ROWS rows; $DELTA_PENDING in-flight delta keys to reconcile at cutover)"
+else
+  DELTA_PENDING=$(q "select count(*) from bench.events where created_at > coalesce((select max(created_at) from bench.events_pgpm_dest), to_timestamp(0))")
+  echo "  copy complete in ${copy_secs}s (dest holds $DEST_ROWS rows; $DELTA_PENDING appended rows past the watermark to catch up at cutover)"
+fi
 
 # 4c. PHASE 2 (cutover): brief lock, catch up + reconcile, drop hypertable, hand off to transmute.
 # #170: optionally pre-drain the delta ONLINE before the lock (p_predrain), and time the TRUE ACCESS
