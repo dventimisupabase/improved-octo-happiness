@@ -17,8 +17,8 @@ create table if not exists bench.events (
   kind       smallint not null,
   payload    text     not null,
   -- The bench partitions by `id` (the only monotonic key whose frontier can be advanced to freeze the
-  -- monolith for an in-window refine; see bench/README.md). pgpm reuses the PK in place at transmute, so
-  -- the partition key must be IN the PK -- AND, for refine's range-COPY (`where id >= X order by id`) to
+  -- monolith for an in-window regrain; see bench/README.md). pgpm reuses the PK in place at transmute, so
+  -- the partition key must be IN the PK -- AND, for regrain's range-COPY (`where id >= X order by id`) to
   -- use an index instead of seq-scanning the whole monolith every microbatch, `id` must LEAD it. So the
   -- PK leads with id. created_at stays in the PK too, so the table is still time-partitionable.
   primary key (id, created_at)

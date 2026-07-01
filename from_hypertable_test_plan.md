@@ -21,7 +21,7 @@ Supabase ships TimescaleDB **Apache 2 Edition** (no compression, no continuous a
 
 3. **Two execution modes.** Split the test files by whether they can run inside a single rolled-back transaction:
    - **Transactional** (`tests/timescale/txn/`): pre-flight refusals and pure structural assertions. Standard pgTAP per-file transaction with rollback. Fast, no cleanup.
-   - **Disposable-database** (`tests/timescale/db/`): anything that exercises the batched copy loop, `refine`, or `maintain`, all of which use procedures that `COMMIT` between batches and therefore cannot run inside an outer transaction. Each file runs against a freshly `createdb`'d database and drops it on teardown. `from_hypertable` itself commits (it drops the source and renames in a real transaction, and the copy loop commits per batch), so most happy-path tests live here.
+   - **Disposable-database** (`tests/timescale/db/`): anything that exercises the batched copy loop, `regrain`, or `maintain`, all of which use procedures that `COMMIT` between batches and therefore cannot run inside an outer transaction. Each file runs against a freshly `createdb`'d database and drops it on teardown. `from_hypertable` itself commits (it drops the source and renames in a real transaction, and the copy loop commits per batch), so most happy-path tests live here.
 
 4. **CI.** Add a separate GitHub Actions job for the timescale track, matrixed over the pinned TimescaleDB versions on PG15 (plus PG14). It does not run on the pg16/17/18 legs. Keep it required for merges that touch `from_hypertable` and the migration SQL.
 

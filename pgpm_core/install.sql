@@ -110,14 +110,14 @@ alter table pgpm.config add column if not exists drain_ambient_baseline numeric;
 alter table pgpm.config add column if not exists drain_ambient_io_baseline numeric;
 alter table pgpm.config add column if not exists drain_io_read_time numeric;
 alter table pgpm.config add column if not exists drain_io_blks_read bigint;
--- auto-refine (REDESIGN.md section 12): when set, maintenance feathers the oldest frozen coarse child
--- toward this target step, one budget-sized microbatch per tick. null = off (refine is operator-driven).
-alter table pgpm.config add column if not exists refine_to text;
--- refine copy progress (REDESIGN.md section 10): the NATIVE-grid lo of the sub-range currently being
--- copied out of the coarse child under refinement -- a cross-tick high-water mark. refine COPIES (never
+-- auto-regrain (REDESIGN.md section 12): when set, maintenance feathers the oldest frozen coarse child
+-- toward this target step, one budget-sized microbatch per tick. null = off (regrain is operator-driven).
+alter table pgpm.config add column if not exists regrain_to text;
+-- regrain copy progress (REDESIGN.md section 10): the NATIVE-grid lo of the sub-range currently being
+-- copied out of the coarse child under regraining -- a cross-tick high-water mark. regrain COPIES (never
 -- deletes), so the source never shrinks and cannot drive progress the way the drain's deletes do; this
--- cursor is the explicit progress state instead. null = no refine in flight; reset to null at the swap.
-alter table pgpm.config add column if not exists refine_cursor text;
+-- cursor is the explicit progress state instead. null = no regrain in flight; reset to null at the swap.
+alter table pgpm.config add column if not exists regrain_cursor text;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -337,7 +337,7 @@ $$;
 
 -- ANALYZE a freshly minted + bulk-loaded table so the planner has real row stats before anything relies
 -- on it. A CREATE TABLE LIKE'd child that has just been INSERT'd into still shows reltuples = -1 (unknown)
--- until autovacuum catches up, so any plan that touches it in the interim -- a later refine/drain batch,
+-- until autovacuum catches up, so any plan that touches it in the interim -- a later regrain/drain batch,
 -- the swap/attach, or a user query right after -- misplans against a phantom-empty table. That is exactly
 -- the seqscan that made the from_hypertable cutover reconcile O(rows) (#164/#166). ANALYZE is sampled, so
 -- its cost is bounded by default_statistics_target, not the table size; call it everywhere a table is
@@ -635,39 +635,39 @@ begin
 end;
 $$;
 
--- ============================== refine ==============================
+-- ============================== regrain ==============================
 
--- refine splits a FROZEN coarse child (the monolith, or a coarser child from a prior pass) into finer
+-- regrain splits a FROZEN coarse child (the monolith, or a coarser child from a prior pass) into finer
 -- children, by COPYING the rows into standalone children in budget-sized microbatches, then in ONE atomic
 -- step detaching the coarse source, attaching the fine children, and DROPping the source. It never deletes
 -- a row out of the source -- the source stays whole and ATTACHED until the swap, so every row remains
 -- visible through the parent the entire time. The product has no dead tuples (the fine children only ever
 -- receive inserts) and no vacuum (the source's space is reclaimed by the DROP, not by DELETE). Because the
--- rows are never moved through an unattached child, refine NEVER opens the snapshot() read gap, and the
+-- rows are never moved through an unattached child, regrain NEVER opens the snapshot() read gap, and the
 -- multi-tick COPY needs no FK leash (the drain's delete-and-move is the one that carries that) -- REDESIGN.md
 -- sections 9 and 10. The one exception is the swap's DETACH itself: Postgres refuses to detach a partition
 -- whose rows are still referenced by an incoming FK (the keys leave the parent between detach and the
 -- re-attach of the copies, which it will not look past), so the swap transiently drops the incoming FK(s)
 -- and re-adds them within its ONE atomic transaction -- invisible to other sessions, so RI is never visibly
--- off, unlike the move-model's whole-refine suspension. Retention-aware: a sub-range entirely below the
+-- off, unlike the move-model's whole-regrain suspension. Retention-aware: a sub-range entirely below the
 -- retention horizon is NOT copied (it is discarded with the source at the DROP), so retention costs no delete.
 --
--- The work is a series of resumable microbatches (refine_step). Because the source is frozen and is never
+-- The work is a series of resumable microbatches (regrain_step). Because the source is frozen and is never
 -- deleted from, it cannot drive progress the way the drain's shrinking DEFAULT does, so progress is tracked
--- explicitly by config.refine_cursor: the native-grid lo of the sub-range currently being copied. A child is
+-- explicitly by config.regrain_cursor: the native-grid lo of the sub-range currently being copied. A child is
 -- built to completion (one budget batch at a time, resumed from its own high-water mark) before the cursor
 -- advances to the next sub-range; when the cursor reaches the coarse hi every sub-range is copied (or aged
--- and skipped) and the swap runs. refine() loops refine_step in ONE transaction (atomic, gap-free) -- the
--- operator's "do it now". maintain() calls refine_step ONCE per tick when auto-refine is on (REDESIGN.md sec
+-- and skipped) and the swap runs. regrain() loops regrain_step in ONE transaction (atomic, gap-free) -- the
+-- operator's "do it now". maintain() calls regrain_step ONCE per tick when auto-regrain is on (REDESIGN.md sec
 -- 12), feathering the copy under the live workload across ticks. The cross-tick path leaves copies in
 -- not-yet-attached children between ticks, but since the source still holds those rows, the parent's count
 -- is never short and snapshot() must NOT union those copies (it would double-count).
 
--- one resumable microbatch of refine work on coarse child p_child toward target step p_target_step.
+-- one resumable microbatch of regrain work on coarse child p_child toward target step p_target_step.
 -- Returns: 'copied:N' (copied N rows into the current fine child), 'swapped:K' (cursor reached hi -> detached
--- the source, attached K fine children, dropped it: refine done), or a soft no-progress status ('active' =
+-- the source, attached K fine children, dropped it: regrain done), or a soft no-progress status ('active' =
 -- not frozen yet, 'default_dirty' = a stray sits in the range, 'nosubdiv' = the step does not subdivide).
-create or replace function pgpm.refine_step(
+create or replace function pgpm.regrain_step(
   p_parent regclass, p_child name, p_target_step text default null, p_batch int default null
 ) returns text language plpgsql as $$
 declare
@@ -696,7 +696,7 @@ begin
   -- the reused-key equijoin (d.<key> = s.<key>, every key column): the copy is an anti-join against it, so
   -- a resumed batch never re-copies a row already in the child even when the control column is non-unique.
   -- The key is whatever transmute reused: a PRIMARY KEY, or (relaxed key contract) a UNIQUE constraint.
-  -- A truly KEYLESS monolith has no key to identify rows by, so a resumable copy cannot dedup -- refine is
+  -- A truly KEYLESS monolith has no key to identify rows by, so a resumable copy cannot dedup -- regrain is
   -- refused for it below ('nokey'); the coarse monolith stays a correct, queryable permanent state.
   select coalesce(
            (select i.indexrelid from pg_index i where i.indrelid = p_parent and i.indisprimary limit 1),
@@ -753,7 +753,7 @@ begin
 
   -- progress cursor: the lo of the sub-range currently being copied. null (fresh) or stale (out of this
   -- child's [lo,hi)) -> start at the coarse lo. The cursor only ever advances, one grid sub-range at a time.
-  v_cursor := cfg.refine_cursor;
+  v_cursor := cfg.regrain_cursor;
   if v_cursor is null
      or pgpm._native_gt(cfg.control_kind, v_lo, v_cursor)        -- cursor < coarse lo
      or pgpm._native_gt(cfg.control_kind, v_cursor, v_hi) then   -- cursor > coarse hi
@@ -763,7 +763,7 @@ begin
   -- advance over any aged (below-horizon) sub-ranges without copying them: they would be dropped by retain()
   -- the instant they became partitions, so they are simply discarded with the source at the swap (never
   -- materialized, and never deleted out of the source either). Aged ranges are the lowest in control order, a
-  -- contiguous prefix, so this loop only runs at the bottom of the child. One refine_skip per skipped range.
+  -- contiguous prefix, so this loop only runs at the bottom of the child. One regrain_skip per skipped range.
   loop
     exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_cursor);   -- cursor >= hi: nothing left to copy
     v_grid_lo := pgpm._grid_floor(cfg.control_kind, v_step, cfg.partition_anchor, v_cursor);
@@ -772,7 +772,7 @@ begin
     if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;
     v_aged := v_retain_boundary is not null and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary);
     exit when not v_aged;                                             -- found a sub-range to copy
-    insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'refine_aged', v_sub_lo, v_sub_hi, 0);
+    insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'regrain_aged', v_sub_lo, v_sub_hi, 0);
     v_cursor := v_sub_hi;                                             -- skip the aged sub-range (no copy, no delete)
   end loop;
 
@@ -803,7 +803,7 @@ begin
     $f$, v_child::text, cfg.control_column, v_lo_lit, v_hi_lit, v_batch, v_cols, v_nsp, v_sub_name, v_pkjoin);
     get diagnostics v_moved = row_count;
     if v_moved > 0 then
-      insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'refine_copy', v_sub_lo, v_sub_hi, v_moved);
+      insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'regrain_copy', v_sub_lo, v_sub_hi, v_moved);
     end if;
     if v_moved < v_batch then
       v_cursor := v_sub_hi;                                          -- sub-range fully copied: advance
@@ -812,7 +812,7 @@ begin
       -- see real stats, not reltuples = -1 (#164).
       perform pgpm._analyze(format('%I.%I', v_nsp, v_sub_name)::regclass);
     end if;
-    update pgpm.config set refine_cursor = v_cursor where parent_table = p_parent;
+    update pgpm.config set regrain_cursor = v_cursor where parent_table = p_parent;
     return 'copied:' || v_moved;
   end if;
 
@@ -836,7 +836,7 @@ begin
                    pgpm._encode(cfg.control_kind, r.lo), pgpm._encode(cfg.control_kind, r.hi));
     execute format('alter table %I.%I drop constraint %I', v_nsp, r.child_name, (r.child_name || '_ck'));
     update pgpm.part set attached = true where parent_table = p_parent and child_name = r.child_name;
-    insert into pgpm.log (parent_table, action, lo, hi, method) values (p_parent, 'refine_attach', r.lo, r.hi, 'check_skip');
+    insert into pgpm.log (parent_table, action, lo, hi, method) values (p_parent, 'regrain_attach', r.lo, r.hi, 'check_skip');
     v_made := v_made + 1;
   end loop;
   delete from pgpm.part where parent_table = p_parent and child_name = p_child;
@@ -845,41 +845,41 @@ begin
   -- dropped them (v_fk > 0): a v_fk = 0 means a drain already had them suspended, and re-adding mid-drain
   -- would break the drain's own leash -- maintain re-adds those once the drain is idle.
   if v_fk > 0 then perform pgpm.restore_incoming_fks(p_parent); end if;
-  update pgpm.config set refine_cursor = null where parent_table = p_parent;
-  insert into pgpm.log (parent_table, action, lo, hi, rows, method) values (p_parent, 'refine', v_lo, v_hi, v_made, 'copy_swap_drop');
+  update pgpm.config set regrain_cursor = null where parent_table = p_parent;
+  insert into pgpm.log (parent_table, action, lo, hi, rows, method) values (p_parent, 'regrain', v_lo, v_hi, v_made, 'copy_swap_drop');
   return 'swapped:' || v_made;
 end;
 $$;
 
--- refine(): the synchronous "do it now" driver -- loops refine_step in ONE transaction (atomic, gap-free)
+-- regrain(): the synchronous "do it now" driver -- loops regrain_step in ONE transaction (atomic, gap-free)
 -- until the coarse child is fully split, and returns the number of fine children created. Soft no-progress
 -- statuses become a hard error here (the operator gets a clear refusal); maintain() instead just skips.
-create or replace function pgpm.refine(p_parent regclass, p_child name, p_target_step text default null)
+create or replace function pgpm.regrain(p_parent regclass, p_child name, p_target_step text default null)
 returns int language plpgsql as $$
 declare v_status text; v_iter int := 0;
 begin
   loop
-    v_status := pgpm.refine_step(p_parent, p_child, p_target_step, null);
+    v_status := pgpm.regrain_step(p_parent, p_child, p_target_step, null);
     if v_status like 'swapped:%' then return split_part(v_status, ':', 2)::int; end if;
     if v_status in ('active', 'default_dirty', 'nosubdiv', 'nokey', 'idle') then
-      raise exception 'pg_partition_magician: cannot refine % -- %', p_child,
+      raise exception 'pg_partition_magician: cannot regrain % -- %', p_child,
         case v_status
           when 'active' then 'it is still active (not frozen); wait until the frontier passes its upper bound'
           when 'default_dirty' then 'the DEFAULT holds rows inside its range; drain them first'
           when 'nosubdiv' then 'the target step does not subdivide its range'
-          when 'nokey' then 'it has no primary key or unique constraint, so a resumable copy cannot identify rows; refine is unavailable for keyless tables (the coarse monolith remains a valid, queryable state)'
-          else 'nothing to refine' end;
+          when 'nokey' then 'it has no primary key or unique constraint, so a resumable copy cannot identify rows; regrain is unavailable for keyless tables (the coarse monolith remains a valid, queryable state)'
+          else 'nothing to regrain' end;
     end if;
     v_iter := v_iter + 1;
-    if v_iter > 10000000 then raise exception 'pg_partition_magician: refine safety limit'; end if;
+    if v_iter > 10000000 then raise exception 'pg_partition_magician: regrain safety limit'; end if;
   end loop;
 end;
 $$;
 
--- refine_history(): convenience -- refine the oldest coarse child (the monolith: the smallest-lo attached
--- partition) to p_target_step (default: the configured partition_step). Hierarchical refinement is just
--- repeated refine() calls with chosen steps.
-create or replace function pgpm.refine_history(p_parent regclass, p_target_step text default null)
+-- regrain_history(): convenience -- regrain the oldest coarse child (the monolith: the smallest-lo attached
+-- partition) to p_target_step (default: the configured partition_step). Hierarchical regraining is just
+-- repeated regrain() calls with chosen steps.
+create or replace function pgpm.regrain_history(p_parent regclass, p_target_step text default null)
 returns int language plpgsql as $$
 declare cfg pgpm.config; v_ncast text; v_mon name;
 begin
@@ -888,8 +888,8 @@ begin
   v_ncast := pgpm._native_type(cfg.control_kind);
   execute format('select child_name from pgpm.part where parent_table = %L::regclass and attached order by lo::%s asc limit 1',
                  p_parent::text, v_ncast) into v_mon;
-  if v_mon is null then raise exception 'pg_partition_magician: % has no partitions to refine', p_parent; end if;
-  return pgpm.refine(p_parent, v_mon, p_target_step);
+  if v_mon is null then raise exception 'pg_partition_magician: % has no partitions to regrain', p_parent; end if;
+  return pgpm.regrain(p_parent, v_mon, p_target_step);
 end;
 $$;
 
@@ -1080,8 +1080,8 @@ begin
         -- unique constraint, faithful to a keyless source (e.g. a plain hypertable un-hypertabled by
         -- from_hypertable). The one requirement is that the control column be NOT NULL: a partition key
         -- cannot be null, and pgpm never scans to enforce it, so a nullable control column is refused.
-        -- (refine is unavailable for a keyless monolith -- it has no key to dedup a resumed copy -- but
-        -- the coarse monolith is a correct, queryable permanent state; see refine_step.)
+        -- (regrain is unavailable for a keyless monolith -- it has no key to dedup a resumed copy -- but
+        -- the coarse monolith is a correct, queryable permanent state; see regrain_step.)
         if not (select a.attnotnull from pg_attribute a
                   where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) then
           raise exception 'pg_partition_magician: cannot transmute % on % -- the table has no primary key or unique constraint to reuse, and % is nullable. A partition key must be NOT NULL: run ALTER TABLE % ALTER COLUMN % SET NOT NULL first, then re-run transmute. (A primary key or unique constraint including % would also satisfy this.)',
@@ -1392,7 +1392,7 @@ begin
   -- attached partition with the smallest lo (it starts at grid_floor(min(control)), strictly below B,
   -- while every forward partition starts at B or higher). The reverse is a one-way door once any row
   -- lives outside the monolith's [lo, hi): a forward partition after the frontier crosses B, a backdated
-  -- stray in the DEFAULT, or finer children from a refinement (Tier 2 foldback / Tier 3 merge not built).
+  -- stray in the DEFAULT, or finer children from a regraining (Tier 2 foldback / Tier 3 merge not built).
   execute format('select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached order by lo::%s asc limit 1',
                  p_parent::text, v_ncast) into v_mon, v_mon_lo, v_mon_hi;
   if v_mon is null then
@@ -1403,7 +1403,7 @@ begin
                  p_parent::text, cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_hi),
                  cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_lo)) into v_outside;
   if v_outside then
-    raise exception 'pg_partition_magician: cannot untransmute % -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a refinement has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or refinement begins.',
+    raise exception 'pg_partition_magician: cannot untransmute % -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a regraining has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or regraining begins.',
       p_parent;
   end if;
 
@@ -1652,15 +1652,15 @@ begin
 end;
 $$;
 
--- Operator switch for auto-refine (REDESIGN.md sec 12). p_target_step (an interval for time/uuidv7, a
+-- Operator switch for auto-regrain (REDESIGN.md sec 12). p_target_step (an interval for time/uuidv7, a
 -- bigint step as text for id) turns it on: each maintenance tick feathers the oldest frozen coarse child
--- one budget-sized microbatch toward that granularity. null turns it off (refine stays operator-driven via
--- refine()/refine_history()). This only PACES refinement across ticks; refine_step enforces its own
+-- one budget-sized microbatch toward that granularity. null turns it off (regrain stays operator-driven via
+-- regrain()/regrain_history()). This only PACES regraining across ticks; regrain_step enforces its own
 -- preconditions (frozen, default-clear), so enabling it is always safe.
-create or replace function pgpm.set_refine(p_parent regclass, p_target_step text default null)
+create or replace function pgpm.set_regrain(p_parent regclass, p_target_step text default null)
 returns void language plpgsql as $$
 begin
-  update pgpm.config set refine_to = p_target_step where parent_table = p_parent;
+  update pgpm.config set regrain_to = p_target_step where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
 end;
 $$;
@@ -1695,7 +1695,7 @@ returns text language plpgsql as $$
 declare
   cfg pgpm.config;
   v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
-  v_refine text := 'skipped'; v_refine_child name;
+  v_regrain text := 'skipped'; v_regrain_child name;
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
   v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
@@ -1825,10 +1825,10 @@ begin
     v_batch := v_budget;
   end if;
 
-  -- Auto-refine target: the oldest FROZEN coarse child (if auto-refine is on). A coarse child (hi > one
+  -- Auto-regrain target: the oldest FROZEN coarse child (if auto-regrain is on). A coarse child (hi > one
   -- step past lo) is frozen once its whole range is at/below the current grid floor (no live write still
-  -- lands in it). Found here, before the drain, only so the auto-refine block below can use it.
-  if cfg.refine_to is not null then
+  -- lands in it). Found here, before the drain, only so the auto-regrain block below can use it.
+  if cfg.regrain_to is not null then
     execute format(
       'select child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached'
       || ' and pgpm._native_gt(%L, p.hi, pgpm._grid_next(%L, %L, p.lo))'
@@ -1837,7 +1837,7 @@ begin
       cfg.control_kind,
       pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, pgpm._frontier_native(p_parent)),
       pgpm._native_type(cfg.control_kind))
-      into v_refine_child;
+      into v_regrain_child;
   end if;
 
   -- The drain IS the conversion: give its (infrequent) partition attach room to win its lock,
@@ -1848,9 +1848,9 @@ begin
     -- Suspend (re-drop) any preserve-managed FK that is currently live BEFORE the DRAIN moves referenced
     -- rows: the drain deletes a closed-tail row out of the DEFAULT and re-inserts it through an unattached
     -- child, so the row is briefly outside the parent and a live NO ACTION FK would reject the move (a
-    -- CASCADE/SET NULL would silently honour it). Gated on a non-empty closed tail. Auto-refine does NOT
+    -- CASCADE/SET NULL would silently honour it). Gated on a non-empty closed tail. Auto-regrain does NOT
     -- need this: it COPIES without deleting, so referenced rows never leave the visible parent -- so the
-    -- suspend is no longer forced for a pending refine. Shares the drain's subtransaction.
+    -- suspend is no longer forced for a pending regrain. Shares the drain's subtransaction.
     v_suspended := pgpm.suspend_incoming_fks(p_parent);
     v_drain := pgpm.drain_step(p_parent, v_batch);
   exception when others then
@@ -1875,28 +1875,28 @@ begin
       values (p_parent, 'drain_budget', v_budget, v_reason);
   end if;
 
-  -- Auto-refine (REDESIGN.md sec 12): feather the oldest frozen coarse child (found up front as
-  -- v_refine_child) one budget-sized COPY microbatch toward refine_to per tick, under the same adaptive
+  -- Auto-regrain (REDESIGN.md sec 12): feather the oldest frozen coarse child (found up front as
+  -- v_regrain_child) one budget-sized COPY microbatch toward regrain_to per tick, under the same adaptive
   -- budget as the drain. Isolated in its own subtransaction; a lock race or a soft status just retries next
-  -- tick. Unlike the drain, refine COPIES and never deletes: the source stays whole and attached until the
+  -- tick. Unlike the drain, regrain COPIES and never deletes: the source stays whole and attached until the
   -- atomic swap, so it never moves a referenced row out of the parent, never opens the snapshot() gap, and
   -- needs NO FK leash -- it is NOT gated on a live preserve FK and runs whether or not one is suspended.
-  if v_refine_child is not null then
+  if v_regrain_child is not null then
     begin
-      v_refine := pgpm.refine_step(p_parent, v_refine_child, cfg.refine_to, v_batch);
+      v_regrain := pgpm.regrain_step(p_parent, v_regrain_child, cfg.regrain_to, v_batch);
     exception when others then
-      v_refine := 'deferred';
-      v_note := v_note || ' refine_deferred';
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'refine_skip', left(sqlerrm, 200));
+      v_regrain := 'deferred';
+      v_note := v_note || ' regrain_deferred';
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'regrain_skip', left(sqlerrm, 200));
     end;
-  elsif cfg.refine_to is not null then
-    v_refine := 'none';   -- auto-refine on, but no frozen coarse child to work
+  elsif cfg.regrain_to is not null then
+    v_regrain := 'none';   -- auto-regrain on, but no frozen coarse child to work
   end if;
 
   -- Re-add any incoming FKs that transmute(..., 'preserve') dropped, now against the new parent, AFTER
-  -- both the drain and the refine have moved this tick. restore_incoming_fks self-gates on quiescence (no
-  -- closed rows AND no in-flight child), so while a multi-tick refine is mid-flight it stays a no-op and
-  -- the FK remains suspended (RI off, surfaced by status().fks_suspended), re-adding only once the refine
+  -- both the drain and the regrain have moved this tick. restore_incoming_fks self-gates on quiescence (no
+  -- closed rows AND no in-flight child), so while a multi-tick regrain is mid-flight it stays a no-op and
+  -- the FK remains suspended (RI off, surfaced by status().fks_suspended), re-adding only once the regrain
   -- has swapped in its fine children. Isolated: a hiccup here never aborts progress.
   begin
     v_restored := pgpm.restore_incoming_fks(p_parent);
@@ -1905,8 +1905,8 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
   end;
 
-  return format('obtained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s refine=%s%s',
-                v_made, v_dropped, v_drain, v_suspended, v_restored, v_refine, v_note);
+  return format('obtained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
+                v_made, v_dropped, v_drain, v_suspended, v_restored, v_regrain, v_note);
 end;
 $$;
 
@@ -2036,7 +2036,7 @@ $$;
 -- (enforcing new writes) but blocked from full validation by pre-existing orphans (see
 -- incoming_fk_orphans() / validate_incoming_fks()).
 -- dropped/recreated (not CREATE OR REPLACE) because the redesign widens the return shape with
--- coarse_partitions + history_unrefined (REDESIGN.md section 14).
+-- coarse_partitions + history_unregrained (REDESIGN.md section 14).
 drop function if exists pgpm.status();
 create or replace function pgpm.status()
 returns table (
@@ -2044,7 +2044,7 @@ returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint,
   default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint,
-  fks_suspended bigint, fks_unvalidated bigint, history_unrefined boolean
+  fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean
 )
 language plpgsql as $$
 declare
@@ -2058,9 +2058,9 @@ begin
     -- backlog via the canonical check_default: default_rows (total), closed_rows (drainable now), oldest
     select cd.default_rows, cd.closed_rows, cd.oldest into v_drows, v_closed, v_old
       from pgpm.check_default(r.parent_table) cd;
-    -- n_partitions = attached (real) partitions; coarse_partitions = the un-refined coarse children (a
-    -- wider-than-one-step range, REDESIGN.md section 14) -- the refinement backlog; inflight = the
-    -- not-yet-attached drain/refine children.
+    -- n_partitions = attached (real) partitions; coarse_partitions = the un-regrained coarse children (a
+    -- wider-than-one-step range, REDESIGN.md section 14) -- the regraining backlog; inflight = the
+    -- not-yet-attached drain/regrain children.
     select count(*) filter (where attached),
            count(*) filter (where attached
                             and pgpm._native_gt(r.control_kind, hi, pgpm._grid_next(r.control_kind, r.partition_step, lo))),
@@ -2082,7 +2082,7 @@ begin
       from pgpm.dropped_fk where parent_table = r.parent_table;
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
-    coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unrefined := v_coarse > 0;
+    coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unregrained := v_coarse > 0;
     default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
     last_drained := v_last_drained; drain_skips := v_skips;
     fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval;
@@ -2135,9 +2135,9 @@ begin
 
   -- the parent already covers the DEFAULT and every attached partition; add every in-flight DRAIN child:
   -- a standalone table matching the parent's child-partition naming that is NOT yet attached (same shape as
-  -- the orphan guard). Crucially, EXCLUDE a refine copy-child -- an unattached child whose range is contained
+  -- the orphan guard). Crucially, EXCLUDE a regrain copy-child -- an unattached child whose range is contained
   -- in an attached partition (the coarse source it is being copied out of). Its rows are still present in
-  -- that attached source, so unioning the copy would DOUBLE-COUNT (refine copies, never moves -- so unlike a
+  -- that attached source, so unioning the copy would DOUBLE-COUNT (regrain copies, never moves -- so unlike a
   -- drain child its rows are not absent from the parent). A true drain child sits in no attached partition's
   -- range, so it is kept; a true orphan (not in pgpm.part) is also kept, conservatively.
   v_arms := format('select * from %s', v_parent::text);
@@ -2149,7 +2149,7 @@ begin
                 then substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{19}$'
                 else substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{4}(_[0-9]+)*$' end
        and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
-       and not exists (                                            -- skip refine copies (rows still in the source)
+       and not exists (                                            -- skip regrain copies (rows still in the source)
              select 1 from pgpm.part cp
               join pgpm.part ap on ap.parent_table = cp.parent_table and ap.attached
              where cp.parent_table = v_parent and cp.child_name = c.relname
@@ -2196,8 +2196,8 @@ begin
   if coalesce(v_closed, 0) > 0 then return 0; end if;
 
   -- gate 2: no in-flight (un-attached) DRAIN child mid-drain (same shape as transmute's orphan guard). A
-  -- refine copy-child is EXCLUDED (its range is contained in an attached partition): refine copies without
-  -- deleting, so the referenced rows never leave the visible parent, and a copy-refine never needs the FK
+  -- regrain copy-child is EXCLUDED (its range is contained in an attached partition): regrain copies without
+  -- deleting, so the referenced rows never leave the visible parent, and a copy-regrain never needs the FK
   -- suspended -- so it must not hold a drain-suspended FK off either (that would reopen the RI window the
   -- copy design closes). Only a true drain child, in no attached partition's range, blocks the re-add.
   select c.relname into v_inflight
@@ -2210,7 +2210,7 @@ begin
               else substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{4}(_[0-9]+)*$'
          end
      and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
-     and not exists (                                            -- a refine copy is not an absent-row child
+     and not exists (                                            -- a regrain copy is not an absent-row child
            select 1 from pgpm.part cp
             join pgpm.part ap on ap.parent_table = cp.parent_table and ap.attached
            where cp.parent_table = p_parent and cp.child_name = c.relname
@@ -2336,7 +2336,7 @@ begin
     return 0;
   end if;
   -- Normally gated on drain work (closed tail rows): no work => leave live FKs in place. p_force overrides
-  -- the gate, for the caller (maintain's auto-refine) that is about to move referenced rows out of a
+  -- the gate, for the caller (maintain's auto-regrain) that is about to move referenced rows out of a
   -- frozen coarse child even though the closed tail is empty.
   if not p_force then
     select closed_rows into v_closed from pgpm.check_default(p_parent);

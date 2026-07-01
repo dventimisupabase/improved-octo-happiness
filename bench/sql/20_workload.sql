@@ -8,7 +8,7 @@
 -- Every query is the kind you'd actually run against an id-partitioned events table: it filters by
 -- user_id (the lookup index) AND a RECENT ID WINDOW. The bench partitions by id, so an id-range predicate
 -- PRUNES to the newest partition(s) -- which is the point: it keeps the read cost ~stable before and after
--- and lets refine degradation show up as the signal instead of being masked (or, with a created_at
+-- and lets regrain degradation show up as the signal instead of being masked (or, with a created_at
 -- predicate, dominated) by partition fan-out. A created_at predicate would fan out across EVERY partition
 -- because id and created_at are not constraint-linked, so the planner cannot prune an id-partitioned table
 -- from a created_at filter. "Recent by id" is the matched-to-the-key form of "recent activity".

@@ -1,5 +1,5 @@
--- Retention in the monolith model, and retention-aware refine. While history is one coarse monolith
--- spanning the horizon, retain() cannot drop it (retention is suspended over coarse history). refine() is
+-- Retention in the monolith model, and retention-aware regrain. While history is one coarse monolith
+-- spanning the horizon, retain() cannot drop it (retention is suspended over coarse history). regrain() is
 -- retention-aware: it copies only the within-horizon sub-ranges and SKIPS the ones entirely below the
 -- horizon (it never copies them; their rows are discarded with the coarse source at the swap, never copied
 -- and never deleted out of it), so no doomed partition is ever created and a later retain() has nothing to
@@ -20,12 +20,12 @@ select is(
   0, 'retention is suspended over the coarse monolith (a partition spanning the horizon cannot be dropped)');
 
 select is(
-  (select pgpm.refine_history('public.rt7'))::int,
-  3, 'retention-aware refine copies only the 3 within-horizon sub-ranges [30000, 60000)');
+  (select pgpm.regrain_history('public.rt7'))::int,
+  3, 'retention-aware regrain copies only the 3 within-horizon sub-ranges [30000, 60000)');
 
 select is(
-  (select count(distinct lo)::int from pgpm.log where parent_table = 'public.rt7'::regclass and action = 'refine_aged'),
-  3, 'the 3 below-horizon sub-ranges are skipped (logged refine_aged), never copied or materialized');
+  (select count(distinct lo)::int from pgpm.log where parent_table = 'public.rt7'::regclass and action = 'regrain_aged'),
+  3, 'the 3 below-horizon sub-ranges are skipped (logged regrain_aged), never copied or materialized');
 
 select is(
   (select count(*)::int from public.rt7 where id < 30000),
@@ -33,7 +33,7 @@ select is(
 
 select is(
   pgpm.retain('public.rt7'),
-  0, 'a later retain() is a no-op: refine already reclaimed the aged ranges (no materialize-then-drop churn)');
+  0, 'a later retain() is a no-op: regrain already reclaimed the aged ranges (no materialize-then-drop churn)');
 
 select ok(
   to_regclass('public.rt7_p' || lpad('0', 19, '0')) is null

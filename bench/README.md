@@ -4,15 +4,15 @@ Proves `pg_partition_magician` converts a **giant, live, query-loaded** table to
 partitioned **online**, and measures latency / throughput / health *before*,
 *during*, and *after* the conversion.
 
-> **Model note: monolith + refine.** Since the redesign, `transmute()` is an instant metadata cutover
-> that parks all history in one bounded *monolith* partition; the bulk O(rows) move is now `refine()`
-> (COPY the monolith into fine children, one atomic swap, drop the source), not the drain. `refine`
+> **Model note: monolith + regrain.** Since the redesign, `transmute()` is an instant metadata cutover
+> that parks all history in one bounded *monolith* partition; the bulk O(rows) move is now `regrain()`
+> (COPY the monolith into fine children, one atomic swap, drop the source), not the drain. `regrain`
 > only runs on a *frozen* coarse child (whole range below the write frontier). A time key's frontier is
 > wall-clock `now()`, so a fresh time monolith cannot freeze inside a benchmark window; an id key's
 > frontier is `max(id)`, which the harness advances past the monolith's upper bound with one sentinel
-> row to freeze it on demand (the same trick pgpm's own refine tests use). So the harness partitions
+> row to freeze it on demand (the same trick pgpm's own regrain tests use). So the harness partitions
 > `bench.events` by its bigint `id` (it is in the PK, so `transmute` reuses the PK in place) and
-> measures the refine of the id-monolith under load. A rung is green when refine completes
+> measures the regrain of the id-monolith under load. A rung is green when regrain completes
 > (`coarse_partitions` reaches 0), every history row is conserved across the swap, and convert-phase
 > latency tracks baseline with zero workload failures.
 
@@ -51,23 +51,23 @@ and the month-spread is unchanged).
 
 ## The phases (a passive observer)
 
-pgpm is **self-driving**: you call `transmute()` once, enable auto-refine, and pgpm's own pg_cron
-maintenance refines the monolith (and obtains/drains) autonomously, inside the database. So this
+pgpm is **self-driving**: you call `transmute()` once, enable auto-regrain, and pgpm's own pg_cron
+maintenance regrains the monolith (and obtains/drains) autonomously, inside the database. So this
 harness does **not** perform the partitioning: it sets pgpm up the way an operator would, drives an
 ambient workload, and *observes*. Three phases:
 
 1. **baseline**: ambient workload against the *unpartitioned* table.
 2. **convert**: fire `pgpm.transmute()` once (`p_paused => false`), freeze the monolith (advance the id
-   frontier past it with a sentinel row), enable auto-refine (`set_refine`), and schedule
-   `pgpm.maintain` on pg_cron. Then **pgpm** refines the monolith into fine partitions on its own
+   frontier past it with a sentinel row), enable auto-regrain (`set_regrain`), and schedule
+   `pgpm.maintain` on pg_cron. Then **pgpm** regrains the monolith into fine partitions on its own
    (COPY into new children, one atomic swap, drop the source) while the harness drives the workload and
-   watches `pgpm.log` until the refine completes (`coarse_partitions` reaches 0). The harness never
-   calls `refine_step`; because the conversion runs server-side, a dropped harness connection can't
+   watches `pgpm.log` until the regrain completes (`coarse_partitions` reaches 0). The harness never
+   calls `regrain_step`; because the conversion runs server-side, a dropped harness connection can't
    stop it.
 3. **post**: ambient workload against the now fully-partitioned table.
 
 The report compares client tps + p50/p95/p99 latency across the three phases, summarizes pgpm's own
-conversion (refine/obtain from `pgpm.log`), and asserts **row conservation** (every history row still
+conversion (regrain/obtain from `pgpm.log`), and asserts **row conservation** (every history row still
 present after the swap). The system-metric time-series (WAL, checkpoints, `pg_stat_io`, wait/lock
 events) is **pg_flight_recorder's** job: it records them continuously and server-side, and the report
 slices its series to the conversion window. So degradation *while pgpm converts the table under load*
@@ -111,8 +111,8 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_GEN_JOBS` | `1` | parallel generator sessions: set to ≈vCPU to fan generation across cores (one `INSERT…SELECT` is single-core-bound) |
 | `BENCH_DEFER_INDEX` | `0` | drop the secondary index during bulk load, rebuild after; avoids scattered per-row index maintenance across hundreds of millions of inserts |
 | `BENCH_INTERVAL` | `1 month` | partition width (time-key only; the ladder partitions by `id`, see `BENCH_ID_STEP`) |
-| `BENCH_ID_STEP` | `10000000` | id-grid step: the bench partitions `bench.events` by its bigint `id`; the monolith `[0,B)` refines into ~`B/step` fine partitions |
-| `BENCH_REFINE` | `1` | `1` = freeze the monolith and drive auto-refine (the bulk mover) and observe it to completion; `0` = transmute-only (no bulk move) |
+| `BENCH_ID_STEP` | `10000000` | id-grid step: the bench partitions `bench.events` by its bigint `id`; the monolith `[0,B)` regrains into ~`B/step` fine partitions |
+| `BENCH_REGRAIN` | `1` | `1` = freeze the monolith and drive auto-regrain (the bulk mover) and observe it to completion; `0` = transmute-only (no bulk move) |
 | `BENCH_OBTAIN` | `3` | future partitions pgpm obtains (configured on transmute; pgpm's maintenance does it) |
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | ambient-workload pgbench concurrency |
 | `BENCH_OPS` | `50` | server-side ops per `workload_step` call, **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table blows `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
@@ -250,7 +250,7 @@ sampled. The module has its own test track (`./test.sh observe`); see the
 
 ## Migrating a TimescaleDB hypertable (`run_fh.sh`)
 
-`bench/run.sh` converts a plain id-keyed table with `transmute` + `refine`.
+`bench/run.sh` converts a plain id-keyed table with `transmute` + `regrain`.
 **`bench/run_fh.sh`** is its sibling for the `from_hypertable` path: it converts a
 TimescaleDB **hypertable** (Apache edition, the Supabase fleet) to pgpm-managed native
 partitioning, online, under live OLTP load. It needs **PostgreSQL 15 with Apache
@@ -275,7 +275,7 @@ exposed as two phases so writes keep arriving across them. Three observed phases
      key/indexes/identity, and hands off to `transmute`. (At scale this window is **not**
      negligible: `CREATE TABLE LIKE` carries no indexes, so the rebuild of the PK and
      secondary index on the full table happens inside it.)
-   - **refine**: split the resulting time-monolith into `BENCH_FH_INTERVAL` partitions (see
+   - **regrain**: split the resulting time-monolith into `BENCH_FH_INTERVAL` partitions (see
      the wall-clock note below).
 3. **post**: ambient workload against the now pgpm-partitioned table.
 
@@ -289,23 +289,23 @@ duplicated" check even under continuous insert/update/delete. (Delta-reconcile
 *correctness* is covered by the pgTAP suite, `tests/timescale/db/10`; the bench measures
 at-scale behavior and load, not correctness.)
 
-### Refine and the wall-clock frontier (a bench instrument)
+### Regrain and the wall-clock frontier (a bench instrument)
 
-pgpm refines a partition only once the write frontier has passed its upper bound, and for
+pgpm regrains a partition only once the write frontier has passed its upper bound, and for
 a **time** key the frontier is wall-clock `now()`. A `from_hypertable` monolith spans
 `[min, next-period-boundary]`, so its upper bound is in the future and it is the *active
-current partition*: pgpm correctly refuses to refine it until the calendar rolls past the
-boundary. To exercise refine inside a bench window, `run_fh.sh`:
+current partition*: pgpm correctly refuses to regrain it until the calendar rolls past the
+boundary. To exercise regrain inside a bench window, `run_fh.sh`:
 
-- runs the refine-phase workload at an effective clock pushed **past** the monolith (the
+- runs the regrain-phase workload at an effective clock pushed **past** the monolith (the
   `p_clock_secs` argument), so its writes land in **forward** partitions and the monolith
   range stays quiescent, and
-- drives `refine_history` in a session whose `now()` is shadowed to a future time (a
+- drives `regrain_history` in a session whose `now()` is shadowed to a future time (a
   `shadow.now()` in a schema ahead of `pg_catalog`; pgpm functions do not pin
   `search_path`).
 
 This is a **bench instrument only**: it lets pgpm act on a genuinely-quiescent historical
-range as if frozen. In production you never do this; the monolith refines naturally as the
+range as if frozen. In production you never do this; the monolith regrains naturally as the
 calendar advances.
 
 ### Running it
@@ -335,12 +335,12 @@ conservation, and pgfr/pgss latency), not client tps.
 | env | default | meaning |
 |-----|---------|---------|
 | `BENCH_CHUNK_INTERVAL` | `1 week` | hypertable chunk width (sets how many chunks the copy iterates) |
-| `BENCH_FH_INTERVAL` | `1 month` | pgpm partition width `from_hypertable` transmutes to, and the refine target |
+| `BENCH_FH_INTERVAL` | `1 month` | pgpm partition width `from_hypertable` transmutes to, and the regrain target |
 | `BENCH_TRACK_CHANGES` | `1` | install the delta trigger so in-flight update/delete are reconciled at cutover (needs a key; refused on a keyless table) |
-| `BENCH_REFINE` | `1` | after cutover, refine the time-monolith via the now()-shadow instrument; `0` = stop after cutover |
+| `BENCH_REGRAIN` | `1` | after cutover, regrain the time-monolith via the now()-shadow instrument; `0` = stop after cutover |
 | `BENCH_OBTAIN` | `4` | forward partitions obtained at cutover |
-| `BENCH_DRAIN_BATCH` | `50000` | rows per refine microbatch; also the cutover pre-drain's micro-batch size and residual threshold |
-| `BENCH_DRAIN_MAX_SECS` | `1800` | safety cap on the refine observation window |
+| `BENCH_DRAIN_BATCH` | `50000` | rows per regrain microbatch; also the cutover pre-drain's micro-batch size and residual threshold |
+| `BENCH_DRAIN_MAX_SECS` | `1800` | safety cap on the regrain observation window |
 | `BENCH_PREDRAIN` | `1` | `1` = the cutover pre-drains the delta online before the lock (`p_predrain=>true`); `0` = undrained (the #170 A/B) |
 | `BENCH_LOCKPROBE` | `1` | arm a background `pg_locks` session that times the cutover's true `ACCESS EXCLUSIVE` window and reads the at-lock delta residual |
 
@@ -371,5 +371,5 @@ cadence cannot resolve the window, especially the drained arm).
 
 The same `bench/results/` layout (`report.md`, per-phase `*.pgbench.txt`/`*.pctiles.txt`/
 `*.pgss.csv`, and pgfr when enabled), plus `copy.progress.csv` (the online copy: dest rows
-and pending delta keys over time), `refine.progress.csv` (coarse children counting down
+and pending delta keys over time), `regrain.progress.csv` (coarse children counting down
 to 0), and `lockprobe.log` (the cutover lock-window probe's `LOCKPROBE …` line).

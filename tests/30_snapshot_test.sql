@@ -1,4 +1,4 @@
--- The drain visibility gap, made concrete, and the snapshot() escape hatch. refine() (bulk) never opens
+-- The drain visibility gap, made concrete, and the snapshot() escape hatch. regrain() (bulk) never opens
 -- the gap -- it copies and swaps atomically. The ASSISTANT drain, evacuating strays in microbatches,
 -- still can: during a multi-batch drain the already-moved rows live in an unattached child, so
 -- `select from parent` UNDERCOUNTS the interval being drained. pgpm.snapshot(null::<parent>) UNIONs the

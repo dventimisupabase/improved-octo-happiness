@@ -3,7 +3,7 @@
 Welcome. This repo is **`pg_partition_magician`**: a lightweight, **pure-SQL**
 RANGE-partition manager for PostgreSQL whose only runtime dependency is **pg_cron**.
 It transmutes an existing (possibly huge, live) table into a native partitioned table
-*online*, then manages the lifecycle (obtain, drain, retain, refine) across three
+*online*, then manages the lifecycle (obtain, drain, retain, regrain) across three
 partition-key dimensions: **time**, **integer/bigint id**, and **UUIDv7/ULID**.
 
 For *what it does and how to use it*, read [`README.md`](./README.md) and the
@@ -64,7 +64,7 @@ makes a partitioned parent under the original name, and attaches the old table *
 as one bounded **monolith** child (zero data movement), under a fresh empty **`DEFAULT`**
 net. New writes route to premade partitions; the `DEFAULT` stays empty (the assistant
 **drain** evacuates any stray that lands there). The historical bulk stays in the monolith
-until you **refine** it into proper partitions on demand, by copying (so no dead tuples, no
+until you **regrain** it into proper partitions on demand, by copying (so no dead tuples, no
 vacuum). The unifying idea is the **frontier** (`now()` for time, `max(control)` for
 id/uuidv7): a child is *frozen* and refinable once its whole range is below it. The cutover
 stays online via a scan-skip attach (`NOT VALID` CHECK → `VALIDATE` under a gentle lock →
@@ -165,7 +165,7 @@ with the bundle + minified dbdev package + a source tarball (release notes pulle
 - [`docs/guide.md`](./docs/guide.md) and [`docs/reference.md`](./docs/reference.md): the user-facing
   guide and the full function/catalog reference.
 - [`REDESIGN.md`](./REDESIGN.md): the operating model and design rationale (the bounded-child transmute,
-  the refine machinery, and the foundational supply/demand principles).
+  the regrain machinery, and the foundational supply/demand principles).
 - `pgpm_core/install.sql`: heavily commented; the adapter layer
   (`_grid_floor`/`_grid_next`/`_encode`/`_decode`/`_frontier_native`/`_part_name`) is
   where new partition kinds plug in.

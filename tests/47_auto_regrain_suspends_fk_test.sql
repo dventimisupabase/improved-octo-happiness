@@ -1,9 +1,9 @@
--- Auto-refine COPIES; it never removes a referenced row from the visible parent. The source monolith stays
--- whole and attached until the atomic swap, so referential integrity holds continuously and a copy-refine
--- needs NO FK leash. Unlike the drain (which deletes-and-moves and must suspend), a copy-refine must leave a
--- live preserve-managed FK ALONE: the FK stays live across the whole refine, including the swap, and RI is
+-- Auto-regrain COPIES; it never removes a referenced row from the visible parent. The source monolith stays
+-- whole and attached until the atomic swap, so referential integrity holds continuously and a copy-regrain
+-- needs NO FK leash. Unlike the drain (which deletes-and-moves and must suspend), a copy-regrain must leave a
+-- live preserve-managed FK ALONE: the FK stays live across the whole regrain, including the swap, and RI is
 -- enforced throughout. Regression for the move-model bug, which wrongly suspended the FK for the entire
--- refine -- a long, needless RI-off window (REDESIGN.md sections 9 and 10).
+-- regrain -- a long, needless RI-off window (REDESIGN.md sections 9 and 10).
 create extension if not exists pgtap;
 begin;
 select plan(7);
@@ -20,38 +20,38 @@ select pgpm.restore_incoming_fks('public.arf');   -- monolith holds every refere
 select is(
   (select count(*)::int from pg_constraint
      where conrelid = 'public.arf_ref'::regclass and contype = 'f' and confrelid = 'public.arf'::regclass),
-  1, 'precondition: the preserve FK is live before auto-refine');
+  1, 'precondition: the preserve FK is live before auto-regrain');
 
 insert into public.arf (id, payload) values (10000, 'frontier');   -- advance frontier past B -> monolith frozen
-select pgpm.set_refine('public.arf', '100');                       -- enable feathered auto-refine
+select pgpm.set_regrain('public.arf', '100');                       -- enable feathered auto-regrain
 
--- one maintain tick feathers a COPY microbatch. Because refine copies (it never moves referenced rows out of
+-- one maintain tick feathers a COPY microbatch. Because regrain copies (it never moves referenced rows out of
 -- the parent), the live FK must be left ALONE -- not suspended the way the drain suspends it.
 select pgpm.maintain('public.arf');
 select is(
   (select count(*)::int from pg_constraint
      where conrelid = 'public.arf_ref'::regclass and contype = 'f' and confrelid = 'public.arf'::regclass),
-  1, 'mid-refine: the preserve FK is still LIVE (a copy-refine does not suspend it)');
+  1, 'mid-regrain: the preserve FK is still LIVE (a copy-regrain does not suspend it)');
 select is(
   (select fks_suspended::int from pgpm.status() where parent = 'public.arf'::regclass),
-  0, 'mid-refine: status() reports no suspended FK (RI never goes off for a copy-refine)');
+  0, 'mid-regrain: status() reports no suspended FK (RI never goes off for a copy-regrain)');
 
--- mid-refine RI is intact: a referencing insert to a key still in the monolith succeeds (the key is present
+-- mid-regrain RI is intact: a referencing insert to a key still in the monolith succeeds (the key is present
 -- the entire time, never moved through an unattached child).
 select lives_ok(
   $$ insert into public.arf_ref (m_id) values (5) $$,
-  'mid-refine: a referencing insert to an in-range key succeeds (the key never left the parent)');
+  'mid-regrain: a referencing insert to an in-range key succeeds (the key never left the parent)');
 
--- drive the refine to completion across ticks; the atomic swap runs with the FK live the whole time
+-- drive the regrain to completion across ticks; the atomic swap runs with the FK live the whole time
 do $$ begin for i in 1..60 loop perform pgpm.maintain('public.arf'); end loop; end $$;
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.arf'::regclass),
-  0::bigint, 'the refine completes across ticks (no coarse partition remains), FK live throughout');
+  0::bigint, 'the regrain completes across ticks (no coarse partition remains), FK live throughout');
 select is(
   (select count(*)::int from pg_constraint
      where conrelid = 'public.arf_ref'::regclass and contype = 'f' and confrelid = 'public.arf'::regclass),
-  1, 'the preserve FK is still live after the refine completes (it was never dropped)');
+  1, 'the preserve FK is still live after the regrain completes (it was never dropped)');
 select throws_ok(
   $$ insert into public.arf_ref (m_id) values (88888888) $$,
   '23503', NULL, 'the live FK still rejects a dangling reference (RI enforced end to end)');

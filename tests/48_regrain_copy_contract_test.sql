@@ -1,10 +1,10 @@
--- The copy contract (REDESIGN.md sections 9 and 10): refine COPIES, it never moves. While a feathered
--- (cross-tick) refine is mid-flight, the source monolith still holds every row and stays attached, so:
+-- The copy contract (REDESIGN.md sections 9 and 10): regrain COPIES, it never moves. While a feathered
+-- (cross-tick) regrain is mid-flight, the source monolith still holds every row and stays attached, so:
 --   (1) a plain read of the parent is NEVER short (no undercount),
 --   (2) the source is never deleted from (no dead tuples, no bloat),
 --   (3) snapshot() does not union the in-flight copies (they would double-count rows still in the source).
--- These three assertions encode exactly what the move-model implementation got wrong. refine never logs a
--- 'refine_move' (the delete-and-move action); it logs 'refine_copy'.
+-- These three assertions encode exactly what the move-model implementation got wrong. regrain never logs a
+-- 'regrain_move' (the delete-and-move action); it logs 'regrain_copy'.
 create extension if not exists pgtap;
 begin;
 select plan(8);
@@ -14,29 +14,29 @@ insert into public.cc (payload) select 'x' from generate_series(1, 300);   -- hi
 select pgpm.transmute('public.cc', 'id', 50, p_drain_batch => 20, p_paused => false);  -- monolith [0,B); batch 20
 select pgpm.obtain('public.cc');
 insert into public.cc (id, payload) values (10000, 'frontier');   -- advance frontier past B -> monolith frozen
-select pgpm.set_refine('public.cc', '50');                        -- enable feathered auto-refine to step 50
+select pgpm.set_regrain('public.cc', '50');                        -- enable feathered auto-regrain to step 50
 
--- one maintain tick: a partial COPY (one budget microbatch), the refine is NOT finished and copies are in flight
+-- one maintain tick: a partial COPY (one budget microbatch), the regrain is NOT finished and copies are in flight
 select pgpm.maintain('public.cc');
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.cc'::regclass),
-  1::bigint, 'mid-refine: the coarse monolith is still present (one tick does not finish the refine)');
+  1::bigint, 'mid-regrain: the coarse monolith is still present (one tick does not finish the regrain)');
 
 select cmp_ok(
-  (select count(*) from pgpm.log where parent_table = 'public.cc'::regclass and action = 'refine_copy'),
-  '>', 0::bigint, 'mid-refine: at least one copy microbatch has run (action refine_copy)');
+  (select count(*) from pgpm.log where parent_table = 'public.cc'::regclass and action = 'regrain_copy'),
+  '>', 0::bigint, 'mid-regrain: at least one copy microbatch has run (action regrain_copy)');
 
 select is(
-  (select count(*)::int from pgpm.log where parent_table = 'public.cc'::regclass and action = 'refine_move'),
-  0, 'refine never logs a move: it copies, it does not delete-and-move');
+  (select count(*)::int from pgpm.log where parent_table = 'public.cc'::regclass and action = 'regrain_move'),
+  0, 'regrain never logs a move: it copies, it does not delete-and-move');
 
--- (1) NO UNDERCOUNT: every history row is still visible through the parent mid-refine
+-- (1) NO UNDERCOUNT: every history row is still visible through the parent mid-regrain
 select is(
   (select count(*)::int from public.cc where id <= 300),
-  300, 'mid-refine: a plain read of the parent returns all 300 history rows (no undercount)');
+  300, 'mid-regrain: a plain read of the parent returns all 300 history rows (no undercount)');
 
--- (2) NO DELETES: the source monolith table still holds all 300 history rows mid-refine
+-- (2) NO DELETES: the source monolith table still holds all 300 history rows mid-regrain
 create temporary table _moncnt (n int);
 do $$
 declare v_rel text; v_n int;
@@ -50,23 +50,23 @@ begin
   execute 'select count(*) from ' || v_rel into v_n;
   insert into _moncnt values (v_n);
 end $$;
-select is((select n from _moncnt), 300, 'mid-refine: the monolith source still holds all 300 rows (never deleted from)');
+select is((select n from _moncnt), 300, 'mid-regrain: the monolith source still holds all 300 rows (never deleted from)');
 
 -- (3) NO DOUBLE-COUNT: snapshot() does not union the in-flight copies (their rows are still in the source)
 select is(
   (select count(*)::int from pgpm.snapshot(null::public.cc) where id <= 300),
-  300, 'mid-refine: snapshot() returns 300 history rows, not 300 + the in-flight copies');
+  300, 'mid-regrain: snapshot() returns 300 history rows, not 300 + the in-flight copies');
 
--- drive the refine to completion across ticks
+-- drive the regrain to completion across ticks
 do $$ begin for i in 1..60 loop perform pgpm.maintain('public.cc'); end loop; end $$;
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.cc'::regclass),
-  0::bigint, 'the refine completes across ticks (no coarse partition remains)');
+  0::bigint, 'the regrain completes across ticks (no coarse partition remains)');
 
 select is(
   (select count(*)::int from public.cc where id <= 300),
-  300, 'all 300 history rows conserved across the feathered copy-refine');
+  300, 'all 300 history rows conserved across the feathered copy-regrain');
 
 select * from finish();
 rollback;

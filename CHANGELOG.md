@@ -78,12 +78,12 @@
   `pgpm_monolith_bound` CHECK that `LIKE` also copies is dropped from the parent (the monolith keeps its
   own copy for the metadata-only attach). CHECK constraints now propagate to every partition. (tests/55;
   tests/timescale/db/07)
-- **Generated columns are supported (bug fix).** `drain`, `refine`, and `from_hypertable` move rows by
+- **Generated columns are supported (bug fix).** `drain`, `regrain`, and `from_hypertable` move rows by
   building an explicit column list, which wrongly **included generated columns** -- so the move failed
   with `cannot insert a non-DEFAULT value into a generated column`. Two fixes: omit generated columns from
   those INSERT lists (they recompute on insert), and create the destination/partition child with
   `INCLUDING GENERATED` so its generated column matches the parent (otherwise the attach failed with
-  `column ... must be a generated column`). A table with a STORED generated column now drains, refines, and
+  `column ... must be a generated column`). A table with a STORED generated column now drains, regrains, and
   migrates correctly, with the generated value recomputed on the destination. (tests/54;
   tests/timescale/db/09)
 - **`from_hypertable` hardening tests.** Added retention translation (a `drop_chunks` policy becomes pgpm
@@ -118,10 +118,10 @@
   `NOT NULL` but adds no key -- so `from_hypertable` drops its keyless refusal and migrates those
   hypertables (tests/timescale/db/03; tests/timescale/db/01 updated). A nullable control column, a key that
   *excludes* the control column, and a bare unique index are still refused with guidance. One limitation:
-  `refine` is unavailable on a keyless monolith (no key to dedup a resumable copy), so its history stays as
-  one coarse, queryable child; `refine` raises a clear error rather than failing obscurely. (tests/52;
+  `regrain` is unavailable on a keyless monolith (no key to dedup a resumable copy), so its history stays as
+  one coarse, queryable child; `regrain` raises a clear error rather than failing obscurely. (tests/52;
   tests/32 removed as obsolete, tests/25 updated.)
-- **`refine` reuses the same key `transmute` did (bug fix).** `refine`'s resumable copy identifies rows by
+- **`regrain` reuses the same key `transmute` did (bug fix).** `regrain`'s resumable copy identifies rows by
   the reused key, but it was built from the **primary key only** -- so on a monolith whose reused key is a
   *unique constraint* (the case the previous entry added) it produced malformed SQL (`... where )`) and
   failed. It now uses the primary key or the unique constraint, matching `transmute`. (tests/53)
@@ -139,38 +139,38 @@
   refused. Incoming-FK preservation now accepts an FK that references the reused unique constraint, not
   only the primary key. (tests/49-51; tests/32 updated for the relaxed contract)
 - **The bounded-child transmute redesign: the original table becomes a "monolith" partition, not the
-  `DEFAULT`; the history is split on demand by `refine`.** This supersedes the metadata-only-cutover and
+  `DEFAULT`; the history is split on demand by `regrain`.** This supersedes the metadata-only-cutover and
   `DEFAULT`-as-store framing of the entries below. `transmute` now renames the original aside and attaches
   it, intact, as one bounded coarse **monolith** child covering `[grid_floor(min), B)`, under a fresh
   **empty `DEFAULT`** safety net: still no row movement, but the cutover does one online, read-only
   `VALIDATE` scan (under a non-blocking `SHARE UPDATE EXCLUSIVE` lock) before the brief metadata-only
   rename/attach. The historical bulk no longer drains row-by-row; it stays in the monolith until
-  **`refine()`** splits it into proper partitions by **copying** (no dead tuples, no vacuum), atomically
-  (synchronous `refine` / `refine_history`) or paced across maintenance ticks (`set_refine` auto-refine,
-  budget-feathered like the drain). Refine is retention-aware (below-horizon sub-ranges are skipped, not
+  **`regrain()`** splits it into proper partitions by **copying** (no dead tuples, no vacuum), atomically
+  (synchronous `regrain` / `regrain_history`) or paced across maintenance ticks (`set_regrain` auto-regrain,
+  budget-feathered like the drain). Regrain is retention-aware (below-horizon sub-ranges are skipped, not
   materialized) and optional (a coarse monolith is a correct, permanent state). The drain is demoted to the
   **assistant**: it keeps the empty `DEFAULT` empty by evacuating strays, so `obtain` takes a cheap
-  scan-free attach. `status()` gains `coarse_partitions` and `history_unrefined` (the refinement backlog);
+  scan-free attach. `status()` gains `coarse_partitions` and `history_unregrained` (the regraining backlog);
   `untransmute`'s gate is now monolith/data-based (reversible until a row lands outside the monolith or
-  refinement begins); `maintain` suspends preserve-managed incoming FKs around the drain's row movement (a
-  copy-`refine` needs no such leash; its swap handles the FK atomically -- see the refine-copy fix below).
+  regraining begins); `maintain` suspends preserve-managed incoming FKs around the drain's row movement (a
+  copy-`regrain` needs no such leash; its swap handles the FK atomically -- see the regrain-copy fix below).
   Partitions wider than one step are named `_p<lo>_to_<hi>`. (PRs #116-#119, #123; tests/42-47; REDESIGN.md)
-- **`refine` copies instead of moving (correctness fix for the redesign above).** The first implementation
-  of `refine_step` was inadvertently a clone of the drain: it `DELETE`d rows out of the coarse source and
+- **`regrain` copies instead of moving (correctness fix for the redesign above).** The first implementation
+  of `regrain_step` was inadvertently a clone of the drain: it `DELETE`d rows out of the coarse source and
   re-`INSERT`ed them into unattached children, contradicting the design's *copy, never delete*. That bloated
   the source with dead tuples and reopened the `snapshot()` read gap that copy-then-swap exists to avoid --
-  a paced auto-refine **undercounted** the parent mid-refine. `refine_step` now **copies** each frozen
+  a paced auto-regrain **undercounted** the parent mid-regrain. `regrain_step` now **copies** each frozen
   sub-range into a standalone born-validated child (budget-sized anti-join `INSERT`s resumed from the
-  child's high-water mark, progress tracked across ticks by a new `config.refine_cursor`) and **skips**
+  child's high-water mark, progress tracked across ticks by a new `config.regrain_cursor`) and **skips**
   below-horizon sub-ranges without deleting (discarded with the source at the swap); the source stays whole
   and **attached** until one atomic swap, so a read of the parent is never short. Three consequences follow
-  from the source staying attached: `snapshot()` no longer unions a refine's copy-children (their rows are
+  from the source staying attached: `snapshot()` no longer unions a regrain's copy-children (their rows are
   still in the monolith, so it would double-count); `restore_incoming_fks` no longer counts them as in-flight
-  drain children; and `maintain` no longer suspends an incoming FK for a refine. The multi-tick copy needs no
+  drain children; and `maintain` no longer suspends an incoming FK for a regrain. The multi-tick copy needs no
   FK leash -- only the swap's `DETACH` does (Postgres refuses to detach a partition whose rows are still
   referenced), so the swap transiently drops and re-adds the FK within its one atomic transaction (no visible
-  RI window, unlike the drain's). Log actions are `refine_copy` / `refine_aged` (were `refine_move` /
-  `refine_reclaim`). (PR #128; new tests/48, tests/47 rewritten, tests/07/45/46 updated)
+  RI window, unlike the drain's). Log actions are `regrain_copy` / `regrain_aged` (were `regrain_move` /
+  `regrain_reclaim`). (PR #128; new tests/48, tests/47 rewritten, tests/07/45/46 updated)
 - **Docs rewritten for the monolith model; `DESIGN.md` retired.** The reference, guide, README, and runbook
   are rewritten from scratch against the current API; `REDESIGN.md` is now the canonical design note (the
   original `DESIGN.md`'s enduring supply/demand operating model is folded into it) and `DESIGN.md` is

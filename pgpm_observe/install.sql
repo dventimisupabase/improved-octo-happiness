@@ -9,7 +9,7 @@
 --
 -- The integration is strictly READ-ONLY and ONE-DIRECTIONAL: pgpm writes
 -- nothing into PGFR and PGFR needs zero changes. pgpm already records every
--- obtain/drain/retain/refine/cutover in pgpm.log (with the per-tick adaptive
+-- obtain/drain/retain/regrain/cutover in pgpm.log (with the per-tick adaptive
 -- feathering decision), but keeps no history of what the database as a whole
 -- was doing during those operations. PGFR is the mirror image: it samples wait
 -- events, locks, checkpoints, WAL, I/O, and query latency continuously, but does
@@ -41,7 +41,7 @@ returns boolean language sql stable as $$
 $$;
 
 -- observe_window: the span pgpm was active on p_parent within the last p_since,
--- plus a summary of what it did (rows moved, drain/refine/retain counts, and the
+-- plus a summary of what it did (rows moved, drain/regrain/retain counts, and the
 -- adaptive-feathering backoff breakdown by signal). PURE pgpm.log -- no PGFR
 -- dependency, so it is useful and testable on its own. Always returns exactly one
 -- row; when there is no activity, the window bounds are null and the counts are 0.
@@ -59,7 +59,7 @@ create or replace function pgpm.observe_window(
   log_rows       bigint,
   rows_moved     bigint,
   drains         bigint,
-  refines        bigint,
+  regrains        bigint,
   retains        bigint,
   adaptive_ticks bigint,
   backoffs       bigint,
@@ -73,9 +73,9 @@ create or replace function pgpm.observe_window(
     max(l.at),
     max(l.at) - min(l.at),
     count(*),
-    coalesce(sum(l.rows) filter (where l.action in ('drain_move','refine_copy')), 0),
+    coalesce(sum(l.rows) filter (where l.action in ('drain_move','regrain_copy')), 0),
     count(*) filter (where l.action = 'drain_move'),
-    count(*) filter (where l.action = 'refine'),
+    count(*) filter (where l.action = 'regrain'),
     count(*) filter (where l.action = 'retain_drop'),
     count(*) filter (where l.action = 'drain_budget'),
     count(*) filter (where l.action = 'drain_budget' and l.method <> 'probe'),
@@ -112,8 +112,8 @@ begin
 
   ln := ln || format('pg_partition_magician :: impact report for %s', p_parent);
   ln := ln || format('  window:   %s  ->  %s  (%s)', w.window_start, w.window_end, w.duration);
-  ln := ln || format('  pgpm did: %s log rows, %s rows moved; %s drains, %s refines, %s retains',
-                     w.log_rows, w.rows_moved, w.drains, w.refines, w.retains);
+  ln := ln || format('  pgpm did: %s log rows, %s rows moved; %s drains, %s regrains, %s retains',
+                     w.log_rows, w.rows_moved, w.drains, w.regrains, w.retains);
   ln := ln || format('  feathering: %s adaptive ticks, %s backed off (wal=%s lock=%s io=%s)',
                      w.adaptive_ticks, w.backoffs, w.wal_backoffs, w.lock_backoffs, w.io_backoffs);
   ln := ln || ''::text;

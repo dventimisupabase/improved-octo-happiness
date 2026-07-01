@@ -1,4 +1,4 @@
--- refine() splits a frozen coarse child (the monolith) into finer children by COPYING rows into
+-- regrain() splits a frozen coarse child (the monolith) into finer children by COPYING rows into
 -- standalone children and swapping them in atomically, then DROPPING the vestigial source -- no DELETE,
 -- so no dead tuples or bloat (REDESIGN.md section 10). It refuses while the child is still active.
 create extension if not exists pgtap;
@@ -17,17 +17,17 @@ select is(
      and pgpm._native_gt('id', p.hi, pgpm._grid_next('id', '10000', p.lo))),
   1, 'transmute left exactly one coarse monolith child');
 
--- still active (the frontier has not crossed B): refine refuses.
+-- still active (the frontier has not crossed B): regrain refuses.
 select throws_ok(
-  $$ select pgpm.refine_history('public.rf') $$,
-  'P0001', NULL, 'refine refuses while the monolith is still active (not frozen)');
+  $$ select pgpm.regrain_history('public.rf') $$,
+  'P0001', NULL, 'regrain refuses while the monolith is still active (not frozen)');
 
 -- advance the frontier past B = 60000 (a write into a forward partition), freezing the monolith.
 insert into public.rf (id, payload) values (65000, 'frontier');
 
 select is(
-  (select pgpm.refine_history('public.rf'))::int,
-  6, 'refine split the monolith into 6 fine children');
+  (select pgpm.regrain_history('public.rf'))::int,
+  6, 'regrain split the monolith into 6 fine children');
 
 select is(
   (select count(*)::int from pgpm.part p where p.parent_table = 'public.rf'::regclass and p.attached
@@ -45,11 +45,11 @@ select ok(
 
 select is(
   (select count(*)::int from public.rf),
-  50001, 'all rows conserved across the refine (50000 history + 1 frontier row)');
+  50001, 'all rows conserved across the regrain (50000 history + 1 frontier row)');
 
 select is(
   (select count(*)::int from public.rf where id < 60000),
-  50000, 'the 50000 original rows are all present in the refined [0, 60000) range');
+  50000, 'the 50000 original rows are all present in the regrained [0, 60000) range');
 
 select * from finish();
 rollback;

@@ -15,17 +15,17 @@ and manages the whole lifecycle:
   safety net. The cutover is one read-only scan plus a metadata flip: no rebuild, no downtime. Reversible
   with **`untransmute()`** until the history outgrows the monolith.
 - **obtain**: keep N partitions ahead of the write frontier.
-- **`refine()`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
+- **`regrain()`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
   vacuum). Optional, a coarse monolith is a correct permanent state.
 - **drain**: keep the `DEFAULT` empty by evacuating the occasional stray into its partition. Optionally
   self-tuning against checkpoint pressure (`set_drain_adaptive`).
 - **retain**: drop partitions past a policy.
-- **maintain**: the one procedure `pg_cron` calls (obtain, drain, retain, optional auto-refine).
+- **maintain**: the one procedure `pg_cron` calls (obtain, drain, retain, optional auto-regrain).
 
 The schema is `pgpm`. Think "a slice of `pg_partman`, installable as plain SQL."
 
 Two caveats, both covered in the [guide](docs/guide.md): the scheduled **drain** moves rows through an
-unattached child, so a mid-move read briefly undercounts the in-flight range (`refine`, `drain_all()`, and
+unattached child, so a mid-move read briefly undercounts the in-flight range (`regrain`, `drain_all()`, and
 `pgpm.snapshot` don't). And **incoming foreign keys** are preserved, not ignored (`transmute` never rewrites
 your key; `p_incoming_fks => 'preserve'` re-adds each one once the move is idle).
 
@@ -65,7 +65,7 @@ select * from pgpm.status();
 select pgpm.resume('public.events');
 
 -- 4. (optional) Split the coarse history into fine partitions, paced across ticks:
-select pgpm.set_refine('public.events', '1 month');
+select pgpm.set_regrain('public.events', '1 month');
 ```
 
 The two-step (transmute paused, then `resume`) lets you inspect before anything moves. `transmute` reuses a
@@ -115,7 +115,7 @@ psql "$DATABASE_URL" -f pgpm_observe/install.sql
 
 ## Documentation
 
-- **[User guide](docs/guide.md)**: concepts, install, transmute, scheduling, refine, retain, foreign keys,
+- **[User guide](docs/guide.md)**: concepts, install, transmute, scheduling, regrain, retain, foreign keys,
   troubleshooting.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.

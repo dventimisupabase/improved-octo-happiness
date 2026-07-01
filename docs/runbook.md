@@ -20,7 +20,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 - [The history is not splitting into fine partitions](#the-history-is-not-splitting-into-fine-partitions)
 - [Monitoring a non-empty DEFAULT](#monitoring-a-non-empty-default)
 - [A stray is stuck in the DEFAULT (the drain is behind)](#a-stray-is-stuck-in-the-default-the-drain-is-behind)
-- [Disk is filling during a refine](#disk-is-filling-during-a-refine)
+- [Disk is filling during a regrain](#disk-is-filling-during-a-regrain)
 - [Storage is not dropping despite a retention policy](#storage-is-not-dropping-despite-a-retention-policy)
 - [Re-transmute fails with an orphan-table error](#re-transmute-fails-with-an-orphan-table-error)
 - [A `from_hypertable` cutover is slow or its pre-drain will not converge](#a-from_hypertable-cutover-is-slow-or-its-pre-drain-will-not-converge)
@@ -39,9 +39,9 @@ visible as `status().fks_suspended`; see the guide's
 the FK so it once again enforces every *new* write (as `NOT VALID`), but it could not fully *validate* the
 constraint because rows that violate it were written during the window. Those orphans are real RI
 violations to reconcile; new writes are already guarded again. The attribution is exact: the FK was valid
-when pgpm dropped it, so any orphan present now arose during the window. (Note: **refine** does *not* open
+when pgpm dropped it, so any orphan present now arose during the window. (Note: **regrain** does *not* open
 this window -- it copies, and its swap drops and re-adds the FK within one atomic transaction -- but the
-same reconciliation applies if a refine or retention drops aged, still-referenced history: the re-validate
+same reconciliation applies if a regrain or retention drops aged, still-referenced history: the re-validate
 then finds a true orphan.)
 
 **Steps.**
@@ -108,69 +108,69 @@ must be dropped so a row can move through an unattached child, and that cannot b
 model the conversion itself moves no rows, so the FK is typically restorable immediately after `transmute`
 (`select pgpm.restore_incoming_fks('public.events');`); the window opens only if a later assistant drain
 actually moves referenced rows. To shrink it: keep `obtain` ahead so strays never accumulate, so the drain
-rarely runs; or `pause` heavy referencing-table write bursts while the drain catches up. A `refine` (manual
+rarely runs; or `pause` heavy referencing-table write bursts while the drain catches up. A `regrain` (manual
 or auto) opens no RI window of its own -- the copy never moves a referenced row out of the parent, and the
-swap's FK drop/re-add is one atomic transaction. The one refine-related caveat is data, not timing: if a
-refine or a retention policy drops aged history that is still referenced, the FK re-validates against a real
+swap's FK drop/re-add is one atomic transaction. The one regrain-related caveat is data, not timing: if a
+regrain or a retention policy drops aged history that is still referenced, the FK re-validates against a real
 orphan -- do not retain below rows you still reference.
 
 ## The history is not splitting into fine partitions
 
-**Symptom.** `pgpm.status()` shows `history_unrefined = true` and `coarse_partitions > 0` that does not
+**Symptom.** `pgpm.status()` shows `history_unregrained = true` and `coarse_partitions > 0` that does not
 fall; queries over old data do not prune to a single partition; retention is not reclaiming old data.
 
 **What it means.** After `transmute`, the history lives in one coarse **monolith** partition. That is a
 correct, permanent state, but pruning and fine-grained retention are suspended over its span until it is
-**refined** into proper partitions. If you want fine history, refine has either not been enabled, or it
+**regrained** into proper partitions. If you want fine history, regrain has either not been enabled, or it
 cannot make progress yet.
 
 **Steps.**
 
-1. See the backlog and whether auto-refine is on:
+1. See the backlog and whether auto-regrain is on:
 
    ```sql
-   select parent, coarse_partitions, history_unrefined from pgpm.status();
-   select parent_table, refine_to from pgpm.config where refine_to is not null;   -- auto-refine targets
+   select parent, coarse_partitions, history_unregrained from pgpm.status();
+   select parent_table, regrain_to from pgpm.config where regrain_to is not null;   -- auto-regrain targets
    ```
 
-2. If `refine_to` is null, the history is intentionally coarse. To split it, either enable paced
-   auto-refine or do it by hand once the monolith has **frozen** (the frontier has moved past its upper
+2. If `regrain_to` is null, the history is intentionally coarse. To split it, either enable paced
+   auto-regrain or do it by hand once the monolith has **frozen** (the frontier has moved past its upper
    bound `B`):
 
    ```sql
-   select pgpm.set_refine('public.events', '1 month');   -- paced: one microbatch per maintain tick
+   select pgpm.set_regrain('public.events', '1 month');   -- paced: one microbatch per maintain tick
    -- or, synchronously now (atomic, one transaction):
-   select pgpm.refine_history('public.events');
+   select pgpm.regrain_history('public.events');
    ```
 
-3. If auto-refine is on but `coarse_partitions` is not falling, check why a tick is not progressing in
+3. If auto-regrain is on but `coarse_partitions` is not falling, check why a tick is not progressing in
    `pgpm.log`:
 
    ```sql
    select at, action, method from pgpm.log
-    where parent_table = 'public.events'::regclass and action in ('refine_skip', 'refine')
+    where parent_table = 'public.events'::regclass and action in ('regrain_skip', 'regrain')
     order by id desc limit 10;
    ```
 
-   - A `maintain` summary of `refine=active` means the monolith has **not frozen yet** (the current
-     interval still lands in it); it will refine once the frontier crosses `B`.
-   - `refine=default_dirty` means a stray sits in the monolith's range in the `DEFAULT`; let the assistant
-     drain clear it (see the next entry), then refine resumes.
-   - `refine=copied:N` is healthy forward progress (one budget-sized copy microbatch); `refine=swapped:K`
-     is a completed refine (K fine children attached). A `refine_skip` log row is a lock-race deferral, and
-     a `refine_aged` row is a below-horizon sub-range skipped under a retention policy; both are normal.
+   - A `maintain` summary of `regrain=active` means the monolith has **not frozen yet** (the current
+     interval still lands in it); it will regrain once the frontier crosses `B`.
+   - `regrain=default_dirty` means a stray sits in the monolith's range in the `DEFAULT`; let the assistant
+     drain clear it (see the next entry), then regrain resumes.
+   - `regrain=copied:N` is healthy forward progress (one budget-sized copy microbatch); `regrain=swapped:K`
+     is a completed regrain (K fine children attached). A `regrain_skip` log row is a lock-race deferral, and
+     a `regrain_aged` row is a below-horizon sub-range skipped under a retention policy; both are normal.
 
-4. If disk is the constraint, see [Disk is filling during a refine](#disk-is-filling-during-a-refine).
+4. If disk is the constraint, see [Disk is filling during a regrain](#disk-is-filling-during-a-regrain).
 
 **Verify.**
 
 ```sql
-select coarse_partitions, history_unrefined from pgpm.status() where parent = 'public.events'::regclass;
--- coarse_partitions falling toward 0; history_unrefined false once fully split
+select coarse_partitions, history_unregrained from pgpm.status() where parent = 'public.events'::regclass;
+-- coarse_partitions falling toward 0; history_unregrained false once fully split
 ```
 
-**Prevent.** Decide up front whether the table needs fine history. If it does, enable `set_refine` after
-`transmute` (or refine by hand in a maintenance window). If a coarse monolith is acceptable, leave it.
+**Prevent.** Decide up front whether the table needs fine history. If it does, enable `set_regrain` after
+`transmute` (or regrain by hand in a maintenance window). If a coarse monolith is acceptable, leave it.
 
 ## Monitoring a non-empty DEFAULT
 
@@ -252,8 +252,8 @@ insurance you are glad to hold and alarmed to ever use.
 holds nothing. A non-zero `closed_rows` means a stray landed there (obtain fell behind the frontier, a
 backdated row, or a gap) and the **assistant drain** has not yet evacuated it into a proper partition. A
 falling `closed_rows` with `drain_skips ~ 0` is merely slow; a stuck `closed_rows` with a stale
-`last_drained` and a climbing `drain_skips` is a **wedged** drain. Since the monolith+refine redesign a
-true wedge is rare: the bulk move is `refine`, which copies and cannot strand a duplicate; the drain only
+`last_drained` and a climbing `drain_skips` is a **wedged** drain. Since the monolith+regrain redesign a
+true wedge is rare: the bulk move is `regrain`, which copies and cannot strand a duplicate; the drain only
 relocates strays; and upserts to historical keys hit the attached monolith rather than an invisible child.
 So **merely slow** is the common case and **wedged** is a corner -- but both are worth recognizing.
 
@@ -284,7 +284,7 @@ So **merely slow** is the common case and **wedged** is a corner -- but both are
    [read consistency](guide.md#read-consistency-during-a-move)): an `INSERT ... ON CONFLICT` targeted a
    stray already moved into an unattached drain child and wrote a duplicate into the `DEFAULT`, which the
    next batch then collides on. Post-redesign this is the narrow residual case -- it needs a concurrent
-   upsert to a *stray* mid-move, since historical keys live in the attached monolith and `refine` never
+   upsert to a *stray* mid-move, since historical keys live in the attached monolith and `regrain` never
    moves through an invisible child. Remove the duplicate from the `DEFAULT` (keep the already-moved copy),
    then let the drain continue.
 
@@ -299,15 +299,15 @@ often) so the frontier never outruns the real partitions and writes never fall t
 tables that upsert into historical ranges, prefer the synchronous `drain_all()` in a window over the paced
 drain.
 
-## Disk is filling during a refine
+## Disk is filling during a regrain
 
-**Symptom.** Free space drops while a refine is running; `pgpm.status()` shows `inflight_partitions > 0`
+**Symptom.** Free space drops while a regrain is running; `pgpm.status()` shows `inflight_partitions > 0`
 for the table.
 
-**What it means.** `refine` **copies** the monolith's rows into new fine partitions and only drops the
+**What it means.** `regrain` **copies** the monolith's rows into new fine partitions and only drops the
 source after they are swapped in, so it transiently needs roughly **2x the disk** of the range being
-refined while the copies coexist with the source. On an elastic or auto-scaling volume this is absorbed;
-on a fixed volume it can be a problem if you refine a large coarse child in one shot.
+regrained while the copies coexist with the source. On an elastic or auto-scaling volume this is absorbed;
+on a fixed volume it can be a problem if you regrain a large coarse child in one shot.
 
 **Steps.**
 
@@ -317,24 +317,24 @@ on a fixed volume it can be a problem if you refine a large coarse child in one 
    select parent, coarse_partitions, inflight_partitions from pgpm.status();
    ```
 
-2. If you are disk-bound, stop starting new work and let the current refine finish (it drops its source at
+2. If you are disk-bound, stop starting new work and let the current regrain finish (it drops its source at
    the swap, reclaiming the transient space):
 
    ```sql
-   select pgpm.set_refine('public.events', null);   -- pause auto-refine (the in-flight one still completes)
+   select pgpm.set_regrain('public.events', null);   -- pause auto-regrain (the in-flight one still completes)
    ```
 
-3. Refine **hierarchically** so each step's footprint stays bounded: split the monolith into coarse units
-   first (for example per year), then refine one coarse unit at a time. Each later step only needs ~2x of
+3. Regrain **hierarchically** so each step's footprint stays bounded: split the monolith into coarse units
+   first (for example per year), then regrain one coarse unit at a time. Each later step only needs ~2x of
    one unit, not of the whole history:
 
    ```sql
    -- one coarse unit, by hand (target a coarser step first, then the fine step per unit)
-   select pgpm.refine('public.events', '<monolith child name from pgpm.part>', '1 year');
+   select pgpm.regrain('public.events', '<monolith child name from pgpm.part>', '1 year');
    ```
 
 4. Or acquire more disk: on a managed/elastic volume, grow it (or let auto-scaling absorb the spike), then
-   resume `set_refine`.
+   resume `set_regrain`.
 
 **Verify.**
 
@@ -343,8 +343,8 @@ on a fixed volume it can be a problem if you refine a large coarse child in one 
 select coarse_partitions, inflight_partitions from pgpm.status() where parent = 'public.events'::regclass;
 ```
 
-**Prevent.** Before refining a large history on a fixed volume, prearrange about 2x the headroom of the
-span you will refine, or refine hierarchically so the transient footprint stays bounded to one unit at a
+**Prevent.** Before regraining a large history on a fixed volume, prearrange about 2x the headroom of the
+span you will regrain, or regrain hierarchically so the transient footprint stays bounded to one unit at a
 time. On an elastic volume, no special preparation is needed.
 
 ## Storage is not dropping despite a retention policy
@@ -380,7 +380,7 @@ lingers and storage does not fall. It bounds storage only when maintenance runs 
 2. Run a maintenance pass, or force the reclaim by hand:
 
    ```sql
-   select pgpm.maintain('public.events');     -- one pass: obtain, retain, drain (and auto-refine)
+   select pgpm.maintain('public.events');     -- one pass: obtain, retain, drain (and auto-regrain)
    -- or catch up now, synchronously:
    select pgpm.drain_all('public.events');    -- evacuate / reclaim the closed tail
    select pgpm.retain('public.events');       -- drop aged partitions now
@@ -414,7 +414,7 @@ into best-effort.
 > parent's partition naming -- most likely an orphan left by an interrupted drain. Drop it
 > (drop table public.events_p2026_03) and retry transmute.
 
-**What it means.** The drain (and refine) builds each child as a **standalone** table and only `ATTACH`es
+**What it means.** The drain (and regrain) builds each child as a **standalone** table and only `ATTACH`es
 it when the interval finishes. A standalone child has no dependency on the parent, so a
 `DROP TABLE <parent> CASCADE` does **not** remove an un-attached child -- it survives the cascade. If the
 parent is then recreated and re-transmuted, the next drain would reuse that orphan by name and collide on
