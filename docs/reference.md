@@ -218,8 +218,9 @@ re-insert its current source row), which is what makes incremental draining safe
 **delete-RETURNS** its rows from the delta as the authority and reconciles exactly those keys against the live
 source, so a change is never deleted-without-applying; the source read is bounded per batch to the touched
 control range for chunk exclusion. The driver mirrors `drain`'s `_step` + loop shape and **commits per batch**
-(so WAL recycles); `_step` does one batch (no commit, returns the keys it cleared). It builds a throwaway key
-index on the private destination so the per-batch delete is index-assisted; the cutover drops it.
+(so WAL recycles); `_step` does one batch (no commit, returns the keys it cleared). The per-batch delete uses
+the reused-key index that `from_hypertable_copy` builds once on the private destination (issue #175) -- the
+same index the cutover later *adopts* (`USING INDEX`), so no throwaway index is built or dropped.
 
 - `p_batch` -- micro-batch size (delta rows processed per batch, bounded by a `pgpm_seq` watermark).
 - `p_threshold` -- stop once the residual is at/below this many delta rows (`0` = drain to empty). Under
@@ -336,7 +337,7 @@ cutover are additional. `preflight` reports it as a `NOTICE`.
 
 ### Performance: how long, and how to speed it up
 
-The migration time is dominated by two O(rows) but **online** (non-blocking) phases, the per-chunk copy and
+The migration time is dominated by two O(rows) but **online** (non-blocking) phases, the chunk-by-chunk copy and
 the index pre-build, plus a brief metadata cutover. To go faster (with the limits):
 
 - **More RAM** is the single biggest lever when the working set is near RAM size: a cache-resident copy runs

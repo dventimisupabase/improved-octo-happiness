@@ -76,17 +76,23 @@ the one hard requirement is a `NOT NULL` control column. See the
 ## Migrating from TimescaleDB
 
 On a **TimescaleDB hypertable** (Apache edition)? `from_hypertable` migrates it to a pgpm-managed partition
-set: an online per-chunk copy (the source keeps serving traffic), then a brief cutover that hands off to
-`transmute`. It preserves keys, indexes, identity, generated columns, `CHECK`/defaults/`NOT NULL`, and
-translates a `drop_chunks` policy into pgpm `retain`; keyed and keyless both work.
+set: an online copy into one plain table, done chunk by chunk (the source keeps serving traffic), then a
+brief cutover that hands off to `transmute`. It preserves keys, indexes, identity, generated columns,
+`CHECK`/defaults/`NOT NULL`, and translates a `drop_chunks` policy into pgpm `retain`. Keyed and keyless
+hypertables both migrate.
 
 ```sql
 call pgpm.from_hypertable('public.metrics', 'ts', interval '1 day');
 ```
 
-For workloads that update or delete during the copy, pass `p_track_changes => true`. Either way the catch-up
-backlog is drained **online before the cutover**, so the lock applies only a tiny residual. It is an optional
-add-on, loaded only where the `timescaledb` extension exists:
+For workloads that update or delete during the copy, pass `p_track_changes => true` (it reconciles by key, so
+it needs one; keyless tables migrate append-only). Either way the catch-up backlog is drained **online before
+the cutover**, so the lock applies only a tiny residual.
+
+One keyless caveat: a translated `drop_chunks` retention stays dormant until you add a key and `regrain` the
+history (`retain` drops fine partitions, not the monolith).
+
+It is an optional add-on, loaded only where the `timescaledb` extension exists:
 
 ```bash
 psql "$DATABASE_URL" -f pgpm_hypertable/install.sql
