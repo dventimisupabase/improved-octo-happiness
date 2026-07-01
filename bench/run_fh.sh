@@ -5,7 +5,7 @@
 # HYPERTABLE (Apache) via from_hypertable, under live OLTP load, and measures latency/throughput before,
 # during, and after. Three phases:
 #   1. baseline -- ambient workload against the live hypertable.
-#   2. convert  -- from_hypertable_copy (online per-chunk copy, source live) under load WITH p_track_changes
+#   2. convert  -- from_hypertable_copy (online copy into one plain table, chunk by chunk, source live) under load WITH p_track_changes
 #                  (a trigger logs in-flight insert/update/delete), then from_hypertable_cutover (brief lock,
 #                  catch-up + reconcile, drop the hypertable, hand off to transmute), then -- if BENCH_REGRAIN
 #                  -- regrain the resulting time-monolith into fine partitions via scheduled pgpm.maintain.
@@ -428,7 +428,7 @@ say "report"
   echo
   echo "## conversion (from_hypertable, under load)"
   echo
-  echo "- model: **from_hypertable** -- online per-chunk copy (source live) with p_track_changes, then a brief-lock cutover (catch-up + delta reconcile + drop hypertable + transmute handoff), then regrain the time-monolith."
+  echo "- model: **from_hypertable** -- online copy into one plain table, chunk by chunk (source live), with p_track_changes, then a brief-lock cutover (catch-up + delta reconcile + drop hypertable + transmute handoff), then regrain the time-monolith."
   echo "- conversion window: \`$convert_start\` -> \`$convert_end\`"
   echo "- copy: ${copy_secs}s online, copied $DEST_ROWS rows; $DELTA_PENDING in-flight changes (insert/update/delete) captured by the trigger and reconciled at cutover; progress in \`copy.progress.csv\`"
   echo "- cutover: ${cut_secs}s total call (online pre-drain + index pre-build + the brief ACCESS EXCLUSIVE window; see 'cutover lock window' below for the blocking window alone)"

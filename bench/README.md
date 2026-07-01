@@ -267,8 +267,8 @@ exposed as two phases so writes keep arriving across them. Three observed phases
 
 1. **baseline**: ambient workload against the live hypertable.
 2. **convert**:
-   - `from_hypertable_copy(..., p_track_changes => true)`: online per-chunk copy into a
-     plain destination while the source stays live; an AFTER-row trigger logs every
+   - `from_hypertable_copy(..., p_track_changes => true)`: online copy into one plain
+     destination, chunk by chunk, while the source stays live; an AFTER-row trigger logs every
      in-flight insert/update/delete.
    - `from_hypertable_cutover(...)`: a brief `ACCESS EXCLUSIVE` window that catches up and
      reconciles the delta, drops the hypertable, renames the copy into place, rebuilds the
