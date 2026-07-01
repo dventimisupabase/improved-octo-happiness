@@ -27,7 +27,7 @@ insert into pgpm.log (parent_table, action, rows, method, at) values
   ('public.t'::regclass, 'drain_move',   1000, null,             now() - interval '6 min'),
   ('public.t'::regclass, 'drain_budget', 2500, 'wal',            now() - interval '5 min'),
   ('public.t'::regclass, 'drain_budget', 1250, 'wal',            now() - interval '2 min'),
-  ('public.t'::regclass, 'refine',          1, 'copy_swap_drop', now() - interval '1.5 min');
+  ('public.t'::regclass, 'regrain',          1, 'copy_swap_drop', now() - interval '1.5 min');
 
 select is( pgpm._observe_has_pgfr(), true,
            'PGFR present: _observe_has_pgfr() is true' );

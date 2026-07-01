@@ -1,11 +1,11 @@
-# REDESIGN: bounded-child transmute with on-demand refinement
+# REDESIGN: bounded-child transmute with on-demand regraining
 
 > The canonical design note for pg_partition_magician's **bounded-child transmute**: the original table
 > becomes a bounded **coarse child** (the "monolith") instead of the `DEFAULT` partition, no rows move at
-> cutover, and the historical bulk is split into proper partitions ("refined") on demand. This note
+> cutover, and the historical bulk is split into proper partitions ("regrained") on demand. This note
 > supersedes the original DESIGN.md, whose enduring operating model is folded into
 > [Foundational principles](#foundational-principles-the-operating-model) below. The model **shipped**
-> across PRs #116-#119 plus the auto-refine FK fix; the [build order](#build-order-shipped) maps each piece
+> across PRs #116-#119 plus the auto-regrain FK fix; the [build order](#build-order-shipped) maps each piece
 > to its PR.
 
 ## Why this exists
@@ -19,7 +19,7 @@ unnoticeable, and it carries the read-consistency caveat that `snapshot()` exist
 
 This redesign moves the historical bulk off that path entirely. The original table is relabeled as
 one bounded child and its rows never move. The expensive work becomes a one-time, online,
-read-once `VALIDATE` scan at cutover, plus an optional, operator-gated **refinement** that splits
+read-once `VALIDATE` scan at cutover, plus an optional, operator-gated **regraining** that splits
 the coarse history into proper partitions by copying (never deleting), so it incurs no dead
 tuples, no vacuum, and no bloat.
 
@@ -30,7 +30,7 @@ the original name, and attach the original as **one bounded child** covering
 `[grid_floor(min), B)` (the "monolith"), using a validated `CHECK` so the attach skips its scan.
 Create a fresh **empty `DEFAULT`** as a pure safety net. Going forward, `obtain` makes
 normal-sized partitions ahead, `retain` drops whole children, and the drain shrinks to the assistant
-that keeps the `DEFAULT` empty. The monolith can later be **refined** (coarse to fine, hierarchically)
+that keeps the `DEFAULT` empty. The monolith can later be **regrained** (coarse to fine, hierarchically)
 on demand. The `DEFAULT` keystone is kept; it just no longer stores the history.
 
 ## Foundational principles (the operating model)
@@ -47,7 +47,7 @@ of that shape, not the shape itself.
 headroom after the real workload has taken its share -- smaller than nameplate capacity and varying minute
 to minute. "Unnoticeable" means living within the leftover. Demand has two shapes: a one-time, conditional
 **setup** cost (a PK-widening `CONCURRENTLY` build, only when the partition key is not already in the PK,
-so zero in the common case) and the **steady** cost of moving rows (the bulk `refine`, plus the tiny
+so zero in the common case) and the **steady** cost of moving rows (the bulk `regrain`, plus the tiny
 obtain, assistant drain, and retain).
 
 **The block is the unit of account.** A row is not a unit of constant cost (a wide TOASTed row can cost
@@ -66,12 +66,12 @@ generous hardware, slow on constrained, possibly **never** where leftover supply
 have unnoticeable, fast, and tiny-hardware all at once.
 
 **The monolith is what makes non-completion safe.** From the cutover the table is correct, online, and
-partitioned in form; un-refined history simply lives in the coarse monolith, fully queryable. So
-"partitioned but not fully refined" is a correct, functioning state, not a failure mode, which is exactly
-why refinement is allowed to be optional, slow, or never.
+partitioned in form; un-regrained history simply lives in the coarse monolith, fully queryable. So
+"partitioned but not fully regrained" is a correct, functioning state, not a failure mode, which is exactly
+why regraining is allowed to be optional, slow, or never.
 
 **The operator contract.** Good news: online, no row movement at cutover, no interference, nothing ever
-lost. Bad news: under tight supply the history may refine slowly, or never converge. The lever: acquire
+lost. Bad news: under tight supply the history may regrain slowly, or never converge. The lever: acquire
 more supply (a bigger tier, a faster volume, more IOPS), or temporarily relax the unnoticeable constraint
 to converge faster. pgpm defaults to unnoticeable, and it does not leave: keeping live writes in real
 partitions means creating partitions ahead of the frontier forever, so pgpm stays on as a resident steward
@@ -98,7 +98,7 @@ window). One mechanism, not competing features.
   indexes are reused on attach, and the control column is already in the PK (a standing requirement),
   so there is no `build_pk` CIC. The expensive lumps of the current model are all absent here.
 - The monolith doubles as the **current/active partition** until the frontier crosses `B`, then it
-  freezes. Refinement only ever touches the frozen part.
+  freezes. Regraining only ever touches the frozen part.
 - The table registers **paused**, as today; `resume()` goes live. This is unchanged.
 
 ### 2. The validate-window race, and the fix
@@ -146,20 +146,20 @@ copying essentially all of the bulk into new heaps (about 1x new) while the sour
 be reclaimed by dropping it whole. `DELETE`-as-you-go does not help (Postgres does not shrink a heap
 file without `VACUUM FULL`, so the source holds its size until dropped anyway, plus dead tuples).
 
-**Chosen: strategy 2, monolith plus refine-on-demand.** Cheap transmute, fine history when the
-operator chooses, accepting a roughly 2x disk spike, the copy IO, and the CPU at refinement time.
+**Chosen: strategy 2, monolith plus regrain-on-demand.** Cheap transmute, fine history when the
+operator chooses, accepting a roughly 2x disk spike, the copy IO, and the CPU at regraining time.
 These costs are inherent, online-preserving, and buyable (disk is cheap, managed CPU upsizes). The
-operator is told to **prearrange about 2x disk** for the refinement they intend to run. The
-alternatives are recorded for completeness: strategy 1 (monolith, never refine: coarse history is a
+operator is told to **prearrange about 2x disk** for the regraining they intend to run. The
+alternatives are recorded for completeness: strategy 1 (monolith, never regrain: coarse history is a
 correct permanent terminal state) and strategy 3 (pre-split at transmute: pay the 2x once up front
-so future refinements have bounded peaks).
+so future regrainings have bounded peaks).
 
-### 5. Hierarchical refinement keeps it online
+### 5. Hierarchical regraining keeps it online
 
 Because the monolith is one indivisible partition, the swap that replaces it must attach children
 covering its whole range at once, and a single-level monolith-to-fine swap attaches `span / interval`
 children under `ACCESS EXCLUSIVE` (sub-second for years-of-monthly, a multi-second-to-minute freeze
-for a decade-of-daily). So refine **hierarchically**.
+for a decade-of-daily). So regrain **hierarchically**.
 
 - **First pass, monolith to coarse** (for example per-year): a small-N swap, a brief freeze. This is
   the single roughly-2x-of-the-monolith disk event the operator prearranged.
@@ -211,7 +211,7 @@ exists (
 
 - The `attached` filter is deliberate: only attached partitions can cause a `CREATE`/`ATTACH`
   overlap error. This states the real invariant: **ranges are non-overlapping over `attached = true`
-  rows only.** During refinement the unattached fine children sit inside the still-attached coarse
+  rows only.** During regraining the unattached fine children sit inside the still-attached coarse
   child, so `pgpm.part` legitimately holds overlapping rows transiently.
 - Keep the existing name check (idempotency and `pg_class` drift) and the `DEFAULT`-holds-rows check.
 - This makes the headroom-on-`B` case work automatically: every candidate inside the monolith is
@@ -232,16 +232,16 @@ exists (
 
 ### 9. A consequence worth recording
 
-Because refinement copies and never deletes, and the swap is atomic, **the read-consistency caveat
+Because regraining copies and never deletes, and the swap is atomic, **the read-consistency caveat
 nearly disappears**. The `snapshot()` gap existed because the drain moved rows through an unattached
-child; refinement leaves rows visible in the monolith until the swap commits, so it never opens the
+child; regraining leaves rows visible in the monolith until the swap commits, so it never opens the
 gap, and the demoted assistant drain only ever touches a thin stray population. `snapshot()` remains
 for that residual assistant case, but the honest caveat that shaped the current design is largely
 retired here.
 
-### 10. The refinement procedure
+### 10. The regraining procedure
 
-One primitive, `pgpm.refine(p_parent, p_coarse_child, p_target_step)`, invoked hierarchically.
+One primitive, `pgpm.regrain(p_parent, p_coarse_child, p_target_step)`, invoked hierarchically.
 
 - **Preconditions, refuse rather than improvise.** The child is a managed coarse row (`attached`,
   `hi <> _grid_next(lo)`); it is **frozen**, `coarse.hi <= _grid_floor(frontier)` (kind-aware), else
@@ -257,7 +257,7 @@ One primitive, `pgpm.refine(p_parent, p_coarse_child, p_target_step)`, invoked h
 - **Copy without deleting, feathered by the drain's adaptive and ambient controller.**
   `INSERT INTO <fine_i> SELECT * FROM <coarse_child> WHERE control >= lo_i AND control < hi_i`, in
   microbatches governed by `drain_budget` / AIMD / the WAL and ambient signals. This is the reuse
-  that makes refinement unnoticeable for free: the drain's feathering applied to copy-into-standalone
+  that makes regraining unnoticeable for free: the drain's feathering applied to copy-into-standalone
   instead of move-into-attached. Parallelizable across children. The frozen precondition makes the
   copy a consistent snapshot. Build one child to completion before the next, so an interrupt loses at
   most one partial child, truncated and recopied on resume (the child is invisible).
@@ -282,7 +282,7 @@ One primitive, `pgpm.refine(p_parent, p_coarse_child, p_target_step)`, invoked h
   the multi-tick `snapshot()`/RI window the drain carries -- it is atomic.
 - **Drop the vestigial source** after commit (`DROP TABLE <coarse_child>`). No `DELETE`, no dead
   tuples, no vacuum, disk reclaimed.
-- **Hierarchical control.** A thin `refine_history` helper (or the operator) calls `refine` first
+- **Hierarchical control.** A thin `regrain_history` helper (or the operator) calls `regrain` first
   with a coarse target (monolith to per-year, the single roughly-2x disk event), then once per coarse
   child with the configured `partition_step` (bounded transient per unit). Same primitive throughout.
 
@@ -326,32 +326,32 @@ default are **dropped**: the monolith is frozen and never drains, so nothing chu
 does not run inside transmute (no reason to, and the monolith covers up to `B`), but afterward it takes
 the cheap plain path because the `DEFAULT` is empty.
 
-### 12. The frozen-monolith rule and refinement policy (IMPLEMENTED)
+### 12. The frozen-monolith rule and regraining policy (IMPLEMENTED)
 
-Built across PRs #116 (`refine`), #118 (budget-sized microbatches) and #119 (the auto-refine maintain
+Built across PRs #116 (`regrain`), #118 (budget-sized microbatches) and #119 (the auto-regrain maintain
 policy). What shipped:
 
 Refinability is **derived, no flag**: a coarse row is refinable iff `coarse.hi <= _grid_floor(frontier)`
-(kind-aware), which `refine_step` evaluates from the frontier `maintain` already computes each tick. The
+(kind-aware), which `regrain_step` evaluates from the frontier `maintain` already computes each tick. The
 monolith freezes once the frontier crosses `B`.
 
-- **Default off.** Refinement is the heavy roughly-2x operation, so it is operator-gated, consistent
-  with completion-being-optional. Manual is `pgpm.refine(...)` / `pgpm.refine_history(...)` on the
+- **Default off.** Regraining is the heavy roughly-2x operation, so it is operator-gated, consistent
+  with completion-being-optional. Manual is `pgpm.regrain(...)` / `pgpm.regrain_history(...)` on the
   operator's schedule (synchronous, one transaction, atomic and gap-free).
-- **Optional auto (shipped).** `config.refine_to` (set via `pgpm.set_refine(parent, target_step)`, null =
+- **Optional auto (shipped).** `config.regrain_to` (set via `pgpm.set_regrain(parent, target_step)`, null =
   off) lets `maintain`, as a low-priority step after obtain/drain/retain/restore, run **one budget-sized
-  microbatch per tick** on the oldest frozen coarse child via `refine_step`, under the same adaptive
+  microbatch per tick** on the oldest frozen coarse child via `regrain_step`, under the same adaptive
   budget as the drain. The microbatch is the resumable unit (the state is the shrinking coarse child plus
   the accumulating not-yet-attached fine children, like the drain's shrinking `DEFAULT`); pacing it across
   ticks is the true unnoticeable feathering, at the cost of a transient `snapshot()`-covered gap while a
   coarse child splits (section 9's trade, taken deliberately on the cross-tick path only).
-- `maintain` never blocks or errors on this: `refine_step` reports preconditions as soft statuses
+- `maintain` never blocks or errors on this: `regrain_step` reports preconditions as soft statuses
   (`active` = not frozen, `default_dirty` = a stray sits in the range, `nosubdiv`), and the step runs in
   its own subtransaction, so a lock race or a soft status just retries next tick.
 
-Two refinements sketched here but **not yet built**, both safe to add later: a **disk-headroom guard**
-(refuse to start a refinement whose transient ~2x would not fit in free space, protecting fixed-disk
-operators) and **retention-floor prioritization** (refine the child the floor is crossing first). Today
+Two regrainings sketched here but **not yet built**, both safe to add later: a **disk-headroom guard**
+(refuse to start a regraining whose transient ~2x would not fit in free space, protecting fixed-disk
+operators) and **retention-floor prioritization** (regrain the child the floor is crossing first). Today
 `maintain` simply takes the oldest (smallest-`lo`) frozen coarse child, which in practice is the one
 nearest the floor anyway.
 
@@ -363,7 +363,7 @@ transmute), and empty obtained partitions are non-default attached partitions to
 even though the table is fully reversible). **The gate must become monolith-based and data-based, not
 count-based.** Three tiers:
 
-- **Tier 1, clean (recommended to build).** While `frontier < B` and no refinement has run, the
+- **Tier 1, clean (recommended to build).** While `frontier < B` and no regraining has run, the
   monolith is still the active partition holding the whole table and obtained partitions are empty.
   Reverse is metadata-only: drop live preserved FKs, `DETACH` the monolith, `DROP` the parent and the
   empty `DEFAULT` and any empty obtained partitions, re-establish identity, rename the monolith back,
@@ -372,7 +372,7 @@ count-based.** Three tiers:
 - **Tier 2, foldback (optional).** Once `frontier >= B`, obtained partitions hold post-`B` writes.
   Reverse additionally folds those back into the restored original (`INSERT ... SELECT`, then drop
   them), bounded row movement over recent data only.
-- **Tier 3, the one-way door.** After the first refinement the monolith is gone, so reversal would be a
+- **Tier 3, the one-way door.** After the first regraining the monolith is gone, so reversal would be a
   full merge-rebuild. This is the new door, replacing today's "once draining begins."
 
 ### 14. `status()` surfacing
@@ -381,35 +381,35 @@ Extend the existing return shape:
 
 - **Split the partition count** into fine versus coarse, predicate `hi <> _grid_next(kind, step, lo)`.
   Add `coarse_partitions bigint`.
-- **Surface the refinement backlog**, the new notion of outstanding work now that `default_rows` is
-  normally about zero: an `unrefined_span text` (the extent covered by coarse children) plus a
-  `history_unrefined boolean`, so the operator sees that pruning and fine retention are suspended over
+- **Surface the regraining backlog**, the new notion of outstanding work now that `default_rows` is
+  normally about zero: an `unregrained_span text` (the extent covered by coarse children) plus a
+  `history_unregrained boolean`, so the operator sees that pruning and fine retention are suspended over
   that span. Keep `default_rows` / `closed_rows`, which now report only the strays the assistant evacuates.
 - **Reuse `inflight_partitions`** (the `attached = false` count, issue #94) to show
-  refinement-in-progress. To tell a refinement child from an assistant-drain child, add a small
-  `purpose text` tag to `pgpm.part` (`'drain'` or `'refine'`) and report it; deriving it from "range
+  regraining-in-progress. To tell a regraining child from an assistant-drain child, add a small
+  `purpose text` tag to `pgpm.part` (`'drain'` or `'regrain'`) and report it; deriving it from "range
   sits inside an attached coarse child" also works, but the tag is clearer.
 
-The quiet payoff: because refinement copies-then-swaps and the drain is demoted to the stray-evacuating
+The quiet payoff: because regraining copies-then-swaps and the drain is demoted to the stray-evacuating
 assistant, the `snapshot()` read gap nearly disappears, surviving only for that residual case, not the bulk
 (echoing section 9).
 
 ## Build order (SHIPPED)
 
-The pieces are independently shippable, and the table is correct and online without refinement
+The pieces are independently shippable, and the table is correct and online without regraining
 (strategy 1 is a valid terminal state), so they sequenced naturally. All are now on `main`:
 
 1. **Naming and the overlap check** (sections 6, 7), plus transmute recording the monolith `pgpm.part`
-   row. Prerequisites for even the never-refine path. (PR #116)
+   row. Prerequisites for even the never-regrain path. (PR #116)
 2. **The new transmute layout and ordering** (sections 1, 2, 11): the validated-`CHECK` monolith
    attach, the fresh empty `DEFAULT`, the two simplifications. (PR #116)
 3. **The `untransmute` gate change** (section 13, Tier 1). (PR #116)
 4. **`status()` coarse-awareness** (section 14). (PR #116)
-5. **The `refine` primitive and hierarchical control** (sections 10, 12). (PR #116)
-6. **Retention-aware refine**: below-horizon sub-ranges reclaimed, never materialized. (PR #117)
-7. **Feathered copy**: refine moves in budget-sized microbatches (drain budget + block budget). (PR #118)
-8. **The auto-refine maintain policy** (section 12): `refine_step` + `config.refine_to` / `set_refine`,
+5. **The `regrain` primitive and hierarchical control** (sections 10, 12). (PR #116)
+6. **Retention-aware regrain**: below-horizon sub-ranges reclaimed, never materialized. (PR #117)
+7. **Feathered copy**: regrain moves in budget-sized microbatches (drain budget + block budget). (PR #118)
+8. **The auto-regrain maintain policy** (section 12): `regrain_step` + `config.regrain_to` / `set_regrain`,
    one microbatch per `maintain` tick, true cross-tick pacing. (PR #119)
 
 Not yet built, noted in section 12: the disk-headroom guard and retention-floor prioritization for
-auto-refine. Tier 2 `untransmute` foldback (section 13) also remains a future option.
+auto-regrain. Tier 2 `untransmute` foldback (section 13) also remains a future option.

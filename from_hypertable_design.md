@@ -5,7 +5,7 @@ Scope: single time-or-monotonic RANGE dimension, TimescaleDB Apache 2 Edition
 
 ## Motivation
 
-Supabase ships TimescaleDB Apache 2 Edition and has deprecated it: the extension is gone on Postgres 17 and supported only on Postgres 15, which must drop it before upgrading. The affected population is therefore projects on PG15 (and soon PG14) being pushed off the extension, on older Apache builds. Supabase's own guidance points these users at pg_partman. This document specifies an alternative path that lands them on pg_partition_magician instead, in the coarse-monolith state pgpm is designed around, so the "refine later or never" story applies to migrated tables verbatim.
+Supabase ships TimescaleDB Apache 2 Edition and has deprecated it: the extension is gone on Postgres 17 and supported only on Postgres 15, which must drop it before upgrading. The affected population is therefore projects on PG15 (and soon PG14) being pushed off the extension, on older Apache builds. Supabase's own guidance points these users at pg_partman. This document specifies an alternative path that lands them on pg_partition_magician instead, in the coarse-monolith state pgpm is designed around, so the "regrain later or never" story applies to migrated tables verbatim.
 
 The target user is someone using Timescale "mainly as a partition manager": time-ordered, RANGE-compatible data, a retention policy, and little or none of Timescale's analytical machinery.
 
@@ -23,7 +23,7 @@ Two facts make the full copy clean for this population specifically. Apache Edit
 
 `from_hypertable` does not copy into a pre-partitioned parent and route rows during the load. It copies into a plain unpartitioned heap table, swaps that table into the original name, and then calls `transmute()` on it.
 
-This reduces the hypertable migration to a problem pgpm already solves. Once the data is in an equivalent plain table under the original name, it is exactly transmute's input: rename aside as the bounded monolith, stand up the native partitioned parent, attach the monolith after one online validate scan, register paused. Everything downstream (obtain, drain, retain, refine) is unchanged. `from_hypertable` is therefore a thin front end whose only job is to get the data out of the hypertable and into a faithful plain copy.
+This reduces the hypertable migration to a problem pgpm already solves. Once the data is in an equivalent plain table under the original name, it is exactly transmute's input: rename aside as the bounded monolith, stand up the native partitioned parent, attach the monolith after one online validate scan, register paused. Everything downstream (obtain, drain, retain, regrain) is unchanged. `from_hypertable` is therefore a thin front end whose only job is to get the data out of the hypertable and into a faithful plain copy.
 
 ## Procedure
 
@@ -65,7 +65,7 @@ WHERE <control> >= <chunk_lo> AND <control> < <chunk_hi>
 ORDER BY <control>;
 ```
 
-The time predicate triggers Timescale chunk exclusion, so each batch reads exactly one chunk. Per-batch commits bound transaction size and WAL, give natural progress reporting, and let autovacuum keep up. `ORDER BY <control>` makes the destination physically time-clustered, which makes the later transmute validate scan and any refine cheaper. This mirrors what pg_partman's `partition_data_proc` does and the reason its docs suggest CLUSTER first; here the clustering is free from the copy order.
+The time predicate triggers Timescale chunk exclusion, so each batch reads exactly one chunk. Per-batch commits bound transaction size and WAL, give natural progress reporting, and let autovacuum keep up. `ORDER BY <control>` makes the destination physically time-clustered, which makes the later transmute validate scan and any regrain cheaper. This mirrors what pg_partman's `partition_data_proc` does and the reason its docs suggest CLUSTER first; here the clustering is free from the copy order.
 
 ### 4. Indexes and key
 
@@ -144,7 +144,7 @@ SELECT pgpm.transmute(
 );
 ```
 
-transmute renames it aside as the bounded monolith, builds the native partitioned parent, attaches the monolith after one online validate scan, and registers it paused. From here it is ordinary pgpm: `resume`, `obtain` ahead of the frontier, and `refine` on the operator's schedule or never.
+transmute renames it aside as the bounded monolith, builds the native partitioned parent, attaches the monolith after one online validate scan, and registers it paused. From here it is ordinary pgpm: `resume`, `obtain` ahead of the frontier, and `regrain` on the operator's schedule or never.
 
 ### 8. Retention policy translation
 
@@ -173,7 +173,7 @@ This is a one-time full copy. It costs about 2x disk transiently, a real read-an
 
 ## Positioning versus pg_partman
 
-Supabase already points departing Timescale users at pg_partman. The case for landing on pgpm instead is the bounded-monolith design documented elsewhere in this repo: the migration ends in a coarse-but-correct monolith that does not have to be refined on a deadline, whereas the pg_partman online path attaches history as the default and obligates prompt draining. For a user who just wants time partitioning plus retention going forward and can tolerate coarse history, the migrated end state is lower-effort on pgpm. The companion comparison piece makes this argument in full; `from_hypertable` is what delivers a Timescale user into it.
+Supabase already points departing Timescale users at pg_partman. The case for landing on pgpm instead is the bounded-monolith design documented elsewhere in this repo: the migration ends in a coarse-but-correct monolith that does not have to be regrained on a deadline, whereas the pg_partman online path attaches history as the default and obligates prompt draining. For a user who just wants time partitioning plus retention going forward and can tolerate coarse history, the migrated end state is lower-effort on pgpm. The companion comparison piece makes this argument in full; `from_hypertable` is what delivers a Timescale user into it.
 
 ## Status of the open questions
 

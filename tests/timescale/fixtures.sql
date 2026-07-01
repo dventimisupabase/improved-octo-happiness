@@ -61,7 +61,7 @@ end $$;
 
 -- a hypertable carrying the schema features a migration must preserve: a column DEFAULT, a NOT NULL,
 -- a CHECK, a secondary index, and a composite PK that includes the control column. (No generated column:
--- pgpm's copy/drain/refine cannot yet insert into one -- a known gap, tracked separately.)
+-- pgpm's copy/drain/regrain cannot yet insert into one -- a known gap, tracked separately.)
 create or replace function mk_hypertable_rich(p_name text, p_rows int default 30) returns void language plpgsql as $$
 begin
   execute format('drop table if exists %I cascade', p_name);

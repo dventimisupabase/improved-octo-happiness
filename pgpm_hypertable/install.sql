@@ -60,7 +60,7 @@ end $$;
 -- copied); when null it is chosen by comparing the estimated size to effective_cache_size. The defaults
 -- (~40 MiB/s cache-resident, ~16 MiB/s disk-bound) are order-of-magnitude figures measured on a Supabase
 -- 2XL on gp3 and scale with RAM/IOPS/throughput. This covers ONLY the copy -- the cutover's index rebuild
--- and an optional later refine are additional. Callable on its own for sizing.
+-- and an optional later regrain are additional. Callable on its own for sizing.
 create or replace function pgpm.from_hypertable_time_estimate(
   p_hypertable regclass, p_copy_mibps numeric default null
 ) returns interval language plpgsql as $$
@@ -135,7 +135,7 @@ begin
   if v_cache is not null and v_bytes > v_cache then v_mibps := 16; v_regime := 'disk-bound: estimated size exceeds effective_cache_size';
   else v_mibps := 40; v_regime := 'cache-resident: estimated size fits effective_cache_size'; end if;
   v_eta := pgpm.from_hypertable_time_estimate(p_hypertable, v_mibps);
-  raise notice 'pg_partition_magician: estimated online copy time ~ % (% at ~% MiB/s, %). This covers the copy only -- the cutover then rebuilds the primary key and secondary indexes (extra, scales with row count) and a later refine (if used) is a similar second pass. Rough (measured on a 2XL gp3): more RAM/IOPS/throughput is faster. Override the rate with pgpm.from_hypertable_time_estimate(table, mibps).',
+  raise notice 'pg_partition_magician: estimated online copy time ~ % (% at ~% MiB/s, %). This covers the copy only -- the cutover then rebuilds the primary key and secondary indexes (extra, scales with row count) and a later regrain (if used) is a similar second pass. Rough (measured on a 2XL gp3): more RAM/IOPS/throughput is faster. Override the rate with pgpm.from_hypertable_time_estimate(table, mibps).',
     v_eta, pg_size_pretty(v_bytes), v_mibps, v_regime;
 end $$;
 
@@ -247,7 +247,7 @@ begin
   commit;
 
   -- online chunk-bounded copy: one chunk-range per transaction (the time predicate drives chunk exclusion
-  -- to a single-chunk read; ORDER BY the control column clusters the destination for cheap transmute/refine
+  -- to a single-chunk read; ORDER BY the control column clusters the destination for cheap transmute/regrain
   -- later). The source keeps serving traffic throughout.
   for r in select range_start, range_end from timescaledb_information.chunks
             where hypertable_schema = v_nsp and hypertable_name = v_rel order by range_start loop

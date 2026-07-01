@@ -1,6 +1,6 @@
--- status() surfaces the refinement backlog (REDESIGN.md section 14): coarse_partitions counts the
--- un-refined coarse children (the monolith, and any coarser children from a partial refinement) and
--- history_unrefined flags that pruning and fine retention are suspended over that span. After refine()
+-- status() surfaces the regraining backlog (REDESIGN.md section 14): coarse_partitions counts the
+-- un-regrained coarse children (the monolith, and any coarser children from a partial regraining) and
+-- history_unregrained flags that pruning and fine retention are suspended over that span. After regrain()
 -- splits the monolith into fine children, both go to zero/false.
 create extension if not exists pgtap;
 begin;
@@ -13,23 +13,23 @@ select pgpm.obtain('public.st');
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.st'::regclass),
-  1::bigint, 'status() reports the coarse monolith as one coarse partition (the refinement backlog)');
+  1::bigint, 'status() reports the coarse monolith as one coarse partition (the regraining backlog)');
 
 select ok(
-  (select history_unrefined from pgpm.status() where parent = 'public.st'::regclass),
-  'status() flags history as unrefined while the monolith is coarse');
+  (select history_unregrained from pgpm.status() where parent = 'public.st'::regclass),
+  'status() flags history as unregrained while the monolith is coarse');
 
--- freeze the monolith and refine it
+-- freeze the monolith and regrain it
 insert into public.st (id, payload) values (65000, 'frontier');
-select pgpm.refine_history('public.st');
+select pgpm.regrain_history('public.st');
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.st'::regclass),
-  0::bigint, 'after refine, no coarse partitions remain');
+  0::bigint, 'after regrain, no coarse partitions remain');
 
 select ok(
-  not (select history_unrefined from pgpm.status() where parent = 'public.st'::regclass),
-  'after refine, history_unrefined is false (the backlog is cleared)');
+  not (select history_unregrained from pgpm.status() where parent = 'public.st'::regclass),
+  'after regrain, history_unregrained is false (the backlog is cleared)');
 
 select * from finish();
 rollback;

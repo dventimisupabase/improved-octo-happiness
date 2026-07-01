@@ -1,5 +1,5 @@
 -- Time estimate (A4 companion). from_hypertable_time_estimate gives a ROUGH online-copy ETA from the chunk
--- sizes and an assumed effective throughput; the cutover's index rebuild and an optional refine are extra.
+-- sizes and an assumed effective throughput; the cutover's index rebuild and an optional regrain are extra.
 -- It is a pure read-only function (no COMMIT), so it is transaction-safe, but it lives in db/ alongside the
 -- disk-estimate test it mirrors. Autocommit, disposable-db.
 select plan(3);

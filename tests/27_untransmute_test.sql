@@ -4,7 +4,7 @@
 -- monolith, drops the childless parent (cascading the empty default and forward partitions), renames the
 -- monolith back, and restores what transmute changed (identity moved to the parent, preserved incoming
 -- FKs). It stays reversible through obtain (forward partitions are empty); it is a one-way door once a
--- row lands OUTSIDE the monolith (past B, in a forward partition) or refinement splits the monolith.
+-- row lands OUTSIDE the monolith (past B, in a forward partition) or regraining splits the monolith.
 create extension if not exists pgtap;
 
 begin;

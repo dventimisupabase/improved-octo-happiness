@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Climb ONE rung of the from_hypertable ladder (bench/SIZE_LADDER.md scales) on a green PG15 instance.
 #
-# Sibling of bench/run_rung.sh: where that converts a plain id-table with transmute+refine, THIS converts
-# a TimescaleDB hypertable via from_hypertable (online copy -> brief cutover -> refine the time-monolith)
+# Sibling of bench/run_rung.sh: where that converts a plain id-table with transmute+regrain, THIS converts
+# a TimescaleDB hypertable via from_hypertable (online copy -> brief cutover -> regrain the time-monolith)
 # under load, on PostgreSQL 15 with Apache TimescaleDB. Each rung runs on its OWN fresh PG15 2XL green
 # instance (see bench-fresh-instance-per-run): one provisioned project per rung, top to bottom.
 #
@@ -30,9 +30,9 @@ echo "  connection: green session-mode pooler ($pooler_host:5432), project ${BEN
 export BENCH_GEN_JOBS="${BENCH_GEN_JOBS:-8}"      # 2XL = 8 vCPU
 export BENCH_CLIENTS="${BENCH_CLIENTS:-16}" BENCH_JOBS="${BENCH_JOBS:-8}" BENCH_OPS="${BENCH_OPS:-10}"
 export BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-10}"
-export BENCH_FH_INTERVAL="${BENCH_FH_INTERVAL:-1 month}"   # pgpm partition width + refine target
+export BENCH_FH_INTERVAL="${BENCH_FH_INTERVAL:-1 month}"   # pgpm partition width + regrain target
 export BENCH_TRACK_CHANGES="${BENCH_TRACK_CHANGES:-1}"     # full-online: reconcile in-flight upd/del at cutover
-export BENCH_REFINE="${BENCH_REFINE:-1}"
+export BENCH_REGRAIN="${BENCH_REGRAIN:-1}"
 export BENCH_OBTAIN="${BENCH_OBTAIN:-4}"
 export BENCH_PREDRAIN="${BENCH_PREDRAIN:-1}"               # #170 A/B: 1 = online pre-drain (drained), 0 = undrained
 export BENCH_LOCKPROBE="${BENCH_LOCKPROBE:-1}"             # time the cutover's true ACCESS EXCLUSIVE window

@@ -8,7 +8,7 @@ The mental model in one breath: `transmute` converts a live table into a native 
 by renaming the original aside and attaching it, with **zero row movement**, as one bounded **monolith**
 child (covering `[grid_floor(min), B)`), under a fresh empty `DEFAULT`. Going forward, `obtain` keeps
 real partitions ahead of the write frontier, `retain` drops whole partitions past a policy, the **drain**
-(the magician's assistant) keeps the `DEFAULT` empty by evacuating strays, and `refine` splits the coarse
+(the magician's assistant) keeps the `DEFAULT` empty by evacuating strays, and `regrain` splits the coarse
 monolith into finer partitions on demand. `maintain` is the one procedure `pg_cron` runs.
 
 Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a native grid value is a
@@ -49,14 +49,14 @@ Parameters:
   `pgpm` never scans to enforce it). A key is not required: if a **primary key or unique constraint**
   includes the control column, `pgpm` reuses it in place and never rewrites it; otherwise the table is
   partitioned **keyless** (no key synthesized). A key that *excludes* the control column is refused (no
-  rewrite), as is a *bare* unique index (promote it to a constraint first). Note: `refine` is unavailable
+  rewrite), as is a *bare* unique index (promote it to a constraint first). Note: `regrain` is unavailable
   on a keyless monolith, so its history stays as one coarse child unless a key is added before transmute.
 - `p_interval` -- the grid width (`interval '1 day'`, `'1 month'`, `'1 year'`, ...). Cast a bare literal:
   `interval '1 month'` (it disambiguates from the `bigint` overload).
 - `p_obtain` -- how many partitions to keep ahead of the frontier.
 - `p_retain` -- drop partitions older than this `interval`; `null` keeps everything.
 - `p_keep_default` -- keep the `DEFAULT` safety net (the default; leave it on).
-- `p_drain_batch` -- rows per drain/refine microbatch.
+- `p_drain_batch` -- rows per drain/regrain microbatch.
 - `p_anchor` -- the grid origin the boundaries align to.
 - `p_paused` -- register paused (the default); `false` goes live immediately.
 - `p_incoming_fks` -- `'error'` (refuse if any incoming FK exists), `'drop'` (drop them), or `'preserve'`
@@ -111,7 +111,7 @@ back, restores identity and any preserved incoming FKs, and clears `pgpm` state.
 attached partition with the smallest `lo`.
 
 It is a **one-way door** once any row lives outside the monolith's range -- a forward partition after the
-frontier crosses `B`, a backdated stray in the `DEFAULT`, or finer children from a refinement -- because a
+frontier crosses `B`, a backdated stray in the `DEFAULT`, or finer children from a regraining -- because a
 metadata-only reverse would lose those rows. (Tier-2 fold-back and Tier-3 merge are not built.)
 
 ## Migrating from TimescaleDB (`from_hypertable`)
@@ -147,9 +147,9 @@ Scope and caveats:
   size in extra disk until cutover drops the old hypertable. `from_hypertable_preflight` raises a `NOTICE`
   with the estimate; `from_hypertable_disk_estimate` returns it for sizing a volume ahead of time.
 - A carried-over `drop_chunks` retention policy is auto-translated into `pgpm`'s `retain`, but retention over
-  the unrefined **monolith is dormant** until you `refine` it (`retain` only drops attached fine partitions),
-  and `refine` is unavailable on a keyless monolith. So a keyless migration that relied on `drop_chunks` will
-  not reclaim disk until a key is added and the monolith is refined.
+  the unregrained **monolith is dormant** until you `regrain` it (`retain` only drops attached fine partitions),
+  and `regrain` is unavailable on a keyless monolith. So a keyless migration that relied on `drop_chunks` will
+  not reclaim disk until a key is added and the monolith is regrained.
 
 ### `from_hypertable`
 
@@ -403,13 +403,13 @@ pgpm.retain(p_parent regclass) returns int
 
 Drops every partition whose whole range is older than the retention horizon (`config.retain`), returning
 the count dropped. A coarse partition that merely straddles the horizon is **not** dropped, so retention
-is suspended over un-refined coarse history until `refine` splits it (or `refine` reclaims the aged
+is suspended over un-regrained coarse history until `regrain` splits it (or `regrain` reclaims the aged
 sub-ranges directly). `null` retention drops nothing.
 
-### `refine`
+### `regrain`
 
 ```sql
-pgpm.refine(p_parent regclass, p_child name, p_target_step text default null) returns int
+pgpm.regrain(p_parent regclass, p_child name, p_target_step text default null) returns int
 ```
 
 Splits one **frozen** coarse child `p_child` into finer children of width `p_target_step` (default
@@ -422,34 +422,34 @@ does not subdivide it, or the `DEFAULT` holds rows in its range.
 
 ```sql
 -- split the monolith into the configured fine granularity, once the frontier has passed it
-select pgpm.refine_history('public.events');
+select pgpm.regrain_history('public.events');
 ```
 
-### `refine_step`
+### `regrain_step`
 
 ```sql
-pgpm.refine_step(p_parent regclass, p_child name, p_target_step text default null, p_batch int default null)
+pgpm.regrain_step(p_parent regclass, p_child name, p_target_step text default null, p_batch int default null)
   returns text
 ```
 
-One resumable microbatch of `refine`: it **copies** (never deletes) a within-horizon sub-range's next
+One resumable microbatch of `regrain`: it **copies** (never deletes) a within-horizon sub-range's next
 budget-sized batch into its fine child, skips a below-horizon sub-range (discarded with the source at the
-swap), and performs the atomic swap once the cursor (`config.refine_cursor`) reaches the coarse `hi`. The
+swap), and performs the atomic swap once the cursor (`config.regrain_cursor`) reaches the coarse `hi`. The
 source stays whole and **attached** until that swap, so a read of the parent is never short. Returns
-`copied:N`, `swapped:K` (refine complete, K children attached), or a soft no-progress status: `active`
+`copied:N`, `swapped:K` (regrain complete, K children attached), or a soft no-progress status: `active`
 (not frozen yet), `default_dirty` (a stray sits in the range), or `nosubdiv` (the step does not subdivide).
 This is the unit `maintain` paces across ticks; because it copies, the cross-tick path opens **no**
 read gap (unlike the drain). Its one FK touch is the swap's `DETACH`, which transiently drops and re-adds
 any incoming FK within that single transaction.
 
-### `refine_history`
+### `regrain_history`
 
 ```sql
-pgpm.refine_history(p_parent regclass, p_target_step text default null) returns int
+pgpm.regrain_history(p_parent regclass, p_target_step text default null) returns int
 ```
 
-Convenience: `refine` the oldest coarse child (the monolith -- the smallest-`lo` attached partition) to
-`p_target_step`. The hierarchical monolith to coarse to fine path is just repeated `refine` calls with
+Convenience: `regrain` the oldest coarse child (the monolith -- the smallest-`lo` attached partition) to
+`p_target_step`. The hierarchical monolith to coarse to fine path is just repeated `regrain` calls with
 chosen steps.
 
 ### `maintain`
@@ -459,11 +459,11 @@ pgpm.maintain(p_parent regclass) returns text
 ```
 
 The per-table tick: `obtain`, `retain`, one drain step, restore any preserved FK whose tail has drained,
-and -- when auto-refine is on (`config.refine_to`) -- one `refine_step` on the oldest frozen coarse child.
+and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the oldest frozen coarse child.
 A no-op while paused. Every step is isolated in its own subtransaction under a short `lock_timeout`, so it
 never blocks or deadlocks the live workload; a step that loses a lock race is deferred and retried next
 tick. Returns a one-line summary, for example
-`obtained=2 dropped=0 drain=idle suspended_fk=0 restored_fk=0 refine=copied:5000`.
+`obtained=2 dropped=0 drain=idle suspended_fk=0 restored_fk=0 regrain=copied:5000`.
 
 ### `maintain_all`
 
@@ -504,7 +504,7 @@ pgpm.pause(p_parent regclass)  returns void
 ```
 
 Flip `config.paused`. `transmute` registers a table paused; `resume` lets scheduled maintenance begin
-obtaining, draining, retaining (and refining, if enabled). `pause` stops it. `drain_all`/`drain_step`
+obtaining, draining, retaining (and regraining, if enabled). `pause` stops it. `drain_all`/`drain_step`
 ignore the flag, so you can still drive the drain by hand while paused.
 
 ### `set_drain_adaptive`
@@ -529,16 +529,16 @@ drain is crowding the live workload, sensed from lock waits and read-I/O latency
 relative surge multiple over a learned EWMA baseline (`p_factor => 0` turns it off), `p_alpha` the
 baseline smoothing, `p_floor` the idle-box guard.
 
-### `set_refine`
+### `set_regrain`
 
 ```sql
-pgpm.set_refine(p_parent regclass, p_target_step text default null) returns void
+pgpm.set_regrain(p_parent regclass, p_target_step text default null) returns void
 ```
 
-Turn auto-refine on or off. A non-null `p_target_step` (an interval as text for time/uuidv7, a `bigint`
+Turn auto-regrain on or off. A non-null `p_target_step` (an interval as text for time/uuidv7, a `bigint`
 step as text for id) lets each `maintain` tick feather the oldest frozen coarse child one microbatch
-toward that granularity; `null` turns it off (refine stays operator-driven). Enabling it is always safe:
-`refine_step` enforces its own preconditions, so an un-meetable tick simply retries.
+toward that granularity; `null` turns it off (regrain stays operator-driven). Enabling it is always safe:
+`regrain_step` enforces its own preconditions, so an un-meetable tick simply retries.
 
 ## Observability
 
@@ -550,16 +550,16 @@ pgpm.status() returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint, default_oldest text, newest_bound text,
   last_drained timestamptz, drain_skips bigint, fks_suspended bigint, fks_unvalidated bigint,
-  history_unrefined boolean
+  history_unregrained boolean
 )
 ```
 
 One row per managed table. Beyond the static config it surfaces:
 
 - `n_partitions` / `coarse_partitions` -- attached partitions, and how many of those are still coarse
-  (wider than one step). `coarse_partitions > 0` (and `history_unrefined = true`) is the refinement
-  backlog: pruning and fine retention are suspended over that span until it is refined.
-- `inflight_partitions` -- children created but not yet attached (a drain or refine in progress; their
+  (wider than one step). `coarse_partitions > 0` (and `history_unregrained = true`) is the regraining
+  backlog: pruning and fine retention are suspended over that span until it is regrained.
+- `inflight_partitions` -- children created but not yet attached (a drain or regrain in progress; their
   rows are durable but not visible through the parent until attach -- use `snapshot()` for a complete
   read).
 - `default_rows` / `closed_rows` -- total and drainable-now rows in the `DEFAULT` (normally near zero;
@@ -578,8 +578,8 @@ pgpm.snapshot(p_rowtype anyelement) returns setof anyelement
 
 A complete, consistent read during a paced **drain**. While the drain has rows mid-move they live in an
 unattached child, so a plain `select` from the parent **undercounts**; `snapshot` unions the parent with
-every in-flight drain child. (It deliberately skips a refine's copy-children -- their rows are still in the
-attached monolith -- so it never double-counts; refine, which copies, opens no gap to cover.) Pass the
+every in-flight drain child. (It deliberately skips a regrain's copy-children -- their rows are still in the
+attached monolith -- so it never double-counts; regrain, which copies, opens no gap to cover.) Pass the
 parent's row type as a typed `null` so it can infer the table:
 
 ```sql
@@ -588,7 +588,7 @@ select count(*) from pgpm.snapshot(null::public.events);
 
 It is an optimization fence (it materializes the union, so a `WHERE` does not push down) and does nothing
 for writes (a write to an already-moved drain row no-ops until the interval attaches). Single-batch
-intervals and the synchronous `drain_all`/`refine()` never open the gap.
+intervals and the synchronous `drain_all`/`regrain()` never open the gap.
 
 ### `check_default`
 
@@ -635,7 +635,7 @@ PGFR-backed functions raise a `pgpm`-prefixed error when PGFR is absent.
 ```sql
 pgpm.observe_window(p_parent regclass, p_since interval default '7 days') returns table (
   parent_table regclass, window_start timestamptz, window_end timestamptz, duration interval,
-  log_rows bigint, rows_moved bigint, drains bigint, refines bigint, retains bigint,
+  log_rows bigint, rows_moved bigint, drains bigint, regrains bigint, retains bigint,
   adaptive_ticks bigint, backoffs bigint, wal_backoffs bigint, lock_backoffs bigint, io_backoffs bigint
 )
 ```
@@ -739,13 +739,13 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `obtain` | `int` | partitions kept ahead of the frontier |
 | `retain` | `text` | retention horizon (interval for time/uuidv7, bigint count for id; null = keep) |
 | `keep_default` | `boolean` | keep the `DEFAULT` safety net |
-| `drain_batch` | `int` | rows per drain/refine microbatch |
+| `drain_batch` | `int` | rows per drain/regrain microbatch |
 | `default_table` | `name` | the `DEFAULT` partition's table name |
 | `paused` | `boolean` | maintenance is idle while true |
 | `created_at` | `timestamptz` | when transmuted |
 | `obtain_retry_after` | `timestamptz` | back-off marker after an obtain lock-race deferral |
 | `drain_max_blocks` | `int` | optional block budget per microbatch (caps wide rows; null = row cap only) |
-| `refine_to` | `text` | auto-refine target step (null = off; see `set_refine`) |
+| `regrain_to` | `text` | auto-regrain target step (null = off; see `set_regrain`) |
 | `drain_adaptive` | `boolean` | adaptive feathering on (mode 2) |
 | `drain_budget` | `int` | the adaptive controller's current row budget |
 | `drain_ckpt_seen` | `bigint` | last forced-checkpoint counter (reactive backstop) |
@@ -768,7 +768,7 @@ The registry of managed partitions (excludes the `DEFAULT`). `lo`/`hi` are nativ
 | `child_name` | `name` | the partition's table name |
 | `lo` / `hi` | `text` | native `[lo, hi)` bounds (a partition is coarse when `hi > grid_next(lo)`) |
 | `created_at` | `timestamptz` | when created |
-| `attached` | `boolean` | false while a drain/refine is still filling it standalone; true once attached |
+| `attached` | `boolean` | false while a drain/regrain is still filling it standalone; true once attached |
 
 Primary key `(parent_table, child_name)`. The non-overlap invariant holds over `attached = true` rows
 only; an in-flight child may transiently sit inside a still-attached coarse child.
@@ -785,10 +785,10 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 | `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
 | `drain_move` / `drain_attach` | a drain microbatch moved rows / attached a completed interval |
 | `retain_drop` / `retain_reclaim` | a partition dropped by retention / aged rows deleted from the `DEFAULT` |
-| `refine_copy` / `refine_aged` / `refine_attach` / `refine` | a refine microbatch copied rows into a fine child / skipped a below-horizon sub-range (discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
+| `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
 | `drain_budget` | an adaptive controller step (`rows` = the new budget, `method` = the reason) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
-| `obtain_skip` / `retain_skip` / `drain_skip` / `refine_skip` / `restore_fk_skip` | a step deferred (lock race or transient error; `method` carries the reason) |
+| `obtain_skip` / `retain_skip` / `drain_skip` / `regrain_skip` / `restore_fk_skip` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `restore_incoming_fk_failed` / `validate_incoming_fk_blocked` | a preserve-FK re-add failed / a validation was blocked by an orphan |
 
 ### `pgpm.dropped_fk`

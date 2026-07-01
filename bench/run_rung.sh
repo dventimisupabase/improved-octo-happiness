@@ -48,8 +48,8 @@ export BENCH_OBSERVE_INTERVAL=10
 export BENCH_PGFR=1   # no PK pre-build: transmute never rewrites the PK, so the cutover is always metadata-only
 
 # ---- per-rung scale (see bench/SIZE_LADDER.md) ----
-# BENCH_ID_STEP ~= BENCH_ROWS/5 so the monolith [0,B) refines into ~6 fine id-partitions per rung.
-# The refine COPIES the WHOLE monolith (all BENCH_ROWS history rows), so it is the bulk O(rows) move the
+# BENCH_ID_STEP ~= BENCH_ROWS/5 so the monolith [0,B) regrains into ~6 fine id-partitions per rung.
+# The regrain COPIES the WHOLE monolith (all BENCH_ROWS history rows), so it is the bulk O(rows) move the
 # ladder measures -- and it needs transient ~2x storage (the copies before the swap drops the source).
 case "$RUNG" in
   R0) export BENCH_ROWS=1000000   BENCH_ID_STEP=200000   BENCH_PHASE_SECS=45  BENCH_DRAIN_BATCH=100000 BENCH_DRAIN_IDLE_SECS=45  BENCH_DRAIN_MAX_SECS=600 ;;

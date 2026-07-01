@@ -1,7 +1,7 @@
--- refine() copies each sub-range in budget-sized microbatches (drain_batch, capped by drain_max_blocks),
+-- regrain() copies each sub-range in budget-sized microbatches (drain_batch, capped by drain_max_blocks),
 -- not one statement per sub-range, so a wide sub-range can't become one giant copy. The whole call is one
 -- transaction here (atomic, gap-free); the microbatching bounds per-statement footprint and reuses the
--- drain's budget so a maintain-driven auto-refine can pace it across ticks. Each microbatch logs refine_copy.
+-- drain's budget so a maintain-driven auto-regrain can pace it across ticks. Each microbatch logs regrain_copy.
 create extension if not exists pgtap;
 begin;
 select plan(4);
@@ -13,20 +13,20 @@ select pgpm.obtain('public.fw');
 insert into public.fw (id, payload) values (5000, 'frontier');   -- advance frontier -> monolith frozen
 
 select is(
-  (select pgpm.refine_history('public.fw'))::int,
-  3, 'refine splits the monolith into 3 fine children');
+  (select pgpm.regrain_history('public.fw'))::int,
+  3, 'regrain splits the monolith into 3 fine children');
 
 select cmp_ok(
-  (select max(rows) from pgpm.log where parent_table = 'public.fw'::regclass and action = 'refine_copy'),
-  '<=', 10::bigint, 'every refine microbatch is bounded by drain_batch (10 rows)');
+  (select max(rows) from pgpm.log where parent_table = 'public.fw'::regclass and action = 'regrain_copy'),
+  '<=', 10::bigint, 'every regrain microbatch is bounded by drain_batch (10 rows)');
 
 select cmp_ok(
-  (select count(*) from pgpm.log where parent_table = 'public.fw'::regclass and action = 'refine_copy'),
+  (select count(*) from pgpm.log where parent_table = 'public.fw'::regclass and action = 'regrain_copy'),
   '>=', 12::bigint, 'the copy is microbatched (many bounded copies, not one statement per sub-range)');
 
 select is(
   (select count(*)::int from public.fw where id < 150),
-  120, 'all 120 rows conserved across the feathered refine');
+  120, 'all 120 rows conserved across the feathered regrain');
 
 select * from finish();
 rollback;

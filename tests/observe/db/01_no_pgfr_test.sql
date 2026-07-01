@@ -8,13 +8,13 @@ select plan(6);
 create table public.t (id bigint);
 
 -- A small synthetic operation log: a transmute, one drain, two adaptive ticks (one
--- a 'probe' = no congestion, one a 'wal' backoff), a refine, and a retention drop.
+-- a 'probe' = no congestion, one a 'wal' backoff), a regrain, and a retention drop.
 insert into pgpm.log (parent_table, action, rows, method, at) values
   ('public.t'::regclass, 'transmute',    null, null,             now() - interval '5 min'),
   ('public.t'::regclass, 'drain_move',   1000, null,             now() - interval '4 min'),
   ('public.t'::regclass, 'drain_budget', 5000, 'probe',          now() - interval '4 min'),
   ('public.t'::regclass, 'drain_budget', 2500, 'wal',            now() - interval '3 min'),
-  ('public.t'::regclass, 'refine',          1, 'copy_swap_drop', now() - interval '2 min'),
+  ('public.t'::regclass, 'regrain',          1, 'copy_swap_drop', now() - interval '2 min'),
   ('public.t'::regclass, 'retain_drop',  null, null,             now() - interval '1 min');
 
 select is( pgpm._observe_has_pgfr(), false,

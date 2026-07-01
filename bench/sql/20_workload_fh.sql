@@ -15,9 +15,9 @@
 -- Mix: 35% head insert (+ companion upsert), 30% recent read (newest 20), 15% wider recent count,
 --      12% UPDATE a recent row (track_changes UPDATE), 8% DELETE a recent row (track_changes DELETE).
 -- p_clock_secs shifts the workload's effective "now" forward by that many seconds. The phases that run
--- against the live/normal head pass 0 (real now()). The REFINE phase passes a positive offset that pushes
+-- against the live/normal head pass 0 (real now()). The REGRAIN phase passes a positive offset that pushes
 -- the effective clock PAST the migrated monolith's upper bound, so the workload's writes land in FORWARD
--- partitions (not the frozen historical monolith) -- the condition that lets pgpm refine the monolith under
+-- partitions (not the frozen historical monolith) -- the condition that lets pgpm regrain the monolith under
 -- ongoing load (a time monolith cannot freeze while current-period writes still target its range).
 create or replace function bench.workload_step_fh(p_ops int default 10, p_clock_secs bigint default 0)
 returns void language plpgsql as $$

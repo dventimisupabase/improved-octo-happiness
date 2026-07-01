@@ -4,8 +4,8 @@ The #173 cutover-lock-window bench arm run at scale on Supabase **green**, to se
 pre-drain (#170 tracking delta, #176 append-only tail) shortens the cutover's `ACCESS EXCLUSIVE` window.
 Each rung is four arms = {tracking, append-only} x {drained, undrained}, each on its **own fresh 2XL PG15
 project with TimescaleDB 2.16.1** (one arm per instance, run in parallel), us-east-1, gp3 12 000 IOPS.
-`BENCH_DRAIN_BATCH=5000` (the pre-drain micro-batch and residual threshold), `BENCH_REFINE=0` (the lock
-window is at cutover, before any refine). Lock window timed by the harness's `pg_locks` probe.
+`BENCH_DRAIN_BATCH=5000` (the pre-drain micro-batch and residual threshold), `BENCH_REGRAIN=0` (the lock
+window is at cutover, before any regrain). Lock window timed by the harness's `pg_locks` probe.
 
 ## Results
 

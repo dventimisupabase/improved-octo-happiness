@@ -1,6 +1,6 @@
--- Auto-refine maintain policy (REDESIGN.md section 12). With set_refine() on, each maintain tick feathers
+-- Auto-regrain maintain policy (REDESIGN.md section 12). With set_regrain() on, each maintain tick feathers
 -- the oldest frozen coarse child one budget-sized microbatch toward the target step -- true cross-tick
--- pacing under the live workload, the way the drain is paced. Off by default. refine_step enforces its own
+-- pacing under the live workload, the way the drain is paced. Off by default. regrain_step enforces its own
 -- preconditions (frozen, default-clear), so a tick that can't make progress just retries next tick.
 create extension if not exists pgtap;
 begin;
@@ -11,35 +11,35 @@ insert into public.ar (payload) select 'x' from generate_series(1, 200);   -- id
 select pgpm.transmute('public.ar', 'id', 50, p_drain_batch => 30, p_paused => false);   -- monolith [0, 250) -- 5 steps; batch 30
 select pgpm.obtain('public.ar');
 insert into public.ar (id, payload) values (10000, 'frontier');   -- advance frontier past B=250 -> monolith frozen
-select pgpm.set_refine('public.ar', '50');                        -- enable auto-refine to step 50
+select pgpm.set_regrain('public.ar', '50');                        -- enable auto-regrain to step 50
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.ar'::regclass),
-  1::bigint, 'a coarse monolith awaits refinement before any tick');
+  1::bigint, 'a coarse monolith awaits regraining before any tick');
 
--- one maintain tick makes PARTIAL progress (one microbatch), not the whole refine in a single tick
+-- one maintain tick makes PARTIAL progress (one microbatch), not the whole regrain in a single tick
 select pgpm.maintain('public.ar');
 select cmp_ok(
-  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'refine_copy'),
-  '>', 0::bigint, 'one maintain tick feathered a refine copy microbatch (cross-tick pacing)');
+  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'regrain_copy'),
+  '>', 0::bigint, 'one maintain tick feathered a regrain copy microbatch (cross-tick pacing)');
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.ar'::regclass),
-  1::bigint, 'after a single tick the coarse child is still mid-refine (not finished in one tick)');
+  1::bigint, 'after a single tick the coarse child is still mid-regrain (not finished in one tick)');
 
 -- drive ticks to completion
 do $$ begin for i in 1..40 loop perform pgpm.maintain('public.ar'); end loop; end $$;
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.ar'::regclass),
-  0::bigint, 'repeated maintain ticks complete the refine (no coarse partitions remain)');
+  0::bigint, 'repeated maintain ticks complete the regrain (no coarse partitions remain)');
 
 select is(
   (select count(*)::int from public.ar where id < 250),
-  200, 'all 200 history rows conserved across the feathered cross-tick refine');
+  200, 'all 200 history rows conserved across the feathered cross-tick regrain');
 
 select cmp_ok(
-  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'refine_copy'),
-  '>=', 5::bigint, 'the refine was paced across many copy microbatches, not one statement');
+  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'regrain_copy'),
+  '>=', 5::bigint, 'the regrain was paced across many copy microbatches, not one statement');
 
 select * from finish();
 rollback;
